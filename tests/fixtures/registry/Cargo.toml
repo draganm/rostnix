@@ -1,0 +1,9 @@
+[package]
+name = "from-registry"
+version = "0.1.0"
+edition = "2021"
+
+# From the registry tests/registry.py serves on this machine. Where that
+# registry is, the cargo home of whoever builds says: the project does not.
+[dependencies]
+rostnix-fixture-dep = { version = "0.1.0", registry = "fixture" }

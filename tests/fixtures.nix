@@ -67,6 +67,14 @@ in
     cargoRoot = "ws";
   };
 
+  # A dependency from a registry other than crates.io: the one that
+  # tests/registry.py serves. This evaluates only while that runs and the
+  # cargo home of whoever evaluates names it; tests/run.sh sees to both.
+  registry = rustEnv.buildRustApplication {
+    pname = "registry";
+    src = ./fixtures/registry;
+  };
+
   # One project under four profiles: fat LTO with panic=abort, thin LTO,
   # no LTO, and dev with debug information.
   profiles-release = profiles "release";

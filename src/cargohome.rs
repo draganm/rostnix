@@ -3,6 +3,7 @@
 //! shell.
 
 use std::fs;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -123,6 +124,12 @@ impl Cargo {
             scratch,
             default_to_git_command: std::env::var_os("CARGO_NET_GIT_FETCH_WITH_CLI").is_none(),
         };
+        // The cargo home may come to hold a copy of registry settings, a
+        // token among them, so no one else may look into it.
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&this.scratch)
+            .map_err(|err| format!("creating {}: {err}", this.scratch.display()))?;
         fs::create_dir_all(this.home())?;
         fs::create_dir_all(this.target_dir())?;
 
