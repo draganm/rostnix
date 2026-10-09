@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["app", "crates/core", "crates/core/nested", "crates/macros"]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = { level = "deny", priority = -1 }

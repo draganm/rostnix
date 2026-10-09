@@ -1,0 +1,10 @@
+[package]
+name = "ws-core"
+version.workspace = true
+edition.workspace = true
+
+[features]
+loud = []
+
+[lints]
+workspace = true

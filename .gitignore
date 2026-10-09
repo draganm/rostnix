@@ -1,0 +1,11 @@
+.DS_Store
+.direnv
+*~
+
+# cargo build output; nothing built is ever checked in
+/target
+**/target
+
+# nix build outputs
+result
+result-*

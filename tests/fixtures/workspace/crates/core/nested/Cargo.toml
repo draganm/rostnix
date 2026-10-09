@@ -1,0 +1,4 @@
+[package]
+name = "ws-nested"
+version.workspace = true
+edition.workspace = true
