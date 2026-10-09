@@ -212,11 +212,11 @@ pub fn run() -> Result<()> {
     );
     env.insert("CARGO".to_string(), attrs.cargo.clone());
     env.insert("CARGO_ENCODED_RUSTFLAGS".to_string(), String::new());
-    env.extend(node.override_env.clone());
 
     let output = Command::new(&script.artifact)
         .current_dir(&pkg_root)
         .envs(&env)
+        .envs(&node.override_env)
         .env_remove("RUSTFLAGS")
         .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
@@ -232,8 +232,12 @@ pub fn run() -> Result<()> {
     }
 
     let parsed = parse_output(&stdout).map_err(|err| format!("{what}: {err}"))?;
-    for warning in &parsed.warnings {
-        eprintln!("warning: {}@{}: {warning}", node.pkg.name, node.pkg.version);
+    // As under cargo, a foreign package's warnings are not the builder's
+    // concern; they stay in `output`.
+    if node.local {
+        for warning in &parsed.warnings {
+            eprintln!("warning: {}@{}: {warning}", node.pkg.name, node.pkg.version);
+        }
     }
     if !parsed.errors.is_empty() {
         for error in &parsed.errors {
@@ -257,6 +261,7 @@ pub fn run() -> Result<()> {
             metadata: parsed.metadata,
             argv: vec![script.artifact],
             env_recorded: env,
+            override_env: node.override_env.clone(),
             cwd: pkg_root,
         },
     )

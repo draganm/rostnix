@@ -81,6 +81,7 @@ pub struct Dep {
 #[serde(rename_all = "camelCase")]
 pub struct RunNode {
     pub pkg: PkgRef,
+    pub local: bool,
     pub src: String,
     pub manifest_dir: String,
     /// The output of the unit that compiled the script.
@@ -114,9 +115,12 @@ pub struct CompileRecord {
     pub transitive: Vec<String>,
     /// The `-L` values of every build script in the unit's closure.
     pub native: Vec<String>,
-    /// What rustc ran with.
+    /// What rustc ran with: the environment cargo would set, and what the
+    /// package's override added to it.
     pub argv: Vec<String>,
     pub env: BTreeMap<String, String>,
+    #[serde(rename = "overrideEnv", default)]
+    pub override_env: BTreeMap<String, String>,
     pub cwd: String,
 }
 
@@ -135,9 +139,11 @@ pub struct RunRecord {
     pub check_cfgs: Vec<String>,
     pub env: Vec<(String, String)>,
     pub metadata: Vec<(String, String)>,
-    /// What the script ran with.
+    /// What the script ran with: the environment cargo would set, and what
+    /// the package's override added to it.
     pub argv: Vec<String>,
     pub env_recorded: BTreeMap<String, String>,
+    pub override_env: BTreeMap<String, String>,
     pub cwd: String,
 }
 

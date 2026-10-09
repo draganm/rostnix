@@ -56,11 +56,11 @@ impl Package {
     /// except those that name paths.
     pub fn env(&self) -> BTreeMap<String, String> {
         let opt = |value: &Option<String>| value.clone().unwrap_or_default();
-        let (core, pre) = match self.version.split_once('-') {
-            Some((core, rest)) => (core, rest.split('+').next().unwrap_or("")),
-            None => (self.version.split('+').next().unwrap_or(""), ""),
-        };
-        let mut numbers = core.split('+').next().unwrap_or("").split('.');
+        // MAJOR.MINOR.PATCH[-PRE][+BUILD]: the build metadata may itself
+        // contain hyphens, so it comes off first.
+        let without_build = self.version.split('+').next().unwrap_or("");
+        let (core, pre) = without_build.split_once('-').unwrap_or((without_build, ""));
+        let mut numbers = core.split('.');
         let mut number = || numbers.next().unwrap_or("").to_string();
         BTreeMap::from([
             ("CARGO_PKG_NAME".to_string(), self.name.clone()),
@@ -142,5 +142,11 @@ mod tests {
         let env = pre.env();
         assert_eq!(env["CARGO_PKG_VERSION_PATCH"], "3");
         assert_eq!(env["CARGO_PKG_VERSION_PRE"], "beta.1");
+
+        // A hyphen in the build metadata starts no pre-release.
+        let env = package(&meta, "lz4-sys").env();
+        assert_eq!(env["CARGO_PKG_VERSION"], "1.11.1+lz4-1.10.0");
+        assert_eq!(env["CARGO_PKG_VERSION_PATCH"], "1");
+        assert_eq!(env["CARGO_PKG_VERSION_PRE"], "");
     }
 }

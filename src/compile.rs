@@ -39,6 +39,7 @@ pub fn run() -> Result<()> {
         .args(&inv.argv[1..])
         .current_dir(&inv.cwd)
         .envs(&inv.env)
+        .envs(&node.override_env)
         .status()
         .map_err(|err| format!("running {}: {err}", inv.argv[0]))?;
     if !status.success() {
@@ -61,6 +62,7 @@ pub fn run() -> Result<()> {
             native: inv.native,
             argv: inv.argv,
             env: inv.env,
+            override_env: node.override_env.clone(),
             cwd: inv.cwd,
         },
     )
@@ -177,7 +179,6 @@ pub fn plan(
         env.insert("OUT_DIR".to_string(), script.out_dir.clone());
         env.extend(script.env.iter().cloned());
     }
-    env.extend(node.override_env.clone());
 
     // What dependents need. A proc macro is loaded by rustc on its own, and
     // nothing links an executable.
@@ -260,6 +261,7 @@ mod tests {
             native: native.iter().map(|s| s.to_string()).collect(),
             argv: vec![],
             env: BTreeMap::new(),
+            override_env: BTreeMap::new(),
             cwd: String::new(),
         }
     }
@@ -376,11 +378,14 @@ mod tests {
         assert!(inv.transitive.is_empty() && inv.native.is_empty());
     }
 
+    // The planned environment is cargo's. An override is laid over it when
+    // rustc is started, and recorded apart.
     #[test]
-    fn override_env_wins() {
+    fn override_env_is_not_part_of_what_cargo_would_set() {
         let mut n = node("lib", false);
-        n.override_env = BTreeMap::from([("CARGO_PKG_NAME".to_string(), "overridden".to_string())]);
+        n.override_env = BTreeMap::from([("EXTRA".to_string(), "1".to_string())]);
         let inv = plan("/rustc", "/cargo", &n, "/out", &[], None);
-        assert_eq!(inv.env["CARGO_PKG_NAME"], "overridden");
+        assert!(!inv.env.contains_key("EXTRA"));
+        assert_eq!(inv.env["CARGO_PKG_NAME"], "pkg");
     }
 }

@@ -29,6 +29,12 @@
         in {
           inherit rustEnv;
           fixtures = import ./tests/fixtures.nix { inherit rustEnv pkgs; };
+          # What a plain `cargo build` of the buildscript fixture needs; the
+          # integration tests make their reference build in it.
+          fixtureShell = pkgs.mkShell {
+            packages = [ pkgs.cargo pkgs.rustc pkgs.pkg-config ];
+            buildInputs = [ pkgs.zlib ];
+          };
         });
 
       devShells = eachSystem (system: pkgs: {

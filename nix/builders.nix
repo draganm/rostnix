@@ -54,7 +54,7 @@ in
   # checksum dictates, so the download runs only where that did not happen.
   fetchCrate = { pname, version, sha256, url }:
     let crate = fetchurl { name = "${pname}-${version}.crate"; inherit url sha256; };
-    in runCommand "rustsrc-${pname}-${version}" { } ''
+    in runCommand "rustsrc-${pname}-${version}" { passthru = { inherit crate; }; } ''
       mkdir $out
       tar -xzf ${crate} -C $out --strip-components=1
     '';
@@ -120,7 +120,7 @@ in
       cargo = cargoBin;
       node = {
         inherit (node) features debugAssertions;
-        inherit (package) manifestDir;
+        inherit (package) manifestDir local;
         pkg = { inherit (package) name version; };
         src = "${sourceOf node.src override}";
         script = "${node.script}";

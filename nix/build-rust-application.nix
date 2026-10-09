@@ -82,6 +82,8 @@ runCommand (if version == null then pname else "${pname}-${version}")
   meta = lib.optionalAttrs (lib.length binNames == 1) { mainProgram = lib.head binNames; } // meta;
   passthru = {
     inherit rustc cargo;
+    # The source tree cargo planned from.
+    src = srcStr;
     graph = checked;
     inherit (checked) units bins;
     # What each unit ran, one file per unit, for comparing with cargo.
