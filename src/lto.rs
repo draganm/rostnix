@@ -284,6 +284,18 @@ mod tests {
         assert!(Lto::ObjectAndBitcode.args().is_empty());
     }
 
+    // A test is linked like a binary whatever its target is, so a
+    // library's unit tests run LTO themselves.
+    #[test]
+    fn a_test_runs_lto_like_a_binary() {
+        let mut g = graph(&[
+            ("lib", &["lib"], "thin", &[1]),
+            ("lib", &["lib"], "thin", &[]),
+        ]);
+        g.units[0].mode = "test".to_string();
+        assert_eq!(generate(&g), [thin(), Lto::OnlyBitcode]);
+    }
+
     #[test]
     fn a_library_root_under_lto_makes_bitcode() {
         let g = graph(&[("lib", &["lib"], "thin", &[])]);

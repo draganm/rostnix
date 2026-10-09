@@ -44,7 +44,10 @@ pub struct PkgRef {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompileNode {
+    /// What is built; `test` for any target built as a test.
     pub kind: String,
+    /// What the target is, whatever it is built as.
+    pub target_kind: String,
     pub pkg: PkgRef,
     pub crate_name: String,
     pub target_name: String,
@@ -100,6 +103,38 @@ pub struct LinksDep {
     pub links: String,
     /// The output of its build-script run.
     pub path: String,
+}
+
+/// The node of a `test` derivation: what the test is compiled from, as for
+/// a `compile`, and what it is run with.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestNode {
+    #[serde(flatten)]
+    pub compile: CompileNode,
+    /// The profile's directory in cargo's target directory.
+    pub profile_dir: String,
+    /// The outputs of the units that built the binaries and examples the
+    /// test finds beside itself.
+    pub executables: Vec<String>,
+    /// Arguments for the test executable.
+    pub args: Vec<String>,
+}
+
+/// What the run of a test leaves behind, beside its log and the record of
+/// its compilation.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestRecord {
+    pub kind: String,
+    pub pkg: PkgRef,
+    pub crate_name: String,
+    /// What the test ran with: the environment cargo would set, and what
+    /// the package's override added to it.
+    pub argv: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub override_env: BTreeMap<String, String>,
+    pub cwd: String,
 }
 
 /// What a `compile` leaves behind.
@@ -161,6 +196,9 @@ pub struct LinkArg {
 }
 
 pub const RECORD_FILE: &str = "unit.json";
+/// Where a test keeps the record of its run, beside that of its
+/// compilation.
+pub const RUN_RECORD_FILE: &str = "run.json";
 
 pub fn read_record<R: DeserializeOwned>(unit_out: &str) -> Result<R> {
     let file = Path::new(unit_out).join(RECORD_FILE);
@@ -170,7 +208,11 @@ pub fn read_record<R: DeserializeOwned>(unit_out: &str) -> Result<R> {
 }
 
 pub fn write_record<R: Serialize>(unit_out: &str, record: &R) -> Result<()> {
-    let file = Path::new(unit_out).join(RECORD_FILE);
+    write_record_as(unit_out, RECORD_FILE, record)
+}
+
+pub fn write_record_as<R: Serialize>(unit_out: &str, name: &str, record: &R) -> Result<()> {
+    let file = Path::new(unit_out).join(name);
     let text = serde_json::to_string_pretty(record)?;
     fs::write(&file, text + "\n").map_err(|err| format!("writing {}: {err}", file.display()).into())
 }

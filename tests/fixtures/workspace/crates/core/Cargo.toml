@@ -8,3 +8,8 @@ loud = []
 
 [lints]
 workspace = true
+
+# A test with its own main function.
+[[test]]
+name = "plain"
+harness = false

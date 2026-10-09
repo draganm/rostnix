@@ -4,7 +4,7 @@
 { lib, fetchurl, runCommand, stdenv, tool, rustc, cargo, system }:
 
 # Per-application settings.
-{ srcStr, crateOverrides ? { } }:
+{ srcStr, crateOverrides ? { }, checkFlags ? [ ] }:
 let
   builder = "${tool}/bin/rostnix";
   rustcBin = "${rustc}/bin/rustc";
@@ -54,6 +54,24 @@ let
     if src ? localSource
     then mkLocalSource (src.localSource // { extra = map cleanPath (override.extraSrc or [ ]); })
     else src;
+  # What the tool is told about a unit that rustc compiles.
+  compileNode = node: override:
+    let inherit (node) package;
+    in {
+      inherit (node) kind targetKind crateName targetName edition srcPath metadata rustcArgs tailArgs passL;
+      inherit (package) manifestDir workDir local;
+      pkg = { inherit (package) name version; };
+      src = "${sourceOf node.src override}";
+      remapTo = "${package.name}-${package.version}";
+      env = package.env // node.env;
+      deps = map (dep: { inherit (dep) name; path = "${dep.unit}"; }) node.deps;
+      buildScript = if node.buildScript == null then null else "${node.buildScript}";
+      overrideEnv = envOf override;
+    };
+
+  # The libraries of every overridden package a unit links.
+  linkedLibraries = node: lib.unique
+    (lib.concatMap (key: crateOverrides.${key}.buildInputs or [ ]) node.overrides);
 in
 {
   # A registry crate: its .crate file, then the tree unpacked from it.
@@ -80,17 +98,7 @@ in
       attrs = {
         rustc = rustcBin;
         cargo = cargoBin;
-        node = {
-          inherit (node) kind crateName targetName edition srcPath metadata rustcArgs tailArgs passL;
-          inherit (package) manifestDir workDir local;
-          pkg = { inherit (package) name version; };
-          src = "${sourceOf node.src override}";
-          remapTo = "${package.name}-${package.version}";
-          env = package.env // node.env;
-          deps = map (dep: { inherit (dep) name; path = "${dep.unit}"; }) node.deps;
-          buildScript = if node.buildScript == null then null else "${node.buildScript}";
-          overrideEnv = envOf override;
-        };
+        node = compileNode node override;
       };
     in
     if !node.linked && package.override == null then
@@ -107,10 +115,39 @@ in
         __structuredAttrs = true;
         strictDeps = true;
         nativeBuildInputs = override.nativeBuildInputs or [ ];
-        buildInputs = lib.unique
-          (lib.concatMap (key: crateOverrides.${key}.buildInputs or [ ]) node.overrides);
+        buildInputs = linkedLibraries node;
         buildCommand = "${builder} compile";
       } // attrs);
+
+  # One test executable, compiled and run. Both happen in a writable copy
+  # of the source, with the binaries and examples the test finds beside
+  # itself where cargo would have put them. Tests start programs and look
+  # for tools, so the derivation gets stdenv, and the tools and the
+  # environment of its package's override.
+  test = node:
+    let
+      inherit (node) package;
+      override = overrideOf package;
+    in
+    stdenv.mkDerivation {
+      inherit (node) name;
+      __structuredAttrs = true;
+      strictDeps = true;
+      rustc = rustcBin;
+      cargo = cargoBin;
+      node = compileNode node override // {
+        inherit (node) profileDir;
+        executables = map (unit: "${unit}") node.executables;
+        args = checkFlags;
+      };
+      nativeBuildInputs = override.nativeBuildInputs or [ ];
+      buildInputs = linkedLibraries node;
+      buildCommand = "${builder} test";
+      passthru = {
+        inherit (node) targetName targetKind;
+        packageName = package.name;
+      };
+    };
 
   # One run of a build script. Build scripts compile C and look for
   # libraries, so they always get stdenv and their package's override.

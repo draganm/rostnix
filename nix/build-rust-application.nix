@@ -14,9 +14,11 @@
 , noDefaultFeatures ? false
 , profile ? "release"
 , crateOverrides ? { }
-  # Tests are not built yet; these three are accepted and ignored.
+  # Whether to build the tests of the selected packages and run them.
 , doCheck ? true
+  # Arguments for every test executable.
 , checkFlags ? [ ]
+  # Names of test targets that are not run.
 , skipTests ? [ ]
 , meta ? { }
 }:
@@ -42,12 +44,12 @@ let
       rustc = "${rustc}/bin/rustc";
       src = srcStr;
       inherit (builtins) storeDir;
-      inherit cargoRoot packages bins examples features allFeatures noDefaultFeatures profile;
+      inherit cargoRoot packages bins examples features allFeatures noDefaultFeatures profile doCheck;
       overrideKeys = lib.attrNames crateOverrides;
     })
   ];
 
-  graph = graphFn (mkBuilders { inherit srcStr crateOverrides; });
+  graph = graphFn (mkBuilders { inherit srcStr crateOverrides checkFlags; });
 
   # A misspelt attribute would otherwise be ignored, and the build would
   # fail later for want of what it was meant to supply.
@@ -73,6 +75,12 @@ let
         && (crateOverrides.${package.override}.extraSrc or [ ]) != [ ])
       (lib.attrValues graph.packages));
 
+  # A skipTests entry that names no test target skips nothing, and the test
+  # it was meant for runs.
+  testTargets = map (test: test.targetName) (lib.attrValues graph.tests);
+  unmatchedSkips = lib.optionals doCheck
+    (lib.filter (name: !lib.elem name testTargets) skipTests);
+
   checked =
     assert lib.assertMsg (unknownOverrides == [ ])
       "rostnix: unknown ${lib.concatStringsSep ", " unknownOverrides}; a crateOverrides entry takes ${lib.concatStringsSep ", " overrideAttrs}";
@@ -82,9 +90,24 @@ let
       "rostnix: the selection builds no binary and no example, so there is nothing to install; name what to build with `bins` or `examples`";
     lib.warnIf (unmatchedOverrides != [ ])
       "rostnix: ${lib.concatStringsSep ", " unmatchedOverrides} ${if lib.length unmatchedOverrides == 1 then "names" else "name"} no package of this build and ${if lib.length unmatchedOverrides == 1 then "has" else "have"} no effect; a key is a package name"
-      graph;
+      (lib.warnIf (unmatchedSkips != [ ])
+        "rostnix: skipTests names ${lib.concatStringsSep ", " unmatchedSkips}, which ${if lib.length unmatchedSkips == 1 then "is no test target" else "are no test targets"} of this build; the test targets are ${lib.concatStringsSep ", " (lib.unique testTargets)}"
+        graph);
 
   binNames = lib.attrNames checked.bins;
+
+  # The tests the application waits for: every one that is not skipped.
+  testRuns = lib.filterAttrs (_: test: !lib.elem test.targetName skipTests) checked.tests;
+  skipped = lib.attrNames (removeAttrs checked.tests (lib.attrNames testRuns));
+
+  # What was run, one file per record, for comparing with cargo.
+  records = name: files: runCommand "${pname}-${name}" { } ''
+    mkdir $out
+    ${lib.concatStrings (lib.mapAttrsToList
+      (key: file: "ln -s ${file} $out/${lib.escapeShellArg key}.json\n")
+      files)}
+  '';
+  recordsOf = keys: lib.genAttrs keys (key: "${checked.units.${key}}/unit.json");
 
   # Copies one executable out of its unit. macOS leaves debug information
   # in the object files and has the executable point at them, which would
@@ -110,19 +133,26 @@ in
 {
   # With one executable, `nix run` needs no flags.
   meta = lib.optionalAttrs (lib.length binNames == 1) { mainProgram = lib.head binNames; } // meta;
+  # The application is built only when its tests pass and what `cargo test`
+  # builds beside them, the examples, compiles. Both are inputs and leave
+  # nothing in the result, so the result does not refer to them.
+  testRuns = lib.attrValues testRuns;
+  inherit (checked) testBuilds;
   passthru = {
     inherit rustc cargo;
     # The source tree cargo planned from.
     src = srcStr;
     graph = checked;
     inherit (checked) units bins;
-    # What each unit ran, one file per unit, for comparing with cargo.
-    unitRecords = runCommand "${pname}-unit-records" { } ''
-      mkdir $out
-      ${lib.concatStrings (lib.mapAttrsToList
-        (key: unit: "ln -s ${unit}/unit.json $out/${lib.escapeShellArg key}.json\n")
-        checked.units)}
-    '';
+    # The tests that are run, each under its unit's key.
+    tests = testRuns;
+    # What `cargo build` would run, and what `cargo test` would: the units
+    # of each plan, and with the second how each test was run. A skipped
+    # test is neither compiled nor run, so it leaves no record.
+    unitRecords = records "unit-records" (recordsOf checked.buildUnits);
+    testUnitRecords = records "test-unit-records"
+      (recordsOf (lib.subtractLists skipped checked.testUnits)
+        // lib.mapAttrs' (key: test: lib.nameValuePair "${key}-run" "${test}/run.json") testRuns);
   };
 }
   ''

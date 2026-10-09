@@ -70,15 +70,21 @@ in
       rev = "e6e900b7a0f41b3540a319c1367fd167921d5d8c";
     };
     examples = [ "amber-store" ];
+    # It runs `cargo build`, which needs the network and a target directory.
+    skipTests = [ "amber_bench_smoke" ];
+    # It expects an extracted file to keep its setuid bit, and Nix lets no
+    # build create a setuid file.
+    checkFlags = [ "--skip" "golden_tar_extracts" ];
   };
 
-  # rostnix builds itself. The source is narrowed to what cargo reads, so
-  # that editing the docs or the Nix library rebuilds nothing.
+  # rostnix builds itself and runs its own unit tests. The source is
+  # narrowed to what cargo and the tests read, so that editing the docs or
+  # the Nix library rebuilds nothing.
   self = rustEnv.buildRustApplication {
     pname = "rostnix";
     src = lib.fileset.toSource {
       root = ../.;
-      fileset = lib.fileset.unions [ ../Cargo.toml ../Cargo.lock ../src ../examples ];
+      fileset = lib.fileset.unions [ ../Cargo.toml ../Cargo.lock ../src ../examples ../testdata ];
     };
   };
 }

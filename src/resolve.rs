@@ -32,6 +32,8 @@ pub struct Request {
     pub no_default_features: bool,
     pub profile: String,
     pub override_keys: Vec<String>,
+    /// Whether to plan the tests too.
+    pub do_check: bool,
 }
 
 impl Request {
@@ -47,6 +49,29 @@ impl Request {
         if self.no_default_features {
             args.push("--no-default-features".to_string());
         }
+        args
+    }
+
+    /// What `cargo test` is asked to plan: the tests of the selected
+    /// packages. `bins` and `examples` narrow what is installed, not what
+    /// is tested.
+    fn test_graph_args(&self) -> Vec<String> {
+        let mut args: Vec<String> = [
+            "test",
+            "--no-run",
+            "--unit-graph",
+            "-Z",
+            "unstable-options",
+            "--locked",
+            "--profile",
+            &self.profile,
+        ]
+        .map(String::from)
+        .to_vec();
+        for package in &self.packages {
+            args.extend(["--package".to_string(), package.clone()]);
+        }
+        args.extend(self.feature_args());
         args
     }
 
@@ -91,6 +116,9 @@ impl Request {
     }
 }
 
+/// What follows an error that the tests alone cause.
+const TESTS_ONLY: &str = "this concerns the tests only: what is installed can be planned without them. Set doCheck = false to build without tests";
+
 /// `"."`, `"./a/"` and the like as a path relative to the source root, with
 /// `""` for the root.
 fn normalize_dir(dir: &str) -> String {
@@ -131,34 +159,58 @@ pub fn run(request: &str) -> Result<String> {
     let host = cargo.host()?;
     let cargo_version = cargo.version(&workspace)?;
 
-    let units: UnitGraph = serde_json::from_slice(
-        &cargo.output(&workspace, &request.unit_graph_args())?,
-    )
-    .map_err(|err| {
-        format!("cargo {cargo_version} printed a unit graph this version cannot read: {err}")
-    })?;
-    if units.version != 1 {
-        return Err(format!("cargo {cargo_version} prints version {} of the unit graph; this version reads version 1", units.version).into());
-    }
+    let plan = |args: &[String]| -> Result<UnitGraph> {
+        let units: UnitGraph =
+            serde_json::from_slice(&cargo.output(&workspace, args)?).map_err(|err| {
+                format!(
+                    "cargo {cargo_version} printed a unit graph this version cannot read: {err}"
+                )
+            })?;
+        if units.version != 1 {
+            return Err(format!("cargo {cargo_version} prints version {} of the unit graph; this version reads version 1", units.version).into());
+        }
+        Ok(units)
+    };
+    let units = plan(&request.unit_graph_args())?;
+    let test_units = request
+        .do_check
+        .then(|| plan(&request.test_graph_args()))
+        .transpose()
+        .map_err(|err| format!("{err}\n{TESTS_ONLY}"))?;
     let metadata: Metadata =
         serde_json::from_slice(&cargo.output(&workspace, &request.metadata_args(&host))?).map_err(
             |err| format!("cargo {cargo_version} printed metadata this version cannot read: {err}"),
         )?;
 
-    let graph = graph::build(&Inputs {
-        units: &units,
-        metadata: &metadata,
-        checksums: &checksums,
-        src,
-        cargo_root: &cargo_root,
-        host: &host,
-        cargo_version: &cargo_version,
-        override_keys: &request.override_keys,
-        read_manifest: &|path| {
-            let text = fs::read_to_string(path).map_err(|err| format!("reading {path}: {err}"))?;
-            toml::from_str(&text).map_err(|err| format!("parsing {path}: {err}").into())
-        },
-    })?;
+    let build = |test_units: Option<&UnitGraph>| {
+        graph::build(&Inputs {
+            units: &units,
+            test_units,
+            metadata: &metadata,
+            checksums: &checksums,
+            src,
+            cargo_root: &cargo_root,
+            host: &host,
+            cargo_version: &cargo_version,
+            override_keys: &request.override_keys,
+            read_manifest: &|path| {
+                let text =
+                    fs::read_to_string(path).map_err(|err| format!("reading {path}: {err}"))?;
+                toml::from_str(&text).map_err(|err| format!("parsing {path}: {err}").into())
+            },
+            read_source: &|path| fs::read_to_string(path).ok(),
+        })
+    };
+    let graph = match build(test_units.as_ref()) {
+        Ok(graph) => graph,
+        // What is refused may be something only the tests need: a
+        // dev-dependency from git, say. Then the way out is to do without
+        // the tests, and the message says so.
+        Err(err) if test_units.is_some() && build(None).is_ok() => {
+            return Err(format!("{err}\n{TESTS_ONLY}").into());
+        }
+        Err(err) => return Err(err),
+    };
 
     // The crates must be added while the private cargo home still exists:
     // their paths go through it.
@@ -196,7 +248,7 @@ mod tests {
         serde_json::from_str(&format!(
             r#"{{"cargo":"/c","rustc":"/r","src":"/s","storeDir":"/nix/store","cargoRoot":".",
                 "packages":[],"bins":[],"examples":[],"features":[],"allFeatures":false,
-                "noDefaultFeatures":false,"profile":"release","overrideKeys":[]{extra}}}"#
+                "noDefaultFeatures":false,"profile":"release","overrideKeys":[],"doCheck":true{extra}}}"#
         ))
         .unwrap()
     }
@@ -232,6 +284,26 @@ mod tests {
             .metadata_args("h")
             .join(" ")
             .ends_with("--features x,dep/y --all-features --no-default-features"));
+    }
+
+    // Tests are those of the selected packages, with the features of the
+    // build. Naming a binary to install does not narrow them.
+    #[test]
+    fn tests_are_planned_for_the_selected_packages() {
+        let mut req = request("");
+        assert_eq!(
+            req.test_graph_args().join(" "),
+            "test --no-run --unit-graph -Z unstable-options --locked --profile release"
+        );
+        req.packages = vec!["a".into()];
+        req.bins = vec!["tool".into()];
+        req.examples = vec!["demo".into()];
+        req.features = vec!["x".into()];
+        req.profile = "thin".into();
+        assert_eq!(
+            req.test_graph_args().join(" "),
+            "test --no-run --unit-graph -Z unstable-options --locked --profile thin --package a --features x"
+        );
     }
 
     #[test]

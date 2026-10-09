@@ -42,18 +42,16 @@ check_bins() {
   echo "ok: $1: installs [$2]"
 }
 
-# check_conformance <fixture> <shell> <cargo build arguments...>
-# Every rustc invocation and build-script run must be what `cargo build -vv`
-# runs for the same source, apart from what the spec lists. The arguments
-# name the fixture's profile and selection, release included: cargo's own
-# default is dev. The reference
-# build runs in the named flake shell, with a cargo home that shares only
-# the download cache, as resolve's does.
-check_conformance() {
-  local fixture="$1" shell="$2" src dir records
-  shift 2
+# compare_with_cargo <fixture> <shell> <records attribute> <conformance flag or ""> <cargo arguments...>
+# Runs cargo on a copy of the fixture's source, in the named flake shell and
+# with a cargo home that shares only the download cache, as resolve's does.
+# What cargo ran must be what the fixture's records say rostnix ran, apart
+# from what the spec lists. The flags are split into words.
+compare_with_cargo() {
+  local fixture="$1" shell="$2" attr="$3" flag="$4" src dir records
+  shift 4
   src="$(nix eval --raw "${exec_opt[@]}" "$flake#fixtures.$fixture.src")"
-  dir="$work/conformance-$fixture"
+  dir="$work/conformance-$fixture-$attr"
   mkdir -p "$dir/home" "$dir/src"
   ln -s "${CARGO_HOME:-$HOME/.cargo}/registry" "$dir/home/registry"
   cp -R "$src/." "$dir/src/"
@@ -61,19 +59,52 @@ check_conformance() {
   (cd "$dir/src" &&
     env -u RUSTFLAGS -u CARGO_BUILD_TARGET -u RUSTC_WRAPPER \
       CARGO_HOME="$dir/home" CARGO_TARGET_DIR="$dir/target" \
-      nix develop "$flake#$shell" --command cargo build -vv --locked "$@" >/dev/null 2>"$dir/cargo.log") ||
-    fail "$fixture: the reference cargo build failed; see $(tail -n 5 "$dir/cargo.log")"
-  records="$(build "fixtures.$fixture.unitRecords")"
+      nix develop "$flake#$shell" --command cargo "$@" >"$dir/cargo.out" 2>"$dir/cargo.log") ||
+    fail "$fixture: the reference cargo $1 failed; see $(tail -n 5 "$dir/cargo.log")"
+  records="$(build "fixtures.$fixture.$attr")"
   CARGO_TARGET_DIR="$work/target" nix develop "$flake" --command \
-    cargo run --quiet --manifest-path "$root/Cargo.toml" --example conformance -- "$dir/cargo.log" "$records" ||
-    fail "$fixture: rostnix does not run what cargo runs (differences above)"
+    cargo run --quiet --manifest-path "$root/Cargo.toml" --example conformance -- $flag "$dir/cargo.log" "$records" ||
+    fail "$fixture: rostnix does not run what cargo $1 runs (differences above)"
   rm -rf "$dir"
+}
+
+# check_conformance <fixture> <shell> <cargo build arguments...>
+# Every rustc invocation and build-script run must be what `cargo build -vv`
+# runs for the same source. The arguments name the fixture's profile and
+# selection, release included: cargo's own default is dev.
+check_conformance() {
+  local fixture="$1" shell="$2"
+  shift 2
+  compare_with_cargo "$fixture" "$shell" unitRecords "" build -vv --locked "$@"
   echo "ok: $fixture: every invocation is cargo's"
+}
+
+# check_test_conformance <fixture> <shell> <cargo test arguments...>
+# The same for the tests: what is compiled for them, and how each test is
+# run, must be what `cargo test -vv` does. That the reference run succeeds
+# also shows that the fixture's tests pass under cargo itself.
+check_test_conformance() {
+  local fixture="$1" shell="$2"
+  shift 2
+  compare_with_cargo "$fixture" "$shell" testUnitRecords "" test -vv --locked "$@"
+  echo "ok: $fixture: every test is compiled and run as cargo does it"
+}
+
+# check_test_compile_conformance <fixture> <shell> <skipped test> <cargo test arguments...>
+# For a project with a test that cannot run here: the reference is
+# `cargo test --no-run`, and the runs are left out of the comparison. So is
+# the test the fixture skips, which rostnix does not compile either.
+check_test_compile_conformance() {
+  local fixture="$1" shell="$2" skipped="$3"
+  shift 3
+  compare_with_cargo "$fixture" "$shell" testUnitRecords "--compile-only --without $skipped" \
+    test --no-run -vv --locked "$@"
+  echo "ok: $fixture: every test is compiled as cargo does it"
 }
 
 # check_incremental <fixture directory or store path> <arguments> <file to append to> <what must change> [label]
 # Evaluates the project from two copies that differ in one file and lists
-# the derivation names of the units that differ.
+# the derivation names of the units and the test runs that differ, sorted.
 check_incremental() {
   local src="$1" args="$2" file="$3" want="$4" a b got
   local label="${5:-$(basename "$1")}"
@@ -91,10 +122,11 @@ check_incremental() {
       build = src: rustEnv.buildRustApplication ({ pname = \"incremental\"; inherit src; } // $args);
       a = build $a;
       b = build $b;
-      changed = builtins.filter
-        (n: a.units.\${n}.drvPath != b.units.\${n}.drvPath)
-        (builtins.attrNames a.units);
-    in builtins.concatStringsSep \" \" (pkgs.lib.unique (map (n: a.units.\${n}.name) changed))
+      changed = set: builtins.filter
+        (n: a.\${set}.\${n}.drvPath != b.\${set}.\${n}.drvPath)
+        (builtins.attrNames a.\${set});
+      names = set: map (n: a.\${set}.\${n}.name) (changed set);
+    in builtins.concatStringsSep \" \" (pkgs.lib.sort builtins.lessThan (pkgs.lib.unique (names \"units\" ++ names \"tests\")))
   ")"
   rm -rf "$a" "$b"
   [ "$got" = "$want" ] || fail "$label: editing $file changed [$got], want [$want]"
@@ -265,15 +297,15 @@ check_no_intermediate_refs() {
   local out refs
   out="$(build "fixtures.$1")"
   refs="$(nix-store --query --references "$out")"
-  if grep -E -- '-(rustsrc|rustlib|rustmacro|rustbs|rustbsrun|rustbin)-' <<<"$refs"; then
+  if grep -E -- '-(rustsrc|rustlib|rustmacro|rustbs|rustbsrun|rustbin|rusttest)-' <<<"$refs"; then
     fail "$1: the result refers to the build inputs listed above"
   fi
-  echo "ok: $1: the result refers to no source tree or unit"
+  echo "ok: $1: the result refers to no source tree, unit or test"
 }
 
 # check_stdenv <fixture>
-# Only units that link, and build-script runs, build with stdenv and its C
-# compiler; a library keeps the tool as its builder.
+# Only units that link, tests among them, and build-script runs build with
+# stdenv and its C compiler; a library keeps the tool as its builder.
 check_stdenv() {
   local got
   got="$(nix eval "${exec_opt[@]}" --raw "$flake#fixtures.$1.units" --apply '
@@ -284,27 +316,169 @@ check_stdenv() {
       all = builtins.attrValues units;
     in "stdenv: ${prefixes (builtins.filter (u: u ? stdenv) all)}; bare: ${prefixes (builtins.filter (u: !(u ? stdenv)) all)}"
   ')" || fail "$1: units do not evaluate"
-  [ "$got" = "stdenv: rustbin rustbs rustbsrun rustmacro; bare: rustlib" ] ||
-    fail "$1: builders are [$got], want [stdenv: rustbin rustbs rustbsrun rustmacro; bare: rustlib]"
+  [ "$got" = "stdenv: rustbin rustbs rustbsrun rustmacro rusttest; bare: rustlib" ] ||
+    fail "$1: builders are [$got], want [stdenv: rustbin rustbs rustbsrun rustmacro rusttest; bare: rustlib]"
   echo "ok: $1: only libraries build without stdenv"
+}
+
+# test_log <fixture> <test target> <target kind>: prints the path of what
+# that test printed when it ran. The kind tells a library's unit tests from
+# those of a binary or an integration test of the same name.
+test_log() {
+  local out
+  out="$(nix build --impure "${exec_opt[@]}" --no-link --print-out-paths --expr "
+    let fixture = (builtins.getFlake \"$flake\").legacyPackages.\${builtins.currentSystem}.fixtures.$1;
+    in builtins.head (builtins.filter (test: test.targetName == \"$2\" && test.targetKind == \"$3\") (builtins.attrValues fixture.tests))
+  ")" || fail "$1: the tests of $2 ($3) do not build and pass"
+  echo "$out/log"
+}
+
+# check_tests_ran <fixture> <test target> <target kind> <pattern its log must match>
+# The pattern is an extended regular expression. One that asks for a count
+# of passed tests cannot be met by a test executable with no test in it.
+check_tests_ran() {
+  local log
+  log="$(test_log "$1" "$2" "$3")"
+  grep -qE -- "$4" "$log" || fail "$1: the log of $2 ($3) does not match '$4': $(cat "$log")"
+  echo "ok: $1: the tests of $2 ($3) ran: $(grep -E -- "$4" "$log" | head -n 1)"
+}
+
+# A failing test fails the build, and the log names the test. The fixture
+# has an ignored test that panics; checkFlags makes the harness run it.
+check_failing_test() {
+  local msg
+  if msg="$(nix build --impure "${exec_opt[@]}" --no-link -L --expr "
+      (builtins.getFlake \"$flake\").legacyPackages.\${builtins.currentSystem}.rustEnv.buildRustApplication {
+        pname = \"failing\";
+        src = $root/tests/fixtures/hello;
+        checkFlags = [ \"--include-ignored\" ];
+      }" 2>&1)"; then
+    fail "a build with a failing test succeeded"
+  fi
+  case "$msg" in
+    *'test tests::fails_on_purpose ... FAILED'*) ;;
+    *) fail "the log of a failing build does not name the failed test: $msg" ;;
+  esac
+  case "$msg" in
+    *'rostnix: the test hello of hello 0.1.0 failed'*) echo "ok: a failing test fails the build and is named" ;;
+    *) fail "a failing test is not reported by name: $msg" ;;
+  esac
+}
+
+# skipTests leaves a test out, so that the application does not wait for
+# it. An entry that names no test target skips nothing and is warned about.
+check_skip_tests() {
+  local got msg
+  got="$(fixture_with hello '{ skipTests = [ "smoke" ]; }' '
+    "${toString (map (test: test.targetName) (builtins.attrValues app.tests))}; ${toString (builtins.length app.testRuns)}"')" ||
+    fail "skipTests does not evaluate"
+  [ "$got" = "cli hello hello; 3" ] || fail "skipTests = [ smoke ] leaves the tests [$got], want [cli hello hello; 3]"
+  msg="$(fixture_with hello '{ skipTests = [ "smok" ]; }' 'app.drvPath' 2>&1)" ||
+    fail "a skipTests entry that names no test stops the evaluation: $msg"
+  case "$msg" in
+    *'skipTests names smok, which is no test target of this build; the test targets are cli, hello, smoke'*)
+      echo "ok: skipTests leaves a test out and warns about an entry that names no test" ;;
+    *) fail "no warning for a skipTests entry that names no test: $msg" ;;
+  esac
+}
+
+# Without doCheck no test is planned: the graph is cargo build's alone.
+check_no_check() {
+  local got
+  got="$(fixture_with hello '{ doCheck = false; }' '
+    "${toString (builtins.length (builtins.attrNames app.tests))} ${toString (builtins.length app.graph.testUnits)} ${toString (app.graph.buildUnits == builtins.attrNames app.units)} ${toString (builtins.length app.testRuns)}"')" ||
+    fail "doCheck = false does not evaluate"
+  [ "$got" = "0 0 1 0" ] || fail "doCheck = false still plans tests: [$got]"
+  echo "ok: doCheck = false plans no test"
+}
+
+# Tests share with the application every unit that both plans describe
+# alike. In hello that is all of the application. In the workspace a
+# dev-dependency turns a feature of ws-core on, so the ws-app the tests run
+# is another unit than the one that is installed.
+check_shared_units() {
+  local got
+  got="$(nix eval "${exec_opt[@]}" --raw "$flake#fixtures.hello.graph" --apply '
+    g: toString (builtins.length (builtins.filter (key: !(builtins.elem key g.testUnits)) g.buildUnits))')" ||
+    fail "hello: the graph does not evaluate"
+  [ "$got" = 0 ] || fail "hello: $got units of the application are planned again for the tests"
+  got="$(nix eval "${exec_opt[@]}" --raw "$flake#fixtures.workspace.graph" --apply '
+    g:
+    let
+      apps = builtins.filter (key: builtins.match "ws-app-0.3.0-bin-ws-app-.*" key != null);
+      installed = apps g.buildUnits;
+      tested = apps g.testUnits;
+    in toString [ (builtins.length installed) (builtins.length tested) (installed != tested) ]')" ||
+    fail "workspace: the graph does not evaluate"
+  [ "$got" = "1 1 1" ] || fail "workspace: installed and tested ws-app are [$got], want [1 1 1]"
+  echo "ok: tests share the application's units where cargo plans them alike, and only there"
+}
+
+# What only the tests need may be something rostnix refuses. The error then
+# says that it concerns the tests, and how to build without them. Here it
+# is a test rooted outside its package, by a path with `..` in it.
+check_tests_only_refusal() {
+  local dir="$work/outside" msg
+  mkdir -p "$dir/pkg"
+  cp -R "$root/tests/fixtures/hello/." "$dir/pkg/"
+  printf '\n[[test]]\nname = "outside"\npath = "../outside.rs"\n' >>"$dir/pkg/Cargo.toml"
+  printf '#[test]\nfn passes() {}\n' >"$dir/outside.rs"
+  outside_with() {
+    nix eval --impure --raw "${exec_opt[@]}" --expr "
+      ((builtins.getFlake \"$flake\").legacyPackages.\${builtins.currentSystem}.rustEnv.buildRustApplication {
+        pname = \"outside\";
+        src = $dir;
+        cargoRoot = \"pkg\";
+        doCheck = $1;
+      }).drvPath" 2>&1
+  }
+  if msg="$(outside_with true)"; then
+    fail "a test rooted outside its package was accepted"
+  fi
+  case "$msg" in
+    *'the target outside of hello 0.1.0 has its root at'*'outside the package directory'*'this concerns the tests only'*'doCheck = false'*) ;;
+    *) fail "unhelpful error for a test that cannot be planned: $msg" ;;
+  esac
+  outside_with false >/dev/null ||
+    fail "doCheck = false does not build without the test that cannot be planned"
+  rm -rf "$dir"
+  echo "ok: what only the tests need and cannot be planned is explained; doCheck = false builds without it"
 }
 
 check_run hello hello '{"greeting":"hello","n":42}'
 check_conformance hello default --profile release
+check_test_conformance hello default --profile release
+check_tests_ran hello cli test "test result: ok\. 6 passed"
+check_tests_ran hello smoke test "test result: ok\. 1 passed"
+check_tests_ran hello hello lib "test result: ok\. 1 passed; 0 failed; 1 ignored"
 check_main_program hello hello
 check_stdenv hello
 check_no_intermediate_refs hello
 check_fetch_fallback hello anyhow
+check_failing_test
+check_skip_tests
+check_no_check
+check_shared_units
+check_tests_only_refusal
 
 # A workspace: the default selection is every member, and a narrower one
-# with a feature builds one binary.
+# with a feature builds one binary. Its tests cover a proc macro's unit
+# tests, a test without the harness, and a binary that the tests get with
+# another feature set than the one installed.
 check_run workspace ws-app "hello from ws-app: 3"
 check_run workspace ws-tool "ws-tool ok 7"
 check_bins workspace "ws-app ws-tool"
 check_conformance workspace default --profile release
+check_test_conformance workspace default --profile release
+check_tests_ran workspace plain test "^plain test ran$"
+check_tests_ran workspace ws_macros proc-macro "test result: ok\. 1 passed"
+check_tests_ran workspace cli test "test result: ok\. 2 passed"
 check_run workspace-shout ws-app "HELLO FROM WS-APP: 3"
 check_bins workspace-shout "ws-app"
 check_conformance workspace-shout default --profile release --package ws-app --bin ws-app --features shout
+# Tests are those of the selected package; naming a binary does not narrow
+# them.
+check_test_conformance workspace-shout default --profile release --package ws-app --features shout
 
 # Build scripts. The note comes from an override's env, the message from a
 # file an override's extraSrc adds, and pc from the pkg-config and zlib that
@@ -313,6 +487,8 @@ zlib_version="$(nix eval --raw "$flake#fixtureShell.buildInputs" --apply 'inputs
 check_run buildscript consumer \
   "add=5 answer=42 note=from-override generated=from-build-script cfg=yes old=yes msg=shared-message zlib=ok pc=$zlib_version"
 ROSTNIX_FIXTURE_NOTE=from-override check_conformance buildscript fixtureShell --profile release
+ROSTNIX_FIXTURE_NOTE=from-override check_test_conformance buildscript fixtureShell --profile release
+check_tests_ran buildscript bs_native lib "test result: ok\. 2 passed"
 check_no_intermediate_refs buildscript
 check_override_typo
 check_override_unmatched
@@ -320,10 +496,13 @@ check_override_inputs
 check_override_foreign_extra_src
 check_override_spellings
 
-# One project under four profiles.
+# One project under four profiles. The release profile aborts on panic;
+# its tests, one of which expects a panic, unwind as cargo has them do.
 for profile in release thin nolto dev; do
   check_run "profiles-$profile" profiles "profiles ok 12345"
   check_conformance "profiles-$profile" default --profile "$profile"
+  check_test_conformance "profiles-$profile" default --profile "$profile"
+  check_tests_ran "profiles-$profile" profiles bin "test result: ok\. 2 passed"
 done
 # dev keeps debug information. On macOS that lives in the units' object
 # files, which the result must not keep alive: it gets a .dSYM instead.
@@ -336,7 +515,8 @@ if [ "$(uname)" = Darwin ]; then
   echo "ok: profiles-dev: debug information is in a .dSYM bundle"
 fi
 
-# Patient zero.
+# Patient zero. Building it runs its test suite, apart from the one test
+# that runs cargo.
 core_rs="$(build fixtures.core-rs)"
 "$core_rs/bin/amber-store" --help >/dev/null || fail "core-rs: amber-store --help fails"
 mkdir -p "$work/tree/sub" && echo one >"$work/tree/a.txt" && echo two >"$work/tree/sub/b.txt"
@@ -346,8 +526,21 @@ diff -r "$work/tree" "$work/restored" || fail "core-rs: amber-store does not res
 echo "ok: core-rs: amber-store ingests and restores a tree"
 check_conformance core-rs default --profile release --example amber-store
 check_no_intermediate_refs core-rs
+core_rs_tests="$(nix eval "${exec_opt[@]}" --raw "$flake#fixtures.core-rs" --apply '
+  app: "${toString (builtins.length app.testRuns)} of ${toString (builtins.length (builtins.attrNames app.graph.tests))}"')"
+[ "$core_rs_tests" = "21 of 22" ] ||
+  fail "core-rs: the application waits for $core_rs_tests tests, want 21 of 22"
+echo "ok: core-rs: 21 of its 22 test executables ran"
+# The CLI test finds the example beside its own executable. The pack store
+# test copies golden files out of the source and writes to the copies.
+check_tests_ran core-rs cli_e2e test "test result: ok\. [1-9][0-9]* passed"
+check_tests_ran core-rs golden_packstore test "test result: ok\. 4 passed"
+check_tests_ran core-rs amber_store_core lib "test result: ok\. [1-9][0-9]* passed"
+# The one test Nix itself rules out: it creates a setuid file.
+check_tests_ran core-rs tar_extract test "test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out"
+check_test_compile_conformance core-rs default amber_bench_smoke --profile release
 
-# rostnix builds itself.
+# rostnix builds itself, and its own unit tests pass in a derivation.
 self="$(build fixtures.self)"
 # Without a command it prints its usage and exits 2.
 usage="$("$self/bin/rostnix" 2>&1 || true)"
@@ -357,33 +550,60 @@ case "$usage" in
 esac
 echo "ok: self: rostnix builds itself"
 check_conformance self default --profile release
+check_test_conformance self default --profile release
+check_tests_ran self rostnix lib "test result: ok\. [1-9][0-9][0-9] passed"
 
 # An edit rebuilds the units that see the file and what depends on them.
+# A test is such a unit: it is built and run again when it could tell the
+# difference.
 hello="$root/tests/fixtures/hello"
-check_incremental "$hello" '{ }' src/lib.rs "rustbin-hello rustlib-hello-0.1.0"
-check_incremental "$hello" '{ }' src/main.rs "rustbin-hello"
-# Tests and examples that are not built are not seen.
-check_incremental "$hello" '{ }' tests/smoke.rs ""
-check_incremental "$hello" '{ }' examples/extra.rs ""
+check_incremental "$hello" '{ }' src/lib.rs \
+  "rustbin-extra rustbin-hello rustlib-hello-0.1.0 rusttest-cli rusttest-hello rusttest-smoke"
+# The binary, its own unit tests, and the integration tests, which run it.
+check_incremental "$hello" '{ }' src/main.rs "rustbin-hello rusttest-cli rusttest-hello rusttest-smoke"
+# A test's own file is seen by that test alone.
+check_incremental "$hello" '{ }' tests/smoke.rs "rusttest-smoke"
+# Data under tests/ is seen by everything built as a test, and by nothing
+# that is installed.
+check_incremental "$hello" '{ }' tests/data/expected.json "rusttest-cli rusttest-hello rusttest-smoke"
+# An example is rebuilt, and the integration tests find it beside
+# themselves. Unit tests are promised no example.
+check_incremental "$hello" '{ }' examples/extra.rs "rustbin-extra rusttest-cli rusttest-smoke"
+# Without tests, tests and examples are not seen at all.
+check_incremental "$hello" '{ doCheck = false; }' tests/smoke.rs ""
+check_incremental "$hello" '{ doCheck = false; }' examples/extra.rs ""
+check_incremental "$hello" '{ doCheck = false; }' src/lib.rs "rustbin-hello rustlib-hello-0.1.0"
 
 workspace="$root/tests/fixtures/workspace"
-check_incremental "$workspace" '{ }' crates/core/src/lib.rs "rustbin-ws-app rustbin-ws-tool rustlib-ws-core-0.3.0"
+check_incremental "$workspace" '{ doCheck = false; }' crates/core/src/lib.rs "rustbin-ws-app rustbin-ws-tool rustlib-ws-core-0.3.0"
 # A package inside another's directory is not part of the outer one.
-check_incremental "$workspace" '{ }' crates/core/nested/src/lib.rs "rustbin-ws-app rustbin-ws-tool rustlib-ws-nested-0.3.0"
+check_incremental "$workspace" '{ doCheck = false; }' crates/core/nested/src/lib.rs "rustbin-ws-app rustbin-ws-tool rustlib-ws-nested-0.3.0"
 # Binaries of one package do not see each other.
-check_incremental "$workspace" '{ }' app/src/bin/ws-tool.rs "rustbin-ws-tool"
-check_incremental "$workspace" '{ }' crates/macros/src/lib.rs "rustbin-ws-app rustbin-ws-tool rustmacro-ws-macros-0.3.0"
+check_incremental "$workspace" '{ doCheck = false; }' app/src/bin/ws-tool.rs "rustbin-ws-tool"
+check_incremental "$workspace" '{ doCheck = false; }' crates/macros/src/lib.rs "rustbin-ws-app rustbin-ws-tool rustmacro-ws-macros-0.3.0"
+# With tests: the tests of the package and of what depends on it run again,
+# and no other package's.
+check_incremental "$workspace" '{ }' crates/core/src/lib.rs \
+  "rustbin-ws-app rustbin-ws-tool rustlib-ws-core-0.3.0 rusttest-cli rusttest-common rusttest-plain rusttest-ws-app rusttest-ws-tool rusttest-ws_core"
+check_incremental "$workspace" '{ }' crates/core/tests/plain.rs "rusttest-plain"
+# tests/common.rs is a test of its own to cargo and a module of plain.rs,
+# which says `mod common;`: both see it, and nothing else does.
+check_incremental "$workspace" '{ }' crates/core/tests/common.rs "rusttest-common rusttest-plain"
+check_incremental "$workspace" '{ }' app/src/bin/ws-tool.rs "rustbin-ws-tool rusttest-cli rusttest-ws-tool"
 
 # A file an override's extraSrc adds is seen by that package's units.
 buildscript="$root/tests/fixtures/buildscript"
 check_incremental "$buildscript" '{ crateOverrides.consumer.extraSrc = [ "shared" ]; }' shared/message.txt \
-  "rustbin-consumer rustbs-consumer-0.1.0 rustbsrun-consumer-0.1.0"
+  "rustbin-consumer rustbs-consumer-0.1.0 rustbsrun-consumer-0.1.0 rusttest-consumer"
 
 core_rs_src="$(nix eval --raw "${exec_opt[@]}" "$flake#fixtures.core-rs.src")"
-check_incremental "$core_rs_src" '{ examples = [ "amber-store" ]; }' src/lib.rs \
+check_incremental "$core_rs_src" '{ examples = [ "amber-store" ]; doCheck = false; }' src/lib.rs \
   "rustbin-amber-store rustlib-amber-store-core-0.10.0" core-rs
-check_incremental "$core_rs_src" '{ examples = [ "amber-store" ]; }' tests/cbor.rs "" core-rs
-check_incremental "$core_rs_src" '{ examples = [ "amber-store" ]; }' examples/amber-bench.rs "" core-rs
+check_incremental "$core_rs_src" '{ examples = [ "amber-store" ]; doCheck = false; }' tests/cbor.rs "" core-rs
+check_incremental "$core_rs_src" '{ examples = [ "amber-store" ]; doCheck = false; }' examples/amber-bench.rs "" core-rs
+# With tests, editing one of the 21 integration tests builds and runs that
+# one again.
+check_incremental "$core_rs_src" '{ examples = [ "amber-store" ]; }' tests/cbor.rs "rusttest-cbor" core-rs
 
 check_exec_error
 check_no_executable_error

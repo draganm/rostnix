@@ -3,7 +3,8 @@
 { lib, rustPlatform }:
 rustPlatform.buildRustPackage {
   pname = "rostnix";
-  version = "0.1.0";
+  # The crate's own version, so that the two cannot drift apart.
+  inherit ((lib.importTOML ../Cargo.toml).package) version;
   # Only what the binary is built from. Editing docs, tests or the Nix
   # library must not rebuild the tool, and with it every unit.
   src = lib.fileset.toSource {

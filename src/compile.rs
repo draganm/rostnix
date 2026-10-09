@@ -91,7 +91,10 @@ pub fn run() -> Result<()> {
 }
 
 fn is_executable(node: &CompileNode) -> bool {
-    matches!(node.kind.as_str(), "bin" | "example" | "build-script")
+    matches!(
+        node.kind.as_str(),
+        "bin" | "example" | "build-script" | "test"
+    )
 }
 
 fn has_crate_type(node: &CompileNode, crate_type: &str) -> bool {
@@ -114,17 +117,19 @@ fn search_dir(value: &str) -> &str {
 }
 
 /// Whether a linker argument a build script asked for applies to this unit.
+/// Cargo goes by what the target is: a binary built as a test still takes
+/// what was asked of binaries.
 fn link_arg_applies(target: &str, node: &CompileNode) -> bool {
     match target {
         "all" => true,
         "cdylib" => is_cdylib(node),
-        "bins" => node.kind == "bin",
-        "examples" => node.kind == "example",
-        // Tests and benches are not built yet.
-        "tests" | "benches" => false,
+        "bins" => node.target_kind == "bin",
+        "examples" => node.target_kind == "example",
+        "tests" => node.target_kind == "test",
+        "benches" => node.target_kind == "bench",
         other => other
             .strip_prefix("bin:")
-            .is_some_and(|name| node.kind == "bin" && node.target_name == name),
+            .is_some_and(|name| node.target_kind == "bin" && node.target_name == name),
     }
 }
 
@@ -147,7 +152,27 @@ pub fn plan(
     script: Option<&RunRecord>,
 ) -> Invocation {
     let out_dir = format!("{out}/{}", if is_executable(node) { "bin" } else { "lib" });
-    let pkg_root = join(&node.src, &node.manifest_dir);
+    plan_at(rustc, cargo, node, &node.src, &out_dir, true, deps, script)
+}
+
+/// The same for a source tree and an output directory of the caller's
+/// choosing. A test is compiled in a writable copy of its source, into the
+/// directory cargo would use, and without the remapping that keeps store
+/// paths out of what is installed: nothing of a test is installed, and its
+/// paths should be the real ones.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_at(
+    rustc: &str,
+    cargo: &str,
+    node: &CompileNode,
+    src: &str,
+    out_dir: &str,
+    remap: bool,
+    deps: &[(String, CompileRecord)],
+    script: Option<&RunRecord>,
+) -> Invocation {
+    let out_dir = out_dir.to_string();
+    let pkg_root = join(src, &node.manifest_dir);
 
     // Cargo names a local package's source relative to the workspace root
     // and runs rustc there; anything else gets an absolute path and runs in
@@ -158,7 +183,7 @@ pub fn plan(
             .strip_prefix(&node.work_dir)
             .unwrap_or(&from_src)
             .trim_start_matches('/');
-        (rel.to_string(), join(&node.src, &node.work_dir))
+        (rel.to_string(), join(src, &node.work_dir))
     } else {
         (join(&pkg_root, &node.src_path), pkg_root.clone())
     };
@@ -261,11 +286,13 @@ pub fn plan(
     }
     // Keeps the store out of panic messages and debug information, and with
     // it the sources out of the closure of what is built.
-    argv.extend([
-        "--remap-path-prefix".to_string(),
-        format!("{}={}", node.src, node.remap_to),
-    ]);
-    if let Some(script) = script {
+    if remap {
+        argv.extend([
+            "--remap-path-prefix".to_string(),
+            format!("{src}={}", node.remap_to),
+        ]);
+    }
+    if let Some(script) = script.filter(|_| remap) {
         // Code a build script generated is compiled from OUT_DIR, and a
         // panic in it would otherwise name the script's run, which refers
         // to the script, the compiler and everything the script was built
@@ -300,9 +327,13 @@ pub fn plan(
         "proc-macro" => vec![lib_dir],
         _ => Vec::new(),
     };
-    if node.kind != "lib" {
+    // A test keeps its search paths for its run: cargo lets a test find
+    // the dynamic libraries build scripts made.
+    if !matches!(node.kind.as_str(), "lib" | "test") {
         native.clear();
         native_external.clear();
+    }
+    if node.kind != "lib" {
         cdylib_link_args.clear();
     }
 
@@ -352,6 +383,7 @@ mod tests {
     fn node(kind: &str, local: bool) -> CompileNode {
         serde_json::from_value(serde_json::json!({
             "kind": kind,
+            "targetKind": kind,
             "pkg": { "name": "pkg", "version": "1.0.0" },
             "crateName": "the_crate",
             "targetName": "the-crate",
@@ -673,6 +705,75 @@ mod tests {
         );
         assert!(inv.cdylib_link_args.is_empty());
         assert!(!inv.argv.join(" ").contains("-from-a"));
+    }
+
+    // A test is compiled where the caller says: in a copy of the source,
+    // into cargo's directory, with the paths left as they are.
+    #[test]
+    fn a_test_is_planned_in_a_copy_of_its_source() {
+        let deps = vec![(
+            "pkg".to_string(),
+            record("lib", "pkg", &["/nix/store/pkg/lib"], &[]),
+        )];
+        let mut n = node("test", true);
+        n.src_path = "tests/cli.rs".to_string();
+        let inv = plan_at(
+            "/rustc",
+            "/cargo",
+            &n,
+            "/build/source",
+            "/build/source/target/release/deps",
+            false,
+            &deps,
+            Some(&script()),
+        );
+        let args = inv.argv.join(" ");
+        assert_eq!(inv.cwd, "/build/source");
+        assert_eq!(inv.argv[4], "crates/pkg/tests/cli.rs");
+        assert!(
+            args.contains("--out-dir /build/source/target/release/deps"),
+            "{args}"
+        );
+        assert!(!args.contains("--remap-path-prefix"), "{args}");
+        assert!(!args.contains("/nix/store/src"), "{args}");
+        assert_eq!(inv.env["CARGO_MANIFEST_DIR"], "/build/source/crates/pkg");
+        assert_eq!(inv.env["OUT_DIR"], "/nix/store/run/out");
+        assert!(inv.transitive.is_empty());
+    }
+
+    // What a script asks of tests, binaries or examples goes by the target,
+    // whatever it is built as.
+    #[test]
+    fn link_arguments_follow_the_target_of_a_test() {
+        let mut own = script();
+        own.link_args.push(LinkArg {
+            target: "tests".to_string(),
+            arg: "-Wl,-tests".to_string(),
+        });
+        let link_args = |target_kind: &str| -> Vec<String> {
+            let mut n = node("test", true);
+            n.target_kind = target_kind.to_string();
+            plan("/rustc", "/cargo", &n, "/out", &[], Some(&own))
+                .argv
+                .iter()
+                .filter_map(|arg| arg.strip_prefix("link-arg=-Wl,-").map(String::from))
+                .collect()
+        };
+        assert_eq!(link_args("test"), ["all", "tests"]);
+        assert_eq!(link_args("lib"), ["all"]);
+        assert_eq!(link_args("bin"), ["all", "bins", "mine"]);
+        assert_eq!(link_args("example"), ["all", "examples"]);
+        // A test keeps the search paths for its run.
+        let inv = plan(
+            "/rustc",
+            "/cargo",
+            &node("test", true),
+            "/out",
+            &[],
+            Some(&own),
+        );
+        assert_eq!(inv.native, ["native=/nix/store/run/out"]);
+        assert!(inv.cdylib_link_args.is_empty());
     }
 
     // The planned environment is cargo's. An override is laid over it when

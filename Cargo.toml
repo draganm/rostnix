@@ -1,6 +1,6 @@
 [package]
 name = "rostnix"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "Builds Rust programs with one Nix derivation per cargo unit and nothing generated to check in"
