@@ -12,10 +12,12 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{PipeReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
 
 use crate::compile::{self, Invocation};
 use crate::node::{self, Attrs, CompileRecord, RunRecord, TestNode, TestRecord, RUN_RECORD_FILE};
@@ -198,11 +200,14 @@ pub fn run_env(
     }
     env.extend(binaries(node, layout));
 
-    // Cargo's search path for dynamic libraries: the target directory, what
-    // build scripts built, and the compiler's own libraries.
+    // Cargo's search path for dynamic libraries: what build scripts built,
+    // the target directory, and the compiler's own libraries.
     let profile_dir = layout.deps_dir.parent().unwrap_or(&layout.deps_dir);
-    let mut search: Vec<String> = vec![text(profile_dir)];
-    search.extend(native.iter().map(|path| search_dir(path).to_string()));
+    let mut search: Vec<String> = native
+        .iter()
+        .map(|path| search_dir(path).to_string())
+        .collect();
+    search.push(text(profile_dir));
     search.push(text(&layout.deps_dir));
     search.push(target_libdir.to_string());
     if !inherited_dylib_path.is_empty() {
@@ -213,6 +218,57 @@ pub fn run_env(
     }
     env.insert(dylib_var().to_string(), search.join(":"));
     env
+}
+
+/// Passes on what a child writes to the pipe, to each of `sinks`, until the
+/// child has exited, and returns how it exited.
+///
+/// The pipe is not read to its end. A test may leave a process behind that
+/// still holds the pipe, a server it started and did not stop, and the end
+/// would not come before that process exits. Cargo returns when the test
+/// does, and so does this: once the child is gone, what is still in the
+/// pipe is passed on, and whoever holds it is left to the builder's end.
+pub fn tee(
+    child: &mut Child,
+    mut reader: PipeReader,
+    sinks: &mut [&mut dyn Write],
+) -> std::io::Result<ExitStatus> {
+    let (sender, receiver) = mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        while let Ok(n) = reader.read(&mut buffer) {
+            if n == 0 || sender.send(buffer[..n].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    let mut pass = |chunk: Vec<u8>| -> std::io::Result<()> {
+        for sink in sinks.iter_mut() {
+            sink.write_all(&chunk)?;
+            sink.flush()?;
+        }
+        Ok(())
+    };
+    let mut exited = None;
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => pass(chunk)?,
+            // Every holder of the pipe has closed it.
+            Err(RecvTimeoutError::Disconnected) => break,
+            // Nothing for a while. If the child is gone, nothing it wrote
+            // is still on its way.
+            Err(RecvTimeoutError::Timeout) => {
+                if exited.is_some() {
+                    break;
+                }
+                exited = child.try_wait()?;
+            }
+        }
+    }
+    match exited {
+        Some(status) => Ok(status),
+        None => child.wait(),
+    }
 }
 
 /// Copies a tree out of the store and makes the copy writable.
@@ -331,7 +387,7 @@ pub fn run() -> Result<()> {
     );
     fs::create_dir_all(out)?;
     let mut log = fs::File::create(Path::new(out).join("log"))?;
-    let (mut reader, writer) = std::io::pipe()?;
+    let (reader, writer) = std::io::pipe()?;
     let mut child = {
         let mut command = Command::new(&layout.exe);
         command
@@ -360,17 +416,7 @@ pub fn run() -> Result<()> {
 
     // Everything the test prints goes to the build log and to the output.
     let mut stdout = std::io::stdout().lock();
-    let mut buffer = [0u8; 8192];
-    loop {
-        let n = reader.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        stdout.write_all(&buffer[..n])?;
-        stdout.flush()?;
-        log.write_all(&buffer[..n])?;
-    }
-    let status = child.wait()?;
+    let status = tee(&mut child, reader, &mut [&mut stdout, &mut log])?;
     if !status.success() {
         return Err(format!("{what} failed: {status}").into());
     }
@@ -612,12 +658,51 @@ mod tests {
         assert!(!env.keys().any(|key| key.starts_with("CARGO_BIN_EXE_")));
         assert_eq!(env["OUT_DIR"], "/nix/store/run/out");
         assert_eq!(env["FROM_SCRIPT"], "1");
-        // The target directory, what the script built, the compiler's
-        // libraries, and what was there before.
+        // What the script built, the target directory, the compiler's
+        // libraries, and what was there before: cargo's order.
         assert_eq!(
             env[dylib_var()],
-            "/build/source/ws/target/release:/nix/store/run/out:\
+            "/nix/store/run/out:/build/source/ws/target/release:\
              /build/source/ws/target/release/deps:/rustc/lib:/inherited"
+        );
+    }
+
+    fn shell(script: &str) -> (Child, PipeReader) {
+        let (reader, writer) = std::io::pipe().unwrap();
+        let child = Command::new("sh")
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(writer.try_clone().unwrap())
+            .stderr(writer)
+            .spawn()
+            .unwrap();
+        (child, reader)
+    }
+
+    #[test]
+    fn output_and_error_output_are_passed_on_in_order() {
+        let (mut child, reader) = shell("echo one; echo two >&2; echo three; exit 3");
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let status = tee(&mut child, reader, &mut [&mut a, &mut b]).unwrap();
+        assert_eq!(status.code(), Some(3));
+        assert_eq!(String::from_utf8_lossy(&a), "one\ntwo\nthree\n");
+        assert_eq!(a, b);
+    }
+
+    // A test that starts a server and does not stop it: the process it
+    // leaves behind holds the pipe, and the build must not wait for it.
+    #[test]
+    fn a_process_the_test_leaves_behind_is_not_waited_for() {
+        let started = std::time::Instant::now();
+        let (mut child, reader) = shell("sleep 20 & echo started; exit 1");
+        let mut seen = Vec::new();
+        let status = tee(&mut child, reader, &mut [&mut seen]).unwrap();
+        assert_eq!(status.code(), Some(1));
+        assert_eq!(String::from_utf8_lossy(&seen), "started\n");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "waited {:?} for a process left behind",
+            started.elapsed()
         );
     }
 

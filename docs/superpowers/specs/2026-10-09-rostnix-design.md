@@ -415,9 +415,12 @@ package directory, narrowed by three rules:
 1. Directories of other packages inside it are left out.
 2. `examples/`, `tests/` and `benches/` are left out, unless the unit is
    itself an example, a test or a bench, or has its root in one of them;
-   then that directory stays. Every unit built as a test keeps `tests/`,
-   the unit tests of a library or a binary included: test data and helper
-   modules live there.
+   then that directory stays, as it does for a unit whose root names a
+   file in it as a module. Every unit built as a test keeps all three, the
+   unit tests of a library or a binary included: a test runs in its package
+   directory and may read whatever lies there, and one that looks through a
+   directory that is missing finds nothing wrong. It loses only the root
+   files of other targets, by the next rule.
 3. The root file of every other binary, example, test and bench is left out.
    Where cargo found such a target as a directory, `src/bin/<name>/main.rs`
    and its like under `examples/`, `tests/` and `benches/`, the directory is
@@ -435,8 +438,8 @@ executables among them, as `cxx_build::bridge("src/main.rs")` does.
 
 For core-rs the library sees the package without `examples`, `tests` and
 `benches`, and the example `amber-store` sees it without `tests`, `benches`
-and the other two examples. The test `cbor` sees it without `examples`,
-`benches` and the root files of the other 20 tests. Editing `tests/cbor.rs`
+and the other two examples. The test `cbor` sees it without the root files
+of the three examples and of the other 20 tests. Editing `tests/cbor.rs`
 builds and runs that test again and nothing else; without `doCheck` it
 rebuilds nothing.
 
@@ -713,7 +716,11 @@ The derivation:
    library path variable, `CARGO_BIN_EXE_<name>` again for an integration
    test, and `OUT_DIR` with the `rustc-env` values of the package's build
    script. `RUST_TEST_THREADS` is set to the cores the build was given,
-   unless something set it already.
+   unless something set it already. What the test prints goes to the build
+   log and to the output. The derivation ends when the test does, as
+   `cargo test` returns then: it does not wait for a process the test left
+   behind, a server it started and did not stop, although that process
+   still holds the test's output open.
 
 Its output holds `log`, what the test printed, and the records of the
 compilation and of the run, `unit.json` and `run.json`. The executable is
@@ -732,6 +739,7 @@ In the generated graph a test is a unit built by `b.test`, which takes what
     executables = [ units."hello-0.1.0-bin-hello-…" units."hello-0.1.0-example-extra-…" ];
   };
   tests."hello-0.1.0-test-cli-1a2b3c4d" = units."hello-0.1.0-test-cli-1a2b3c4d";
+  testBuilds = [ units."hello-0.1.0-example-extra-…" ];   # built by cargo test, not run
   buildUnits = [ /* keys of the units cargo build plans */ ];
   testUnits = [ /* keys of the units cargo test plans */ ];
 ```
@@ -740,8 +748,9 @@ A test derivation is built with stdenv and gets the tools and the
 environment of its package's `crateOverrides` entry, and the libraries of
 every overridden package it links.
 
-- **Sources.** A test unit sees its package directory with `tests/`, less
-  the other tests' root files. It is compiled from that tree and runs in it.
+- **Sources.** A test unit sees its package directory with `examples/`,
+  `tests/` and `benches/`, less the root files of the other targets. It is
+  compiled from that tree and runs in it.
 - **Skipping.** `skipTests` names test targets that are neither built nor
   run: the file name of an integration test without `.rs`, or the name of a
   library or a binary for its unit tests. An entry that names no test target
@@ -752,8 +761,35 @@ every overridden package it links.
   builds only to see that it compiles.
 
 The application lists every test that is not skipped among its inputs, so a
-failing test fails the build. A test leaves nothing in the result, so the
-result does not refer to it.
+failing test fails the build. It also lists what `cargo test` builds
+without running, the examples, so that one that does not compile fails the
+build as it fails `cargo test`. Neither leaves anything in the result, so
+the result does not refer to them.
+
+What follows from this design:
+
+- **The promise holds for the test crate, not for what it links.** The
+  library under test and any helper crate are compiled in their own
+  derivations, from the store. `env!("CARGO_MANIFEST_DIR")` in their
+  non-test code names a read-only view without `tests/`. A test that gets
+  its fixture directory from such a function does not find it.
+- **The copy holds the unit's view, not the workspace.** The workspace's
+  `Cargo.toml` and `Cargo.lock` and the other members are not in it unless
+  `extraSrc` names them.
+- **`skipTests` and `checkFlags` are coarse.** A name in `skipTests` skips
+  every test target of that name: in every selected package, and a
+  library's unit tests together with an integration test named like the
+  library. Every test executable gets the same `checkFlags`.
+- **A test is an input of the application.** Editing a test, `checkFlags` or
+  `skipTests` gives the application another store path although its
+  executables are the same, and what depends on it is built again.
+- **Tests are built with the application's profile.** With `release`, the
+  default, `debug_assert!` and overflow checks are off, as under
+  `cargo test --release`.
+- **What only the tests need can stop the evaluation.** A dev-dependency
+  from a git repository is refused like any other. The message then says
+  that it concerns the tests only and that `doCheck = false` builds without
+  them.
 
 What Nix forbids a build, a test cannot do. In a sandboxed build there is
 no network. No build can create a setuid file, sandboxed or not.
@@ -804,7 +840,7 @@ non-zero. Nix then reports that the program failed.
 | `nix` missing or `nix store add` fails | Warning only; the download derivation covers it. |
 | A unit of a kind or mode this version does not build | Names the unit and its mode. |
 | An example that is not an executable | Names the example and its crate type. |
-| A target whose root file is outside its package directory | Names the target and the file. |
+| A target whose root file is outside its package directory, a `path` with `..` in it included | Names the target and the file. |
 | Two selected executables with one name | Names both units and says to select one. |
 | A unit planned for another target, before stage 4 | Names the target and says cross-compilation is not supported yet. |
 | The selection builds no binary or example | `buildRustApplication` throws, naming `bins` and `examples`. |
@@ -813,6 +849,7 @@ non-zero. Nix then reports that the program failed.
 | A build script fails or prints `cargo::error` | The run derivation fails with the script's output in its log. |
 | A test fails | Its derivation fails with what the test printed in its log, and the application is not built. |
 | A `skipTests` entry names no test target | Warning that names the entry and lists the test targets. |
+| Something only the tests need is refused, or cargo cannot plan them | The error, followed by a line that says it concerns the tests only and names `doCheck = false`. |
 
 ## Not in this version
 
@@ -868,7 +905,7 @@ sandbox because they need `exec` and the network.
 | Fixture | Covers |
 |---|---|
 | `hello` | One package with a library and a binary, crates.io dependencies with build scripts and a proc macro, the default selection. Tests: unit tests, an ignored test that fails, and an integration test of what a test may rely on: the binary through `CARGO_BIN_EXE_`, the example beside its own executable, data read through the working directory and `CARGO_MANIFEST_DIR`, a working directory and a `CARGO_TARGET_TMPDIR` it can write to, a copied fixture it can change, and the environment. |
-| `workspace` | Four members, one of them a proc macro and one nested in another's directory; `packages`, `bins` and `features`; a renamed dependency; lints inherited from the workspace. Tests: unit tests of a library and of the proc macro, a test with `harness = false`, and a dev-dependency that turns a feature on, so that the binary the tests run is not the one installed. |
+| `workspace` | Four members, one of them a proc macro and one nested in another's directory; `packages`, `bins` and `features`; a renamed dependency; lints inherited from the workspace. Tests: unit tests of a library and of the proc macro, a test with `harness = false`, a helper file in `tests/` that a test names as a module and that cargo also builds as a test, and a dev-dependency that turns a feature on, so that the binary the tests run is not the one installed. |
 | `buildscript` | A local build script that generates code into `OUT_DIR`, compiles C, sets `links` and metadata read by a dependent's build script; `rustc-cfg` and `rustc-env`; a `crateOverrides` entry that supplies zlib through `pkg-config`; `extraSrc`. Tests: unit tests that call the C function and read `OUT_DIR` and the script's `rustc-env` value at run time. |
 | `profiles` | One project built under four profiles: fat LTO with `panic = "abort"`, `opt-level = "s"`, `codegen-units` and a per-package override; thin LTO; no LTO; and `dev`. Tests: one that expects a panic, which cargo has unwind under every profile. |
 | core-rs | Patient zero at its pinned commit, fetched with `builtins.fetchTree`: the `amber-store` example, and its test suite: 21 of 22 test executables, with one test skipped by name. |

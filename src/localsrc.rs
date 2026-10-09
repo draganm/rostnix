@@ -34,16 +34,79 @@ pub fn is_under(path: &str, dir: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
+/// The files a crate root names as its modules, as paths from the root's
+/// directory: `name.rs` and `name/mod.rs` for `mod name;`, and what a
+/// `#[path = "…"]` attribute says.
+///
+/// The text is searched, not parsed. A declaration in a block comment or in
+/// a string is taken for one, which only shows a unit a file it does not
+/// need. One that a macro writes is missed, and so is one inside an inline
+/// module or in a module file rather than in the root.
+pub fn declared_modules(source: &str) -> Vec<String> {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut found = Vec::new();
+    for line in source.lines() {
+        let line = line.split("//").next().unwrap_or_default();
+        // `#[path = "…"]`, also inside `#[cfg_attr(…)]`.
+        if line.contains("#[") {
+            for (at, _) in line.match_indices("path") {
+                let before = line[..at].chars().next_back();
+                let value = line[at + 4..].trim_start();
+                if before.is_some_and(is_ident) || !value.starts_with('=') {
+                    continue;
+                }
+                if let Some(path) = value[1..].trim_start().strip_prefix('"') {
+                    found.push(path.split('"').next().unwrap_or_default().to_string());
+                }
+            }
+        }
+        for (at, _) in line.match_indices("mod") {
+            let before = line[..at].chars().next_back();
+            let rest = &line[at + 3..];
+            if before.is_some_and(is_ident) || !rest.starts_with(char::is_whitespace) {
+                continue;
+            }
+            let rest = rest.trim_start();
+            let rest = rest.strip_prefix("r#").unwrap_or(rest);
+            let name: String = rest.chars().take_while(|c| is_ident(*c)).collect();
+            if !name.is_empty() && rest[name.len()..].trim_start().starts_with(';') {
+                found.push(format!("{name}.rs"));
+                found.push(format!("{name}/mod.rs"));
+            }
+        }
+    }
+    found
+}
+
+/// `rel` as seen from the directory `dir`, with `.` and `..` resolved.
+pub fn resolve(dir: &str, rel: &str) -> String {
+    let mut parts: Vec<&str> = dir.split('/').filter(|part| !part.is_empty()).collect();
+    for part in rel.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    parts.join("/")
+}
+
 /// The paths left out of the view a unit of `unit_target` gets of the
 /// package in `pkg_dir`: sorted, and none under another. A unit built as a
-/// test keeps `tests/` whatever its target is: unit tests read the data and
-/// the helper modules kept there as integration tests do.
+/// test keeps `examples/`, `tests/` and `benches/` whatever its target is,
+/// and loses only the root files of other targets in them. `keep` names
+/// files the unit's root declares as its modules; they stay even when they
+/// are other targets' roots, as `tests/common.rs` is when the tests beside
+/// it say `mod common;`.
 pub fn exclusions(
     pkg_dir: &str,
     other_pkg_dirs: &[String],
     targets: &[TargetInfo],
     unit_target: &TargetInfo,
     as_test: bool,
+    keep: &[String],
 ) -> Vec<String> {
     let mut excluded: Vec<String> = Vec::new();
 
@@ -55,12 +118,16 @@ pub fn exclusions(
     }
 
     // Where cargo looks for examples, tests and benches, unless the unit is
-    // one of them, or has its root there by a `path` of its own.
+    // one of them, or has its root there by a `path` of its own, or names a
+    // file there as a module. A test keeps all three: it runs in its
+    // package directory and may read whatever lies there, and a test that
+    // looks through a directory that is not there finds nothing wrong.
     for dir in ["examples", "tests", "benches"] {
         let dir_path = join(pkg_dir, dir);
-        let kept = unit_target.own_dir == Some(dir)
+        let kept = as_test
+            || unit_target.own_dir == Some(dir)
             || is_under(&unit_target.src_path, &dir_path)
-            || (as_test && dir == "tests");
+            || keep.iter().any(|file| is_under(file, &dir_path));
         if !kept {
             excluded.push(dir_path);
         }
@@ -86,8 +153,10 @@ pub fn exclusions(
         } else {
             target.src_path.as_str()
         };
-        // Never hide the unit's own root.
-        if !is_under(&unit_target.src_path, path) {
+        // Never hide the unit's own root, nor a file it names as a module.
+        let needed =
+            is_under(&unit_target.src_path, path) || keep.iter().any(|file| is_under(file, path));
+        if !needed {
             excluded.push(path.to_string());
         }
     }
@@ -134,7 +203,7 @@ mod tests {
     fn library_sees_no_examples_tests_or_benches() {
         let targets = core_rs();
         assert_eq!(
-            exclusions("", &[], &targets, &targets[0], false),
+            exclusions("", &[], &targets, &targets[0], false, &[]),
             ["benches", "examples", "tests"]
         );
     }
@@ -143,7 +212,7 @@ mod tests {
     fn example_sees_its_directory_without_the_other_examples() {
         let targets = core_rs();
         assert_eq!(
-            exclusions("", &[], &targets, &targets[2], false),
+            exclusions("", &[], &targets, &targets[2], false, &[]),
             [
                 "benches",
                 "examples/amber-bench.rs",
@@ -157,35 +226,151 @@ mod tests {
     fn test_sees_tests_without_the_other_tests() {
         let targets = core_rs();
         assert_eq!(
-            exclusions("", &[], &targets, &targets[4], false),
+            exclusions("", &[], &targets, &targets[4], false, &[]),
             ["benches", "examples", "tests/cli_e2e.rs"]
         );
     }
 
-    // A library's unit tests and a binary's see tests/, with its data and
-    // helper modules, but none of the integration tests' own files.
+    // Whatever is built as a test may read whatever lies in its package:
+    // it keeps examples/, tests/ and benches/, with their data and helper
+    // modules, and loses only the other targets' own files.
     #[test]
-    fn a_target_built_as_a_test_keeps_the_tests_directory() {
+    fn a_target_built_as_a_test_keeps_the_three_directories() {
         let mut targets = core_rs();
         targets.push(target("bin", "src/main.rs"));
+        let examples = [
+            "examples/amber-bench.rs",
+            "examples/amber-store.rs",
+            "examples/repair-interop.rs",
+        ];
+        // The library's unit tests.
         assert_eq!(
-            exclusions("", &[], &targets, &targets[0], true),
+            exclusions("", &[], &targets, &targets[0], true, &[]),
             [
-                "benches",
-                "examples",
+                examples[0],
+                examples[1],
+                examples[2],
                 "src/main.rs",
                 "tests/cbor.rs",
                 "tests/cli_e2e.rs"
             ]
         );
+        // The binary's.
         assert_eq!(
-            exclusions("", &[], &targets, &targets[6], true),
-            ["benches", "examples", "tests/cbor.rs", "tests/cli_e2e.rs"]
+            exclusions("", &[], &targets, &targets[6], true, &[]),
+            [
+                examples[0],
+                examples[1],
+                examples[2],
+                "tests/cbor.rs",
+                "tests/cli_e2e.rs"
+            ]
         );
-        // An integration test is unchanged by it.
+        // An integration test.
         assert_eq!(
-            exclusions("", &[], &targets, &targets[4], true),
-            exclusions("", &[], &targets, &targets[4], false)
+            exclusions("", &[], &targets, &targets[4], true, &[]),
+            [
+                examples[0],
+                examples[1],
+                examples[2],
+                "src/main.rs",
+                "tests/cli_e2e.rs"
+            ]
+        );
+    }
+
+    #[test]
+    fn module_declarations_are_found_in_the_text() {
+        let source = r#"
+//! mod not_this;
+use std::fmt;
+mod common;
+pub mod helpers ;
+pub(crate) mod inner;
+#[cfg(unix)] mod unix_only;
+#[path = "../shared/support.rs"]
+mod support;
+mod inline { fn f() {} }
+fn modify() { let model = 1; } // mod neither;
+mod r#async;
+#[cfg_attr(windows, path = "sys/windows.rs")]
+mod sys;
+fn f() { let path = "not/this.rs"; }
+"#;
+        assert_eq!(
+            declared_modules(source),
+            [
+                "common.rs",
+                "common/mod.rs",
+                "helpers.rs",
+                "helpers/mod.rs",
+                "inner.rs",
+                "inner/mod.rs",
+                "unix_only.rs",
+                "unix_only/mod.rs",
+                "../shared/support.rs",
+                "support.rs",
+                "support/mod.rs",
+                "async.rs",
+                "async/mod.rs",
+                "sys/windows.rs",
+                "sys.rs",
+                "sys/mod.rs",
+            ]
+        );
+        assert!(declared_modules("fn main() {}").is_empty());
+    }
+
+    #[test]
+    fn paths_are_resolved_from_a_directory() {
+        assert_eq!(resolve("tests", "common.rs"), "tests/common.rs");
+        assert_eq!(
+            resolve("app/tests", "../shared/support.rs"),
+            "app/shared/support.rs"
+        );
+        assert_eq!(resolve("", "./a/b.rs"), "a/b.rs");
+        assert_eq!(resolve("tests", "../../outside.rs"), "outside.rs");
+    }
+
+    // `tests/common.rs` is a test of its own to cargo, and a module to the
+    // tests that say `mod common;`.
+    #[test]
+    fn a_root_the_unit_names_as_a_module_stays() {
+        let targets = vec![
+            target("lib", "src/lib.rs"),
+            target("test", "tests/a.rs"),
+            target("test", "tests/b.rs"),
+            target("test", "tests/common.rs"),
+            target("test", "tests/suite/main.rs"),
+        ];
+        let view = |keep: &[&str]| {
+            let keep: Vec<String> = keep.iter().map(|s| s.to_string()).collect();
+            exclusions("", &[], &targets, &targets[1], false, &keep)
+        };
+        assert_eq!(
+            view(&[]),
+            [
+                "benches",
+                "examples",
+                "tests/b.rs",
+                "tests/common.rs",
+                "tests/suite"
+            ]
+        );
+        assert_eq!(
+            view(&["tests/common.rs", "tests/common/mod.rs"]),
+            ["benches", "examples", "tests/b.rs", "tests/suite"]
+        );
+        // A file inside a target that is a directory keeps the directory.
+        assert_eq!(
+            view(&["tests/suite/helpers.rs"]),
+            ["benches", "examples", "tests/b.rs", "tests/common.rs"]
+        );
+        // `#[path = "../examples/demo.rs"] mod demo;` keeps the directory
+        // the file is in.
+        assert_eq!(
+            view(&["examples/demo.rs"]),
+            ["benches", "tests/b.rs", "tests/common.rs", "tests/suite"]
         );
     }
 
@@ -199,7 +384,7 @@ mod tests {
             target("build-script", "app/build.rs"),
         ];
         let common = ["app/benches", "app/examples"];
-        let view = |i: usize| exclusions("app", &[], &targets, &targets[i], false);
+        let view = |i: usize| exclusions("app", &[], &targets, &targets[i], false, &[]);
         assert_eq!(
             view(0),
             [
@@ -254,7 +439,7 @@ mod tests {
             target("bin", "src/cli/main.rs"),
         ];
         assert_eq!(
-            exclusions("", &[], &targets, &targets[0], false),
+            exclusions("", &[], &targets, &targets[0], false, &[]),
             ["benches", "examples", "src/cli/main.rs", "tests"]
         );
     }
@@ -268,11 +453,11 @@ mod tests {
             target("example", "examples/demo.rs"),
         ];
         assert_eq!(
-            exclusions("", &[], &targets, &targets[0], false),
+            exclusions("", &[], &targets, &targets[0], false, &[]),
             ["benches", "examples"]
         );
         assert_eq!(
-            exclusions("", &[], &targets, &targets[1], false),
+            exclusions("", &[], &targets, &targets[1], false, &[]),
             ["benches", "examples/demo.rs", "tests"]
         );
     }
@@ -286,7 +471,7 @@ mod tests {
             "app".to_string(),
         ];
         assert_eq!(
-            exclusions("crates/core", &others, &targets, &targets[0], false),
+            exclusions("crates/core", &others, &targets, &targets[0], false, &[]),
             [
                 "crates/core/benches",
                 "crates/core/examples",
@@ -299,7 +484,7 @@ mod tests {
         let root = vec![target("lib", "src/lib.rs")];
         let others = [others.to_vec(), vec!["crates/core".to_string()]].concat();
         assert_eq!(
-            exclusions("", &others, &root, &root[0], false),
+            exclusions("", &others, &root, &root[0], false, &[]),
             [
                 "app",
                 "benches",

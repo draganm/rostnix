@@ -69,6 +69,7 @@ Added to what stage 1 emits:
     executables = [ units."…-bin-hello-…" units."…-example-extra-…" ];
   };
   tests."hello-0.1.0-test-cli-1a2b3c4d" = units."hello-0.1.0-test-cli-1a2b3c4d";
+  testBuilds = [ units."…-example-extra-…" ];   # what cargo test builds without running
   buildUnits = [ "…" ];   # keys of the units cargo build plans
   testUnits = [ "…" ];    # keys of the units cargo test plans
 ```
@@ -94,12 +95,13 @@ Output: `$out/log`, what the test printed; `$out/unit.json`, the record of the c
 ### Compile
 
 - `rustc-link-arg-tests`, `-benches`, `-bins` and `-examples` go by the target's kind, whatever the mode.
-- A test unit's view of its package keeps `tests/`, less the other tests' roots.
+- A test unit's view of its package keeps `examples/`, `tests/` and `benches/`, less the other targets' roots.
+- For every unit, a root of another target that the unit's own root names as a module (`mod common;`, `#[path = "…"]`) stays in its view.
 
 ### `buildRustApplication`
 
 - `doCheck` (default `true`), `checkFlags`, `skipTests` take effect.
-- The application lists every test that is not skipped among its inputs.
+- The application lists every test that is not skipped among its inputs, and `testBuilds`.
 - `passthru.tests`: the tests that are run, by key. `passthru.testUnitRecords`: the records of `testUnits` and of the runs, without the skipped tests. `passthru.unitRecords` holds `buildUnits` only.
 - A `skipTests` entry that names no test target is warned about.
 
@@ -109,62 +111,76 @@ Output: `$out/log`, what the test printed; `$out/unit.json`, the record of the c
 
 **Files:** `src/resolve.rs`, `src/graph.rs`, `src/flags.rs`, `src/localsrc.rs`, `src/lto.rs`, `src/emit.rs`, `testdata/hello/`
 
-- [ ] Record `cargo test --no-run --unit-graph`, `cargo build --unit-graph` and `cargo metadata` for the `hello` fixture into `testdata/hello/`.
-- [ ] `Request.do_check` and `test_graph_args()`.
-- [ ] `graph::build` takes the test plan beside the build plan: kinds `Test` and skipped (`doctest`, and a library example in the test plan); `primary` in the unit hash; `target_kind`; a test's `profile_dir` and `executables`; `Graph.tests`, `build_units`, `test_units`.
-- [ ] `flags::base_args`: `--test` or `--cfg test`, no `--crate-type`. `harness` read from the manifest.
-- [ ] `localsrc::exclusions`: a test unit keeps `tests/`.
-- [ ] Emit `targetKind`, `b.test`, `tests`, `buildUnits`, `testUnits`.
-- [ ] Tests: the shared library unit has one key in both plans; the test units, their views and what they find beside them; `--test` flags against the recorded `cargo test -vv` lines; a `doctest` root is left out; the emitter's output.
+- [x] Record `cargo test --no-run --unit-graph`, `cargo build --unit-graph` and `cargo metadata` for the `hello` fixture into `testdata/hello/`.
+- [x] `Request.do_check` and `test_graph_args()`.
+- [x] `graph::build` takes the test plan beside the build plan: kinds `Test` and skipped (`doctest`, and a library example in the test plan); `primary` in the unit hash; `target_kind`; a test's `profile_dir` and `executables`; `Graph.tests`, `build_units`, `test_units`.
+- [x] `flags::base_args`: `--test` or `--cfg test`, no `--crate-type`. `harness` read from the manifest.
+- [x] `localsrc::exclusions`: a test unit keeps `tests/`.
+- [x] Emit `targetKind`, `b.test`, `tests`, `buildUnits`, `testUnits`.
+- [x] Tests: the shared library unit has one key in both plans; the test units, their views and what they find beside them; `--test` flags against the recorded `cargo test -vv` lines; a `doctest` root is left out; the emitter's output.
 
 ### Task 2: Compiling tests
 
 **Files:** `src/node.rs`, `src/compile.rs`
 
-- [ ] `CompileNode.target_kind`; link arguments by target kind; `plan_at` for a source tree and an output directory of the caller's choosing, with or without remapping.
-- [ ] Tests for each.
+- [x] `CompileNode.target_kind`; link arguments by target kind; `plan_at` for a source tree and an output directory of the caller's choosing, with or without remapping.
+- [x] Tests for each.
 
 ### Task 3: The test builder
 
 **Files:** `src/testrun.rs`, `src/node.rs`, `src/main.rs`, `src/lib.rs`
 
-- [ ] `rostnix test` as described above, with `layout()`, `compile_plan()` and `run_env()` separate from the side effects so that they are unit-tested.
+- [x] `rostnix test` as described above, with `layout()`, `compile_plan()` and `run_env()` separate from the side effects so that they are unit-tested.
 
 ### Task 4: The Nix library
 
 **Files:** `nix/builders.nix`, `nix/build-rust-application.nix`
 
-- [ ] `test`; `doCheck`, `checkFlags`, `skipTests`; the application's dependency on the tests; `passthru.tests`, `testUnitRecords`; `unitRecords` narrowed to `buildUnits`.
+- [x] `test`; `doCheck`, `checkFlags`, `skipTests`; the application's dependency on the tests; `passthru.tests`, `testUnitRecords`; `unitRecords` narrowed to `buildUnits`.
 
 ### Task 5: Fixtures
 
 **Files:** `tests/fixtures/`, `tests/fixtures.nix`
 
-- [ ] `hello`: an integration test that runs the binary through `CARGO_BIN_EXE_hello`, finds the example beside its own executable, reads a data file through the working directory and through `env!("CARGO_MANIFEST_DIR")`, writes to the working directory, to `CARGO_TARGET_TMPDIR` and to a copy of a fixture, and checks the environment the facts table lists; a unit test in the library; an ignored test that fails.
-- [ ] `workspace`: unit tests in a library and in the proc macro, a `harness = false` test, a dev-dependency that turns a feature on, an integration test that runs both binaries.
-- [ ] `buildscript`: a unit test that calls the C function and reads `OUT_DIR` and the script's `rustc-env` value at run time.
-- [ ] `profiles`: a `#[should_panic]` test.
-- [ ] `core-rs`: `skipTests = [ "amber_bench_smoke" ]` and `checkFlags = [ "--skip" "golden_tar_extracts" ]`. `self`: `testdata` joins the source.
+- [x] `hello`: an integration test that runs the binary through `CARGO_BIN_EXE_hello`, finds the example beside its own executable, reads a data file through the working directory and through `env!("CARGO_MANIFEST_DIR")`, writes to the working directory, to `CARGO_TARGET_TMPDIR` and to a copy of a fixture, and checks the environment the facts table lists; a unit test in the library; an ignored test that fails.
+- [x] `workspace`: unit tests in a library and in the proc macro, a `harness = false` test, a dev-dependency that turns a feature on, an integration test that runs both binaries.
+- [x] `buildscript`: a unit test that calls the C function and reads `OUT_DIR` and the script's `rustc-env` value at run time.
+- [x] `profiles`: a `#[should_panic]` test.
+- [x] `core-rs`: `skipTests = [ "amber_bench_smoke" ]` and `checkFlags = [ "--skip" "golden_tar_extracts" ]`. `self`: `testdata` joins the source.
 
 ### Task 6: Conformance for tests
 
 **Files:** `examples/conformance.rs`
 
-- [ ] Test runs are a third kind of invocation, named by the executable without its hash. `rustdoc` lines of the log are left out. `CARGO_BIN_EXE_*` is a variable although its name may hold a hyphen, and its values compare by file name. `--compile-only` leaves runs out on both sides; `--without <crate>` leaves a skipped test out.
+- [x] Test runs are a third kind of invocation, named by the executable without its hash. `rustdoc` lines of the log are left out. `CARGO_BIN_EXE_*` is a variable although its name may hold a hyphen, and its values compare by file name. `--compile-only` leaves runs out on both sides; `--without <crate>` leaves a skipped test out.
 
 ### Task 7: The driver
 
 **Files:** `tests/run.sh`
 
-- [ ] `check_test_conformance` against `cargo test -vv` (core-rs: `--no-run`, `--compile-only`, `--without amber_bench_smoke`).
-- [ ] A failing test fails the build (`checkFlags = [ "--include-ignored" ]`); `skipTests` leaves a test out and warns about an entry that matches nothing; `doCheck = false` plans no tests.
-- [ ] The library of `hello` is one derivation in both plans; the workspace's two `ws-app` binaries differ.
-- [ ] `check_incremental` covers tests; expectations updated: editing a test builds and runs that test again and nothing else.
-- [ ] The result refers to no test.
-- [ ] Verify: `tests/run.sh` ends with `all integration checks passed`, with core-rs's tests among what it ran.
+- [x] `check_test_conformance` against `cargo test -vv` (core-rs: `--no-run`, `--compile-only`, `--without amber_bench_smoke`).
+- [x] A failing test fails the build (`checkFlags = [ "--include-ignored" ]`); `skipTests` leaves a test out and warns about an entry that matches nothing; `doCheck = false` plans no tests.
+- [x] The library of `hello` is one derivation in both plans; the workspace's two `ws-app` binaries differ.
+- [x] `check_incremental` covers tests; expectations updated: editing a test builds and runs that test again and nothing else.
+- [x] The result refers to no test.
+- [x] Verify: `tests/run.sh` ends with `all integration checks passed`, with core-rs's tests among what it ran.
 
-### Task 8: Documents
+### Task 8: What the fixtures did not meet
+
+**Files:** `src/localsrc.rs`, `src/graph.rs`, `src/testrun.rs`, `src/resolve.rs`, `nix/build-rust-application.nix`, `examples/conformance.rs`, `tests/run.sh`, the `workspace` fixture
+
+Found by thinking through real projects and by an independent review of the branch.
+
+- [x] `tests/common.rs` beside tests that say `mod common;`: `localsrc::declared_modules` searches a unit's root for `mod name;` and `path = "…"`, and such a file stays in the view. Pinned by the `workspace` fixture and by `check_incremental`.
+- [x] A test that leaves a process running, which holds the test's output open: `testrun::tee` stops when the test exits. Pinned by a unit test.
+- [x] A test that looks through `examples/` or `benches/`: everything built as a test keeps all three directories.
+- [x] An example that does not compile: the application depends on `testBuilds`.
+- [x] A target rooted outside its package through `..`: the root is normalised before it is checked. Something only the tests need that is refused: the error says so and names `doCheck = false`.
+- [x] Cargo's order of the library search path for a test: what build scripts built comes first.
+- [x] The conformance example compares multisets and reads `CARGO_BIN_EXE_<name>` with a hyphen in the name; `check_tests_ran` names the kind of test and asks for a count that an empty test executable cannot meet.
+
+### Task 9: Documents
 
 **Files:** the spec, `README.md`
 
-- [ ] The spec's "Tests" section, API table, facts, fixture table and layout match what was built. README: tests, `checkFlags`, `skipTests`, what is not run.
+- [x] The spec's "Tests" section, API table, facts, fixture table and layout match what was built, with what follows from the design: what a test's dependencies have compiled in, what the copy holds, how coarse `skipTests` and `checkFlags` are, and that a test is an input of the application. README: tests, `checkFlags`, `skipTests`, what is not run, the limits.

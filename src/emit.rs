@@ -127,6 +127,8 @@ pub fn to_nix(graph: &Graph) -> String {
     if graph.tests.is_empty() {
         line("  tests = { };".to_string());
     }
+    let builds: Vec<String> = graph.test_builds.iter().map(|key| unit_ref(key)).collect();
+    line(format!("  testBuilds = [ {} ];", builds.join(" ")));
     line(format!("  buildUnits = {};", list(&graph.build_units)));
     line(format!("  testUnits = {};", list(&graph.test_units)));
     line("}".to_string());
@@ -425,6 +427,7 @@ mod tests {
   bins."app" = units."app-0.1.0-bin-app-cccccccc";
   roots = [ units."app-0.1.0-bin-app-cccccccc" ];
   tests = { };
+  testBuilds = [  ];
   buildUnits = [ "app-0.1.0-bin-app-cccccccc" "dep-1.0.0+x-build-script-aaaaaaaa" "dep-1.0.0+x-run-build-script-bbbbbbbb" ];
   testUnits = [ ];
 }

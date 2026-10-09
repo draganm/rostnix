@@ -133,9 +133,11 @@ in
 {
   # With one executable, `nix run` needs no flags.
   meta = lib.optionalAttrs (lib.length binNames == 1) { mainProgram = lib.head binNames; } // meta;
-  # The application is built only when its tests pass. A test is an input
-  # and leaves nothing in the result, so the result does not refer to it.
+  # The application is built only when its tests pass and what `cargo test`
+  # builds beside them, the examples, compiles. Both are inputs and leave
+  # nothing in the result, so the result does not refer to them.
   testRuns = lib.attrValues testRuns;
+  inherit (checked) testBuilds;
   passthru = {
     inherit rustc cargo;
     # The source tree cargo planned from.

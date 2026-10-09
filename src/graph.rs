@@ -32,6 +32,9 @@ pub struct Graph {
     /// The units that are tests: each compiles a test executable and runs
     /// it.
     pub tests: Vec<String>,
+    /// What `cargo test` builds without running it, to see that it
+    /// compiles: the examples.
+    pub test_builds: Vec<String>,
     /// The units `cargo build` plans and the units `cargo test` plans. A
     /// unit both plan alike is in both.
     pub build_units: Vec<String>,
@@ -77,6 +80,9 @@ pub enum SrcRef {
 }
 
 #[derive(Debug, Clone)]
+// A graph holds a few hundred nodes; boxing the larger kind would buy
+// nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum UnitNode {
     Compile(CompileUnit),
     Run(RunUnit),
@@ -155,6 +161,8 @@ pub struct Inputs<'a> {
     pub override_keys: &'a [String],
     /// Reads the manifest at a path.
     pub read_manifest: &'a dyn Fn(&str) -> Result<Table>,
+    /// Reads a source file of the tree, if it is there to be read.
+    pub read_source: &'a dyn Fn(&str) -> Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -551,6 +559,14 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
             .collect();
         out.tests.sort();
         out.tests.dedup();
+        out.test_builds = graph
+            .roots
+            .iter()
+            .filter(|&&root| !matches!(kinds[root], Kind::Test | Kind::Skipped))
+            .map(|&root| keys[root].clone())
+            .collect();
+        out.test_builds.sort();
+        out.test_builds.dedup();
     }
     Ok(out)
 }
@@ -615,9 +631,8 @@ fn add_plan(ctx: &Ctx, graph: &UnitGraph, kinds: &[Kind], out: &mut Graph) -> Re
                 unit
             };
             local_src(
+                ctx,
                 pkg_info,
-                ctx.local_dirs,
-                ctx.src_root,
                 view_of,
                 kind == Kind::Run,
                 kind == Kind::Test,
@@ -685,10 +700,13 @@ fn add_plan(ctx: &Ctx, graph: &UnitGraph, kinds: &[Kind], out: &mut Graph) -> Re
         }
 
         let manifest_dir = pkg.manifest_dir();
-        let src_path = relative_to(&unit.target.src_path, manifest_dir).ok_or_else(|| {
+        // Cargo names a root as the manifest wrote it: `path = "../x.rs"`
+        // comes out with the `..` in it.
+        let root = normalized(&unit.target.src_path);
+        let src_path = relative_to(&root, manifest_dir).ok_or_else(|| {
             format!(
                 "the target {} of {} {} has its root at {}, outside the package directory",
-                unit.target.name, pkg.name, pkg.version, unit.target.src_path
+                unit.target.name, pkg.name, pkg.version, root
             )
         })?;
         let is_primary = primary.contains(unit.pkg_id.as_str());
@@ -798,6 +816,11 @@ fn add_plan(ctx: &Ctx, graph: &UnitGraph, kinds: &[Kind], out: &mut Graph) -> Re
         );
     }
     Ok(keys)
+}
+
+/// An absolute path with its `.` and `..` resolved.
+fn normalized(path: &str) -> String {
+    format!("/{}", localsrc::resolve("", path))
 }
 
 /// `path` relative to `dir`, when it is `dir` or under it. `""` is `dir`
@@ -957,13 +980,13 @@ fn target_info(target_kind: &[String], executable: bool, src_path: String) -> Ta
 /// rustc never names, the roots of the package's executables among them, so
 /// its run is shown those too.
 fn local_src(
+    ctx: &Ctx,
     info: &PkgInfo,
-    local_dirs: &[String],
-    src_root: &str,
     unit: &Unit,
     sees_every_root: bool,
     as_test: bool,
 ) -> SrcRef {
+    let (local_dirs, src_root) = (ctx.local_dirs, ctx.src_root);
     let targets: Vec<TargetInfo> = info
         .pkg
         .targets
@@ -973,19 +996,40 @@ fn local_src(
             Some(target_info(
                 &t.kind,
                 t.is_executable(),
-                relative_to(&t.src_path, src_root)?,
+                relative_to(&normalized(&t.src_path), src_root)?,
             ))
         })
         .collect();
     let unit_target = target_info(
         &unit.target.kind,
         false,
-        relative_to(&unit.target.src_path, src_root).unwrap_or_default(),
+        relative_to(&normalized(&unit.target.src_path), src_root).unwrap_or_default(),
     );
+    // Another target's root that this unit's root names as a module is
+    // part of this unit: `mod common;` beside `tests/common.rs`.
+    let root_dir = unit_target
+        .src_path
+        .rsplit_once('/')
+        .map_or("", |(dir, _)| dir);
+    let keep: Vec<String> = (ctx.inp.read_source)(&unit.target.src_path)
+        .map(|text| {
+            localsrc::declared_modules(&text)
+                .iter()
+                .map(|module| localsrc::resolve(root_dir, module))
+                .collect()
+        })
+        .unwrap_or_default();
     SrcRef::Local {
         name: sanitize_name(&format!("rustsrc-{}", info.key)),
         dir: info.rel_dir.clone(),
-        exclude: localsrc::exclusions(&info.rel_dir, local_dirs, &targets, &unit_target, as_test),
+        exclude: localsrc::exclusions(
+            &info.rel_dir,
+            local_dirs,
+            &targets,
+            &unit_target,
+            as_test,
+            &keep,
+        ),
     }
 }
 
@@ -1053,6 +1097,7 @@ mod tests {
             cargo_version: "1.95.0",
             override_keys,
             read_manifest: &|_| Ok(Table::new()),
+            read_source: &|_| None,
         })
     }
 
@@ -1405,6 +1450,15 @@ mod tests {
     /// The graph of the hello fixture from what cargo 1.95 printed for it:
     /// the plan of `cargo build` and, with tests, that of `cargo test`.
     fn hello_with(with_tests: bool, change: impl FnOnce(&mut UnitGraph)) -> Result<Graph> {
+        hello_reading(with_tests, change, &|_| None)
+    }
+
+    /// The same, with the source files `read_source` holds.
+    fn hello_reading(
+        with_tests: bool,
+        change: impl FnOnce(&mut UnitGraph),
+        read_source: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Graph> {
         let units: UnitGraph =
             serde_json::from_str(include_str!("../testdata/hello/build-graph.json")).unwrap();
         let mut tests: UnitGraph =
@@ -1431,6 +1485,7 @@ mod tests {
             cargo_version: "1.95.0",
             override_keys: &[],
             read_manifest: &|_| Ok(Table::new()),
+            read_source,
         })
     }
 
@@ -1543,13 +1598,12 @@ mod tests {
         let graph = hello(true);
         assert_eq!(
             excluded(&hello_test(&graph, "test", "cli").src),
-            ["benches", "examples", "src/main.rs", "tests/smoke.rs"]
+            ["examples/extra.rs", "src/main.rs", "tests/smoke.rs"]
         );
         assert_eq!(
             excluded(&hello_test(&graph, "lib", "hello").src),
             [
-                "benches",
-                "examples",
+                "examples/extra.rs",
                 "src/main.rs",
                 "tests/cli.rs",
                 "tests/smoke.rs"
@@ -1557,13 +1611,37 @@ mod tests {
         );
         assert_eq!(
             excluded(&hello_test(&graph, "bin", "hello").src),
-            ["benches", "examples", "tests/cli.rs", "tests/smoke.rs"]
+            ["examples/extra.rs", "tests/cli.rs", "tests/smoke.rs"]
         );
         // What is installed sees no test at all.
         let lib = compile(&graph, "hello-0.1.0-lib-")[0];
         assert_eq!(
             excluded(&lib.src),
             ["benches", "examples", "src/main.rs", "tests"]
+        );
+    }
+
+    // A test that says `mod smoke;` reads tests/smoke.rs, which cargo also
+    // builds as a test of its own. The file stays in that test's view and
+    // in no other's.
+    #[test]
+    fn a_test_keeps_the_root_it_names_as_a_module() {
+        let graph = hello_reading(true, |_| {}, &|path| {
+            (path == "/src/tests/cli.rs").then(|| "mod smoke;\nfn helper() {}\n".to_string())
+        })
+        .unwrap();
+        assert_eq!(
+            excluded(&hello_test(&graph, "test", "cli").src),
+            ["examples/extra.rs", "src/main.rs"]
+        );
+        assert_eq!(
+            excluded(&hello_test(&graph, "lib", "hello").src),
+            [
+                "examples/extra.rs",
+                "src/main.rs",
+                "tests/cli.rs",
+                "tests/smoke.rs"
+            ]
         );
     }
 
@@ -1586,6 +1664,10 @@ mod tests {
                 "{key}"
             );
         }
+        // `cargo test` also builds the example, to see that it compiles.
+        let builds: Vec<&str> = graph.test_builds.iter().map(|key| unhashed(key)).collect();
+        assert_eq!(builds, ["hello-0.1.0-example-extra"]);
+        assert!(hello(false).test_builds.is_empty());
     }
 
     // `cargo test` builds every example to see that it compiles. One that
@@ -1604,6 +1686,33 @@ mod tests {
         assert!(!graph.units.keys().any(|key| key.contains("-example-")));
         let cli = hello_test(&graph, "test", "cli");
         assert_eq!(cli.test.as_ref().unwrap().executables.len(), 1);
+    }
+
+    // `[[test]] path = "../shared.rs"`: cargo reports the path with the
+    // `..` in it, which must not pass for a path inside the package.
+    #[test]
+    fn a_test_rooted_outside_its_package_is_refused() {
+        let set_root = |tests: &mut UnitGraph, root: &str| {
+            let cli = tests
+                .units
+                .iter_mut()
+                .find(|unit| unit.target.name == "cli")
+                .unwrap();
+            cli.target.src_path = root.to_string();
+        };
+        let err = hello_with(true, |tests| set_root(tests, "/src/../shared.rs"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cli of hello 0.1.0")
+                && err.contains("/shared.rs")
+                && err.contains("outside the package directory"),
+            "{err}"
+        );
+        // A detour that stays inside is the file it leads to.
+        let graph =
+            hello_with(true, |tests| set_root(tests, "/src/tests/../tests/cli.rs")).unwrap();
+        assert_eq!(hello_test(&graph, "test", "cli").src_path, "tests/cli.rs");
     }
 
     #[test]

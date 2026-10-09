@@ -170,8 +170,28 @@ nix build "${opt[@]}" '.#default.tests."app-0.1.0-test-e2e-91d0c3aa"'
 cat result/log
 ```
 
-What a Nix build forbids, a test cannot do: reach the network (in a
-sandboxed build), or create a setuid file.
+The application also depends on the examples `cargo test` builds, so one
+that does not compile fails the build as it fails `cargo test`.
+
+Limits worth knowing:
+
+- What a Nix build forbids, a test cannot do: reach the network (in a
+  sandboxed build), or create a setuid file.
+- Tests are built with `profile`, which is `release` unless you say
+  otherwise, so `debug_assert!` and overflow checks are off as under
+  `cargo test --release`.
+- Only the test itself is compiled in the writable copy. A library that
+  returns `env!("CARGO_MANIFEST_DIR")` from its own, non-test code hands
+  its tests a read-only store path without `tests/`.
+- The copy holds the test's package, not the workspace around it. Name
+  files outside the package in `extraSrc`.
+- A name in `skipTests` skips every test target of that name, in every
+  selected package. Every test executable gets the same `checkFlags`.
+- A test is an input of the application: editing one gives the application
+  a new store path although its binaries are unchanged.
+- If something only the tests need cannot be planned, a git
+  dev-dependency for instance, the error says so and `doCheck = false`
+  builds without tests.
 
 ### crateOverrides
 
@@ -212,7 +232,7 @@ directory, narrowed by three rules:
 - Directories of other packages inside it are left out.
 - `examples/`, `tests/` and `benches/` are left out, unless the step builds
   an example, test or bench. Everything built as a test, unit tests
-  included, keeps `tests/`, where test data and helper modules live.
+  included, keeps all three: a test may read whatever lies in its package.
 - The root files of the package's other binaries, examples, tests and
   benches are left out, except one the step's own root file names as a
   module: `tests/common.rs` stays for a test that says `mod common;`. A

@@ -113,10 +113,11 @@ fn main() -> ExitCode {
         side.retain(|inv| !(compile_only && inv.program == "test"));
         side.retain(|inv| !without.contains(&inv.crate_name));
     }
-    let only_cargo: Vec<&Invocation> = cargo.iter().filter(|inv| !rostnix.contains(inv)).collect();
-    let only_rostnix: Vec<&Invocation> =
-        rostnix.iter().filter(|inv| !cargo.contains(inv)).collect();
-    if only_cargo.is_empty() && only_rostnix.is_empty() && cargo.len() == rostnix.len() {
+    // As multisets: two invocations that normalise alike on one side need
+    // two on the other.
+    let only_cargo = unmatched_in(&cargo, &rostnix);
+    let only_rostnix = unmatched_in(&rostnix, &cargo);
+    if only_cargo.is_empty() && only_rostnix.is_empty() {
         println!(
             "{} invocations, the same under cargo and rostnix",
             cargo.len()
@@ -163,6 +164,21 @@ fn main() -> ExitCode {
         );
     }
     ExitCode::FAILURE
+}
+
+/// The invocations of `all` that `other` has no counterpart for, counting
+/// each of `other` once.
+fn unmatched_in<'a>(all: &'a [Invocation], other: &[Invocation]) -> Vec<&'a Invocation> {
+    let mut unmatched: Vec<&Invocation> = other.iter().collect();
+    all.iter()
+        .filter(|inv| match unmatched.iter().position(|o| o == inv) {
+            Some(i) => {
+                unmatched.swap_remove(i);
+                false
+            }
+            None => true,
+        })
+        .collect()
 }
 
 fn report_difference(cargo: &Invocation, rostnix: &Invocation) {

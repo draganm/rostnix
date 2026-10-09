@@ -116,6 +116,9 @@ impl Request {
     }
 }
 
+/// What follows an error that the tests alone cause.
+const TESTS_ONLY: &str = "this concerns the tests only: what is installed can be planned without them. Set doCheck = false to build without tests";
+
 /// `"."`, `"./a/"` and the like as a path relative to the source root, with
 /// `""` for the root.
 fn normalize_dir(dir: &str) -> String {
@@ -172,27 +175,42 @@ pub fn run(request: &str) -> Result<String> {
     let test_units = request
         .do_check
         .then(|| plan(&request.test_graph_args()))
-        .transpose()?;
+        .transpose()
+        .map_err(|err| format!("{err}\n{TESTS_ONLY}"))?;
     let metadata: Metadata =
         serde_json::from_slice(&cargo.output(&workspace, &request.metadata_args(&host))?).map_err(
             |err| format!("cargo {cargo_version} printed metadata this version cannot read: {err}"),
         )?;
 
-    let graph = graph::build(&Inputs {
-        units: &units,
-        test_units: test_units.as_ref(),
-        metadata: &metadata,
-        checksums: &checksums,
-        src,
-        cargo_root: &cargo_root,
-        host: &host,
-        cargo_version: &cargo_version,
-        override_keys: &request.override_keys,
-        read_manifest: &|path| {
-            let text = fs::read_to_string(path).map_err(|err| format!("reading {path}: {err}"))?;
-            toml::from_str(&text).map_err(|err| format!("parsing {path}: {err}").into())
-        },
-    })?;
+    let build = |test_units: Option<&UnitGraph>| {
+        graph::build(&Inputs {
+            units: &units,
+            test_units,
+            metadata: &metadata,
+            checksums: &checksums,
+            src,
+            cargo_root: &cargo_root,
+            host: &host,
+            cargo_version: &cargo_version,
+            override_keys: &request.override_keys,
+            read_manifest: &|path| {
+                let text =
+                    fs::read_to_string(path).map_err(|err| format!("reading {path}: {err}"))?;
+                toml::from_str(&text).map_err(|err| format!("parsing {path}: {err}").into())
+            },
+            read_source: &|path| fs::read_to_string(path).ok(),
+        })
+    };
+    let graph = match build(test_units.as_ref()) {
+        Ok(graph) => graph,
+        // What is refused may be something only the tests need: a
+        // dev-dependency from git, say. Then the way out is to do without
+        // the tests, and the message says so.
+        Err(err) if test_units.is_some() && build(None).is_ok() => {
+            return Err(format!("{err}\n{TESTS_ONLY}").into());
+        }
+        Err(err) => return Err(err),
+    };
 
     // The crates must be added while the private cargo home still exists:
     // their paths go through it.

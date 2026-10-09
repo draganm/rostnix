@@ -321,23 +321,26 @@ check_stdenv() {
   echo "ok: $1: only libraries build without stdenv"
 }
 
-# test_log <fixture> <test target>: prints the path of what that test
-# printed when it ran.
+# test_log <fixture> <test target> <target kind>: prints the path of what
+# that test printed when it ran. The kind tells a library's unit tests from
+# those of a binary or an integration test of the same name.
 test_log() {
   local out
   out="$(nix build --impure "${exec_opt[@]}" --no-link --print-out-paths --expr "
     let fixture = (builtins.getFlake \"$flake\").legacyPackages.\${builtins.currentSystem}.fixtures.$1;
-    in builtins.head (builtins.filter (test: test.targetName == \"$2\") (builtins.attrValues fixture.tests))
-  ")" || fail "$1: the test $2 does not build and pass"
+    in builtins.head (builtins.filter (test: test.targetName == \"$2\" && test.targetKind == \"$3\") (builtins.attrValues fixture.tests))
+  ")" || fail "$1: the tests of $2 ($3) do not build and pass"
   echo "$out/log"
 }
 
-# check_tests_ran <fixture> <test target> <text its log must hold>
+# check_tests_ran <fixture> <test target> <target kind> <pattern its log must match>
+# The pattern is an extended regular expression. One that asks for a count
+# of passed tests cannot be met by a test executable with no test in it.
 check_tests_ran() {
   local log
-  log="$(test_log "$1" "$2")"
-  grep -qF -- "$3" "$log" || fail "$1: the log of the test $2 does not say '$3': $(cat "$log")"
-  echo "ok: $1: the test $2 ran: $3"
+  log="$(test_log "$1" "$2" "$3")"
+  grep -qE -- "$4" "$log" || fail "$1: the log of $2 ($3) does not match '$4': $(cat "$log")"
+  echo "ok: $1: the tests of $2 ($3) ran: $(grep -E -- "$4" "$log" | head -n 1)"
 }
 
 # A failing test fails the build, and the log names the test. The fixture
@@ -411,11 +414,43 @@ check_shared_units() {
   echo "ok: tests share the application's units where cargo plans them alike, and only there"
 }
 
+# What only the tests need may be something rostnix refuses. The error then
+# says that it concerns the tests, and how to build without them. Here it
+# is a test rooted outside its package, by a path with `..` in it.
+check_tests_only_refusal() {
+  local dir="$work/outside" msg
+  mkdir -p "$dir/pkg"
+  cp -R "$root/tests/fixtures/hello/." "$dir/pkg/"
+  printf '\n[[test]]\nname = "outside"\npath = "../outside.rs"\n' >>"$dir/pkg/Cargo.toml"
+  printf '#[test]\nfn passes() {}\n' >"$dir/outside.rs"
+  outside_with() {
+    nix eval --impure --raw "${exec_opt[@]}" --expr "
+      ((builtins.getFlake \"$flake\").legacyPackages.\${builtins.currentSystem}.rustEnv.buildRustApplication {
+        pname = \"outside\";
+        src = $dir;
+        cargoRoot = \"pkg\";
+        doCheck = $1;
+      }).drvPath" 2>&1
+  }
+  if msg="$(outside_with true)"; then
+    fail "a test rooted outside its package was accepted"
+  fi
+  case "$msg" in
+    *'the target outside of hello 0.1.0 has its root at'*'outside the package directory'*'this concerns the tests only'*'doCheck = false'*) ;;
+    *) fail "unhelpful error for a test that cannot be planned: $msg" ;;
+  esac
+  outside_with false >/dev/null ||
+    fail "doCheck = false does not build without the test that cannot be planned"
+  rm -rf "$dir"
+  echo "ok: what only the tests need and cannot be planned is explained; doCheck = false builds without it"
+}
+
 check_run hello hello '{"greeting":"hello","n":42}'
 check_conformance hello default --profile release
 check_test_conformance hello default --profile release
-check_tests_ran hello cli "test result: ok. 6 passed"
-check_tests_ran hello smoke "test result: ok. 1 passed"
+check_tests_ran hello cli test "test result: ok\. 6 passed"
+check_tests_ran hello smoke test "test result: ok\. 1 passed"
+check_tests_ran hello hello lib "test result: ok\. 1 passed; 0 failed; 1 ignored"
 check_main_program hello hello
 check_stdenv hello
 check_no_intermediate_refs hello
@@ -424,6 +459,7 @@ check_failing_test
 check_skip_tests
 check_no_check
 check_shared_units
+check_tests_only_refusal
 
 # A workspace: the default selection is every member, and a narrower one
 # with a feature builds one binary. Its tests cover a proc macro's unit
@@ -434,9 +470,9 @@ check_run workspace ws-tool "ws-tool ok 7"
 check_bins workspace "ws-app ws-tool"
 check_conformance workspace default --profile release
 check_test_conformance workspace default --profile release
-check_tests_ran workspace plain "plain test ran"
-check_tests_ran workspace ws_macros "test result: ok. 1 passed"
-check_tests_ran workspace cli "test result: ok. 2 passed"
+check_tests_ran workspace plain test "^plain test ran$"
+check_tests_ran workspace ws_macros proc-macro "test result: ok\. 1 passed"
+check_tests_ran workspace cli test "test result: ok\. 2 passed"
 check_run workspace-shout ws-app "HELLO FROM WS-APP: 3"
 check_bins workspace-shout "ws-app"
 check_conformance workspace-shout default --profile release --package ws-app --bin ws-app --features shout
@@ -452,7 +488,7 @@ check_run buildscript consumer \
   "add=5 answer=42 note=from-override generated=from-build-script cfg=yes old=yes msg=shared-message zlib=ok pc=$zlib_version"
 ROSTNIX_FIXTURE_NOTE=from-override check_conformance buildscript fixtureShell --profile release
 ROSTNIX_FIXTURE_NOTE=from-override check_test_conformance buildscript fixtureShell --profile release
-check_tests_ran buildscript bs_native "test result: ok. 2 passed"
+check_tests_ran buildscript bs_native lib "test result: ok\. 2 passed"
 check_no_intermediate_refs buildscript
 check_override_typo
 check_override_unmatched
@@ -466,7 +502,7 @@ for profile in release thin nolto dev; do
   check_run "profiles-$profile" profiles "profiles ok 12345"
   check_conformance "profiles-$profile" default --profile "$profile"
   check_test_conformance "profiles-$profile" default --profile "$profile"
-  check_tests_ran "profiles-$profile" profiles "test result: ok. 2 passed"
+  check_tests_ran "profiles-$profile" profiles bin "test result: ok\. 2 passed"
 done
 # dev keeps debug information. On macOS that lives in the units' object
 # files, which the result must not keep alive: it gets a .dSYM instead.
@@ -497,11 +533,11 @@ core_rs_tests="$(nix eval "${exec_opt[@]}" --raw "$flake#fixtures.core-rs" --app
 echo "ok: core-rs: 21 of its 22 test executables ran"
 # The CLI test finds the example beside its own executable. The pack store
 # test copies golden files out of the source and writes to the copies.
-check_tests_ran core-rs cli_e2e "test result: ok."
-check_tests_ran core-rs golden_packstore "test result: ok. 4 passed"
-check_tests_ran core-rs amber_store_core "test result: ok."
+check_tests_ran core-rs cli_e2e test "test result: ok\. [1-9][0-9]* passed"
+check_tests_ran core-rs golden_packstore test "test result: ok\. 4 passed"
+check_tests_ran core-rs amber_store_core lib "test result: ok\. [1-9][0-9]* passed"
 # The one test Nix itself rules out: it creates a setuid file.
-check_tests_ran core-rs tar_extract "1 filtered out"
+check_tests_ran core-rs tar_extract test "test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out"
 check_test_compile_conformance core-rs default amber_bench_smoke --profile release
 
 # rostnix builds itself, and its own unit tests pass in a derivation.
@@ -515,7 +551,7 @@ esac
 echo "ok: self: rostnix builds itself"
 check_conformance self default --profile release
 check_test_conformance self default --profile release
-check_tests_ran self rostnix "test result: ok."
+check_tests_ran self rostnix lib "test result: ok\. [1-9][0-9][0-9] passed"
 
 # An edit rebuilds the units that see the file and what depends on them.
 # A test is such a unit: it is built and run again when it could tell the
@@ -548,8 +584,11 @@ check_incremental "$workspace" '{ doCheck = false; }' crates/macros/src/lib.rs "
 # With tests: the tests of the package and of what depends on it run again,
 # and no other package's.
 check_incremental "$workspace" '{ }' crates/core/src/lib.rs \
-  "rustbin-ws-app rustbin-ws-tool rustlib-ws-core-0.3.0 rusttest-cli rusttest-plain rusttest-ws-app rusttest-ws-tool rusttest-ws_core"
+  "rustbin-ws-app rustbin-ws-tool rustlib-ws-core-0.3.0 rusttest-cli rusttest-common rusttest-plain rusttest-ws-app rusttest-ws-tool rusttest-ws_core"
 check_incremental "$workspace" '{ }' crates/core/tests/plain.rs "rusttest-plain"
+# tests/common.rs is a test of its own to cargo and a module of plain.rs,
+# which says `mod common;`: both see it, and nothing else does.
+check_incremental "$workspace" '{ }' crates/core/tests/common.rs "rusttest-common rusttest-plain"
 check_incremental "$workspace" '{ }' app/src/bin/ws-tool.rs "rustbin-ws-tool rusttest-cli rusttest-ws-tool"
 
 # A file an override's extraSrc adds is seen by that package's units.
