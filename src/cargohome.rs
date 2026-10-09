@@ -68,23 +68,58 @@ const SOURCE_TABLES: &[&str] = &[
     "credential-alias",
 ];
 
-/// The private cargo home's `config.toml` for a caller's: its
-/// [`SOURCE_TABLES`], and nothing else.
-pub fn source_config(caller_config: &str) -> Result<String> {
+/// Settings of the kept tables that name a path. In a configuration file
+/// a relative path starts at the directory above the one the file is in,
+/// and the private home is somewhere else.
+const PATHS_IN_SOURCES: &[&str] = &["directory", "local-registry"];
+
+/// The private cargo home's `config.toml` for a caller's, whose cargo home
+/// lies in the directory `above_home`: its [`SOURCE_TABLES`] and nothing
+/// else, with the relative paths in them made absolute.
+///
+/// Cargo is also told to fetch git repositories with the git command,
+/// unless the caller's file says which git to use. Nix fetches a git
+/// dependency with the git command, which reads the caller's git and ssh
+/// configuration; cargo's built-in git reads less of it, and would fail
+/// where Nix succeeds. Being in this file, the choice gives way to the
+/// project's own configuration and to the caller's environment.
+pub fn source_config(caller_config: &str, above_home: &str) -> Result<String> {
     let config: Table = toml::from_str(caller_config)?;
-    let kept: Table = config
+    let mut kept: Table = config
         .into_iter()
         .filter(|(table, _)| SOURCE_TABLES.contains(&table.as_str()))
         .collect();
+    let absolute = |value: &mut toml::Value| {
+        if let Some(path) = value.as_str().filter(|path| !path.starts_with('/')) {
+            *value = toml::Value::String(format!("{above_home}/{path}"));
+        }
+    };
+    if let Some(sources) = kept
+        .get_mut("source")
+        .and_then(|sources| sources.as_table_mut())
+    {
+        for source in sources
+            .iter_mut()
+            .filter_map(|(_, source)| source.as_table_mut())
+        {
+            for key in PATHS_IN_SOURCES {
+                if let Some(value) = source.get_mut(*key) {
+                    absolute(value);
+                }
+            }
+        }
+    }
+    if let Some(cainfo) = kept.get_mut("http").and_then(|http| http.get_mut("cainfo")) {
+        absolute(cainfo);
+    }
+    let net = kept
+        .entry("net")
+        .or_insert_with(|| toml::Value::Table(Table::new()));
+    if let Some(net) = net.as_table_mut() {
+        net.entry("git-fetch-with-cli")
+            .or_insert(toml::Value::Boolean(true));
+    }
     Ok(toml::to_string(&kept)?)
-}
-
-/// Whether a `config.toml` says which git cargo is to fetch with.
-fn chooses_git(config: &str) -> bool {
-    toml::from_str::<Table>(config)
-        .ok()
-        .and_then(|config| config.get("net")?.get("git-fetch-with-cli").cloned())
-        .is_some()
 }
 
 /// A cargo set up to plan a build. Its temporary directories are removed
@@ -93,8 +128,6 @@ pub struct Cargo {
     cargo: PathBuf,
     rustc: PathBuf,
     scratch: PathBuf,
-    /// Whether the caller left it to rostnix which git cargo fetches with.
-    default_to_git_command: bool,
 }
 
 impl Cargo {
@@ -118,11 +151,10 @@ impl Cargo {
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos()
         ));
-        let mut this = Cargo {
+        let this = Cargo {
             cargo: cargo.into(),
             rustc: rustc.into(),
             scratch,
-            default_to_git_command: std::env::var_os("CARGO_NET_GIT_FETCH_WITH_CLI").is_none(),
         };
         // The cargo home may come to hold a copy of registry settings, a
         // token among them, so no one else may look into it.
@@ -134,21 +166,36 @@ impl Cargo {
         fs::create_dir_all(this.target_dir())?;
 
         // Where crates come from is the caller's to say; how they are built
-        // is not. `config` is the name cargo used before `config.toml`.
-        let caller_config = ["config.toml", "config"]
+        // is not. `config` is the name cargo used before `config.toml`, and
+        // the one it reads when both are there.
+        let caller_config = ["config", "config.toml"]
             .iter()
             .map(|name| real_home.join(name))
             .find(|file| file.is_file());
-        if let Some(file) = caller_config {
-            let text = fs::read_to_string(&file)
-                .map_err(|err| format!("reading {}: {err}", file.display()))?;
-            let kept =
-                source_config(&text).map_err(|err| format!("parsing {}: {err}", file.display()))?;
-            if chooses_git(&kept) {
-                this.default_to_git_command = false;
+        let above_home = real_home
+            .parent()
+            .unwrap_or(&real_home)
+            .to_string_lossy()
+            .into_owned();
+        let text = match &caller_config {
+            Some(file) => fs::read_to_string(file)
+                .map_err(|err| format!("reading {}: {err}", file.display()))?,
+            None => String::new(),
+        };
+        // A file this cannot read is cargo's to complain about, when cargo
+        // needs it. Most projects need nothing from it.
+        let kept = match source_config(&text, &above_home) {
+            Ok(kept) => kept,
+            Err(err) => {
+                let file = caller_config.unwrap_or_default();
+                eprintln!(
+                    "rostnix: warning: {} cannot be read ({err}); the registries it may name are not known to this build",
+                    file.display()
+                );
+                source_config("", &above_home)?
             }
-            fs::write(this.home().join("config.toml"), kept)?;
-        }
+        };
+        fs::write(this.home().join("config.toml"), kept)?;
         for name in CREDENTIALS {
             let real = real_home.join(name);
             if real.is_file() {
@@ -194,12 +241,6 @@ impl Cargo {
             {
                 cmd.env(&key, value);
             }
-        }
-        // Nix fetches a git dependency with the git command, which reads
-        // the caller's git and ssh configuration. Cargo's built-in git
-        // reads less of it, and would fail where Nix succeeds.
-        if self.default_to_git_command {
-            cmd.env("CARGO_NET_GIT_FETCH_WITH_CLI", "true");
         }
         cmd.env("CARGO_HOME", self.home())
             .env("CARGO_TARGET_DIR", self.target_dir())
@@ -255,11 +296,12 @@ impl Cargo {
         Ok(output.stdout)
     }
 
-    /// The cfgs of the machine rustc runs on, as `rustc --print=cfg`
-    /// prints them.
-    pub fn print_cfg(&self) -> Result<String> {
+    /// The cfgs of the machine rustc runs on when it is given `flags`, as
+    /// `rustc --print=cfg` prints them.
+    pub fn print_cfg(&self, flags: &[String]) -> Result<String> {
         let output = Command::new(&self.rustc)
             .arg("--print=cfg")
+            .args(flags)
             .env_remove("RUSTFLAGS")
             .output()
             .map_err(|err| format!("running {}: {err}", self.rustc.display()))?;
@@ -302,10 +344,14 @@ impl Drop for Cargo {
 mod tests {
     use super::*;
 
+    fn kept(caller_config: &str) -> Table {
+        toml::from_str(&source_config(caller_config, "/home/me").unwrap()).unwrap()
+    }
+
     // Where crates come from is carried over; how things are built is not.
     #[test]
     fn only_the_tables_about_sources_are_kept() {
-        let kept = source_config(
+        let kept = kept(
             r#"
 [build]
 rustflags = ["-C", "target-cpu=native"]
@@ -328,7 +374,6 @@ replace-with = "mirror"
 registry = "sparse+https://mirror.example.com/"
 
 [net]
-git-fetch-with-cli = false
 retry = 3
 
 [http]
@@ -343,9 +388,7 @@ linker = "clang"
 [alias]
 b = "build"
 "#,
-        )
-        .unwrap();
-        let kept: Table = toml::from_str(&kept).unwrap();
+        );
         let mut tables: Vec<&str> = kept.keys().map(String::as_str).collect();
         tables.sort();
         assert_eq!(
@@ -366,16 +409,60 @@ b = "build"
         assert_eq!(kept["net"]["retry"].as_integer(), Some(3));
     }
 
+    // Cargo fetches with the git command, as Nix does, unless the caller
+    // says which git to use.
     #[test]
-    fn a_config_that_chooses_its_git_is_noticed() {
-        assert!(chooses_git("[net]\ngit-fetch-with-cli = false\n"));
-        assert!(chooses_git("[net]\ngit-fetch-with-cli = true\n"));
-        assert!(!chooses_git("[net]\nretry = 3\n"));
-        assert!(!chooses_git(""));
+    fn the_git_command_is_chosen_unless_the_caller_chose() {
+        assert_eq!(kept("")["net"]["git-fetch-with-cli"].as_bool(), Some(true));
+        assert_eq!(
+            kept("[net]\nretry = 3\n")["net"]["git-fetch-with-cli"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            kept("[net]\ngit-fetch-with-cli = false\n")["net"]["git-fetch-with-cli"].as_bool(),
+            Some(false)
+        );
+    }
+
+    // A relative path in the caller's file starts above the caller's cargo
+    // home, and must still lead there from the private one.
+    #[test]
+    fn relative_paths_keep_leading_where_they_led() {
+        let kept = kept(
+            r#"
+[source.vendored]
+directory = "vendor"
+
+[source.local]
+local-registry = "/srv/registry"
+
+[source.mirror]
+registry = "sparse+https://mirror.example.com/"
+
+[http]
+cainfo = "certs/ca.pem"
+"#,
+        );
+        assert_eq!(
+            kept["source"]["vendored"]["directory"].as_str(),
+            Some("/home/me/vendor")
+        );
+        assert_eq!(
+            kept["source"]["local"]["local-registry"].as_str(),
+            Some("/srv/registry")
+        );
+        assert_eq!(
+            kept["source"]["mirror"]["registry"].as_str(),
+            Some("sparse+https://mirror.example.com/")
+        );
+        assert_eq!(
+            kept["http"]["cainfo"].as_str(),
+            Some("/home/me/certs/ca.pem")
+        );
     }
 
     #[test]
     fn a_config_that_is_not_toml_is_refused() {
-        assert!(source_config("[net").is_err());
+        assert!(source_config("[net", "/home/me").is_err());
     }
 }

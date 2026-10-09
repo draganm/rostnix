@@ -93,11 +93,12 @@ pub fn to_nix(graph: &Graph) -> String {
     }
     for (key, source) in &graph.git_sources {
         line(format!(
-            "  sources.{} = b.fetchGit {{ name = {}; url = {}; rev = {}; }};",
+            "  sources.{} = b.fetchGit {{ name = {}; url = {}; rev = {}; ref = {}; }};",
             quote(key),
             quote(&source.name),
             quote(&source.url),
-            quote(&source.rev)
+            quote(&source.rev),
+            optional(&source.git_ref)
         ));
     }
     // A project with no dependency to fetch still has the set.
@@ -561,6 +562,7 @@ mod tests {
                 name: "rustsrc-serde-a866b33".into(),
                 url: "https://github.com/serde-rs/serde".into(),
                 rev: "a866b336f14aa57a07f0d0be9f8762746e64ecb4".into(),
+                git_ref: Some("refs/tags/v1.0.228".into()),
             },
         );
         let private = graph.sources.get_mut("dep-1.0.0+x").unwrap();
@@ -571,7 +573,7 @@ mod tests {
             nix.contains(
                 "  sources.\"git-serde-a866b336f14a\" = b.fetchGit { name = \"rustsrc-serde-a866b33\"; \
                  url = \"https://github.com/serde-rs/serde\"; \
-                 rev = \"a866b336f14aa57a07f0d0be9f8762746e64ecb4\"; };\n"
+                 rev = \"a866b336f14aa57a07f0d0be9f8762746e64ecb4\"; ref = \"refs/tags/v1.0.228\"; };\n"
             ),
             "{nix}"
         );

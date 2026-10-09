@@ -463,12 +463,14 @@ check_registry() {
   "$python" "$root/tests/registry.py" make "$served" "$port" >/dev/null
   "$python" "$root/tests/registry.py" serve "$served" "$port" &
   registry_pid=$!
-  for _ in $(seq 50); do
+  for _ in {1..50}; do
     curl -sf "http://127.0.0.1:$port/index/config.json" >/dev/null && break
     sleep 0.2
   done
-  curl -sf "http://127.0.0.1:$port/index/config.json" >/dev/null ||
-    fail "registry: nothing answers on port $port; is another program using it?"
+  # What answers must be the server just started, not one left over from
+  # an earlier run, which would serve a directory that is gone.
+  kill -0 "$registry_pid" 2>/dev/null && curl -sf "http://127.0.0.1:$port/index/config.json" >/dev/null ||
+    fail "registry: the registry does not run on port $port; is another program using it?"
   printf '[registries.fixture]\nindex = "sparse+http://127.0.0.1:%s/index/"\n\n[build]\nrustflags = ["--cfg", "from_the_callers_home"]\n\n[env]\nFROM_THE_CALLERS_HOME = "1"\n' \
     "$port" >"$home/config.toml"
 
@@ -517,6 +519,38 @@ check_registry_without_address() {
       echo "ok: a crate of a registry that needs a token says how to get it" ;;
     *) fail "unhelpful error for a crate with no address to download from: $msg" ;;
   esac
+}
+
+# The flags of the cargo configuration can be replaced: a project that
+# links with mold on its developers' machines must still build here.
+check_rustflags_argument() {
+  local got
+  got="$(fixture_with config '{ cargoRoot = "ws"; rustflags = [ "--cfg" "from_argument" ]; }' \
+    'builtins.toJSON app.graph.rustflags')" || fail "the rustflags argument does not evaluate"
+  [ "$got" = '["--cfg","from_argument"]' ] ||
+    fail "rustflags = [ --cfg from_argument ] gives the flags $got"
+  echo "ok: config: the rustflags argument takes the place of the configuration's flags"
+}
+
+# A linker the cargo configuration names is not used: rostnix links with
+# the C compiler of its nixpkgs. Evaluation says so, by the key that sets
+# it.
+check_unapplied_config() {
+  local dir="$work/linker" msg
+  mkdir -p "$dir/.cargo"
+  cp -R "$root/tests/fixtures/hello/." "$dir/"
+  printf '[target."cfg(all())"]\nlinker = "clang"\n' >"$dir/.cargo/config.toml"
+  msg="$(nix eval --impure --raw "${exec_opt[@]}" --expr "
+      ((builtins.getFlake \"$flake\").legacyPackages.\${builtins.currentSystem}.rustEnv.buildRustApplication {
+        pname = \"linker\";
+        src = $dir;
+      }).drvPath" 2>&1)" || fail "a cargo configuration that names a linker stops the evaluation: $msg"
+  case "$msg" in
+    *"the cargo configuration sets target.'cfg(all())'.linker, which is not applied"*)
+      echo "ok: a setting of the cargo configuration that is not applied is named" ;;
+    *) fail "no warning for a linker in the cargo configuration: $msg" ;;
+  esac
+  rm -rf "$dir"
 }
 
 check_run hello hello '{"greeting":"hello","n":42}'
@@ -574,11 +608,13 @@ echo "ok: gitdeps: each repository is fetched at the revision Cargo.lock names"
 # directory of the file that sets them. The workspace lies below the source
 # root, with a configuration file at each level.
 check_run config configured \
-  "config ok: plain=plain message=hello-from-data unix=true expression=true build=false script=flags n=7"
+  "config ok: plain=plain message=hello-from-data unix=true expression=true triple=true flag=true build=false script=flags n=7"
 CARGO_ROOT=ws check_conformance config default --profile release
 CARGO_ROOT=ws check_test_conformance config default --profile release
 check_tests_ran config configured bin "test result: ok\. 2 passed"
 check_no_intermediate_refs config
+check_rustflags_argument
+check_unapplied_config
 
 # A crate from a registry other than crates.io.
 check_registry
@@ -701,12 +737,12 @@ check_incremental "$buildscript" '{ crateOverrides.consumer.extraSrc = [ "shared
   "rustbin-consumer rustbs-consumer-0.1.0 rustbsrun-consumer-0.1.0 rusttest-consumer"
 
 # A file that a relative variable of the cargo configuration names is seen
-# by every unit that is given the variable, the registry crate among them.
+# by every unit of a local package, although it lies outside the package.
+# The crate from the registry is given no path into this source, and is
+# rebuilt neither when that file changes nor when the source does.
 config="$root/tests/fixtures/config"
 check_incremental "$config" '{ cargoRoot = "ws"; }' data/message.txt \
-  "rustbin-configured rustbs-configured-0.1.0 rustbsrun-configured-0.1.0 rustlib-itoa-1.0.18 rusttest-configured"
-# Another variable names the workspace itself. A crate from the registry is
-# not given it, and so is not rebuilt when the source changes.
+  "rustbin-configured rustbs-configured-0.1.0 rustbsrun-configured-0.1.0 rusttest-configured"
 check_incremental "$config" '{ cargoRoot = "ws"; }' ws/app/src/main.rs \
   "rustbin-configured rustbsrun-configured-0.1.0 rusttest-configured"
 

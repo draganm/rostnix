@@ -51,30 +51,48 @@ pub fn parse_cfgs(print_cfg: &str) -> Vec<Cfg> {
         .collect()
 }
 
-/// The flags cargo gives every rustc invocation for the machine `host`.
-///
-/// When the table of the triple or a matching `cfg(…)` table has flags,
-/// those are the flags: the triple's first, then the `cfg` tables' in the
-/// order of their keys. Only when none has any does `build.rustflags`
-/// count.
-pub fn rustflags(config: &Value, host: &str, cfgs: &[Cfg]) -> Vec<String> {
-    let mut flags = Vec::new();
-    if let Some(tables) = config.get("target").and_then(Value::as_object) {
-        if let Some(of_triple) = tables.get(host).and_then(|table| table.get("rustflags")) {
-            flags.extend(string_list(of_triple));
-        }
+/// The `[target]` tables that apply to the machine `host`: the triple's,
+/// then the `cfg(…)` tables that match, in the order of their keys.
+/// Without cfgs only the triple's is known to apply.
+fn target_tables<'a>(
+    config: &'a Value,
+    host: &str,
+    cfgs: Option<&[Cfg]>,
+) -> Vec<(&'a str, &'a Value)> {
+    let Some(tables) = config.get("target").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut applying = Vec::new();
+    if let Some((key, table)) = tables.get_key_value(host) {
+        applying.push((key.as_str(), table));
+    }
+    if let Some(cfgs) = cfgs {
         let mut keys: Vec<&String> = tables
             .keys()
             .filter(|key| key.starts_with("cfg("))
             .collect();
         keys.sort();
         for key in keys {
-            if !CfgExpr::matches_key(key, cfgs) {
-                continue;
+            if CfgExpr::matches_key(key, cfgs) {
+                applying.push((key.as_str(), &tables[key]));
             }
-            if let Some(of_cfg) = tables[key].get("rustflags") {
-                flags.extend(string_list(of_cfg));
-            }
+        }
+    }
+    applying
+}
+
+/// The flags cargo gives every rustc invocation for the machine `host`,
+/// when the machine has the cfgs `cfgs`.
+///
+/// When the table of the triple or a matching `cfg(…)` table has flags,
+/// those are the flags: the triple's first, then the `cfg` tables' in the
+/// order of their keys. Only when none has any does `build.rustflags`
+/// count. Without cfgs no `cfg(…)` table is looked at.
+pub fn rustflags(config: &Value, host: &str, cfgs: Option<&[Cfg]>) -> Vec<String> {
+    let mut flags = Vec::new();
+    for (_, table) in target_tables(config, host, cfgs) {
+        if let Some(of_table) = table.get("rustflags") {
+            flags.extend(string_list(of_table));
         }
     }
     if flags.is_empty() {
@@ -85,17 +103,66 @@ pub fn rustflags(config: &Value, host: &str, cfgs: &[Cfg]) -> Vec<String> {
     flags
 }
 
-/// Whether the configuration has a `cfg(…)` table with flags, so that the
-/// cfgs of the machine are needed to read it.
-pub fn has_cfg_rustflags(config: &Value) -> bool {
+/// The flags as cargo settles them. Which `cfg(…)` tables match depends on
+/// the machine's cfgs, and those depend on the flags: a table of the triple
+/// may turn a target feature on that a `cfg(…)` table asks about.
+///
+/// Cargo starts from the flags it knows without cfgs, asks rustc for the
+/// cfgs with those flags, and reads the tables again. If that gives other
+/// flags it asks once more with them, and keeps them whether or not they
+/// hold, with a warning when they do not. `print_cfg` runs
+/// `rustc --print=cfg` with the flags it is given.
+pub fn settled_rustflags(
+    config: &Value,
+    host: &str,
+    print_cfg: &dyn Fn(&[String]) -> crate::Result<String>,
+) -> crate::Result<(Vec<String>, Vec<Cfg>)> {
+    let first = rustflags(config, host, None);
+    let cfgs = parse_cfgs(&print_cfg(&first)?);
+    let flags = rustflags(config, host, Some(&cfgs));
+    if flags == first {
+        return Ok((flags, cfgs));
+    }
+    let cfgs = parse_cfgs(&print_cfg(&flags)?);
+    if rustflags(config, host, Some(&cfgs)) != flags {
+        // Cargo's own words for it.
+        eprintln!(
+            "rostnix: warning: non-trivial mutual dependency between target-specific configuration and RUSTFLAGS"
+        );
+    }
+    Ok((flags, cfgs))
+}
+
+/// What the configuration sets for this machine that acts when things are
+/// built and that rostnix does not apply: each as the key that sets it.
+pub fn unapplied(config: &Value, host: &str, cfgs: &[Cfg]) -> Vec<String> {
+    let mut keys = Vec::new();
+    for (name, table) in target_tables(config, host, Some(cfgs)) {
+        for setting in ["linker", "runner"] {
+            if table.get(setting).is_some() {
+                keys.push(format!("target.'{name}'.{setting}"));
+            }
+        }
+    }
+    for setting in ["rustc-wrapper", "rustc-workspace-wrapper"] {
+        if config
+            .get("build")
+            .and_then(|build| build.get(setting))
+            .is_some()
+        {
+            keys.push(format!("build.{setting}"));
+        }
+    }
+    keys
+}
+
+/// Whether the configuration has a `cfg(…)` table, so that the cfgs of the
+/// machine are needed to read it.
+pub fn has_cfg_tables(config: &Value) -> bool {
     config
         .get("target")
         .and_then(Value::as_object)
-        .is_some_and(|tables| {
-            tables
-                .iter()
-                .any(|(key, table)| key.starts_with("cfg(") && table.get("rustflags").is_some())
-        })
+        .is_some_and(|tables| tables.keys().any(|key| key.starts_with("cfg(")))
 }
 
 /// The file each variable of `[env]` is set in, from what
@@ -157,7 +224,9 @@ pub fn env(
             ),
             _ => continue,
         };
-        if !relative {
+        // Cargo joins the value to the directory, and joining an absolute
+        // path gives that path.
+        if !relative || value.starts_with('/') {
             entries.push(EnvEntry {
                 name: name.clone(),
                 value,
@@ -167,11 +236,16 @@ pub fn env(
             });
             continue;
         }
-        // <base>/.cargo/config.toml
+        // The directory above the one the file is in: the one that holds
+        // `.cargo` for a `.cargo/config.toml`, and by the same rule for a
+        // file that one includes. An origin that is no file, a command
+        // line say, has no directory.
         let base = origins
             .get(name)
+            .filter(|origin| origin.starts_with('/'))
             .and_then(|file| file.rsplit_once('/'))
-            .and_then(|(cargo_dir, _)| cargo_dir.strip_suffix("/.cargo"))
+            .and_then(|(dir, _)| dir.rsplit_once('/'))
+            .map(|(base, _)| base)
             .unwrap_or(workspace);
         let path = format!("/{}", resolve(base, &value));
         let from_root = match path.strip_prefix(src_root) {
@@ -221,8 +295,13 @@ pub fn apply(
             _ => entry.value.clone(),
         };
         env.insert(entry.name.clone(), value);
+        // Recorded as what follows the source root in the value.
         if let Some(path) = &entry.relative {
-            relative.insert(entry.name.clone(), format!("{path}{slash}"));
+            let below_root = match path.as_str() {
+                "" => slash.to_string(),
+                path => format!("/{path}{slash}"),
+            };
+            relative.insert(entry.name.clone(), below_root);
         }
     }
     relative
@@ -273,7 +352,7 @@ mod tests {
         assert_eq!(
             relative,
             BTreeMap::from([
-                ("DATA".to_string(), "data/message.txt".to_string()),
+                ("DATA".to_string(), "/data/message.txt".to_string()),
                 ("ROOT".to_string(), "/".to_string())
             ])
         );
@@ -291,7 +370,7 @@ mod tests {
         let mut env = BTreeMap::new();
         let relative = apply(&mut env, &entries, false, "/nix/store/crate", &|_| false);
         assert_eq!(env["DATA"], "/nix/store/copy/data/message.txt");
-        assert_eq!(relative["DATA"], "data/message.txt");
+        assert_eq!(relative["DATA"], "/data/message.txt");
     }
 
     const HOST: &str = "aarch64-apple-darwin";
@@ -321,7 +400,7 @@ mod tests {
                   "x86_64-unknown-linux-gnu":{"rustflags":["--cfg","from_other_triple"]}}}"#,
         );
         assert_eq!(
-            rustflags(&config, HOST, &cfgs()),
+            rustflags(&config, HOST, Some(&cfgs())),
             [
                 "--cfg",
                 "from_triple",
@@ -333,7 +412,77 @@ mod tests {
                 "from_unix"
             ]
         );
-        assert!(has_cfg_rustflags(&config));
+        assert!(has_cfg_tables(&config));
+        // Before the cfgs are known, only the triple's table counts.
+        assert_eq!(rustflags(&config, HOST, None), ["--cfg", "from_triple"]);
+    }
+
+    /// A rustc that prints the cfgs of the test machine and one for every
+    /// `--cfg` it is given.
+    fn print_cfg(flags: &[String]) -> crate::Result<String> {
+        let mut out = String::from("target_arch=\"aarch64\"\ntarget_family=\"unix\"\nunix\n");
+        for pair in flags.windows(2) {
+            if pair[0] == "--cfg" {
+                out.push_str(&format!("{}\n", pair[1]));
+            }
+        }
+        Ok(out)
+    }
+
+    // A table may ask about a cfg that the triple's flags turn on. Cargo
+    // ran rustc with `--cfg foo --cfg bar` for this.
+    #[test]
+    fn flags_are_settled_against_the_cfgs_they_bring_about() {
+        let chained = config(
+            r#"{"target":{"aarch64-apple-darwin":{"rustflags":["--cfg","foo"]},
+                          "cfg(foo)":{"rustflags":["--cfg","bar"]}}}"#,
+        );
+        let (flags, cfgs) = settled_rustflags(&chained, HOST, &print_cfg).unwrap();
+        assert_eq!(flags, ["--cfg", "foo", "--cfg", "bar"]);
+        assert!(CfgExpr::matches_key("cfg(bar)", &cfgs));
+
+        // Nothing but `[build]`: rustc is asked once and the flags stay.
+        let plain = config(r#"{"build":{"rustflags":["-C","target-cpu=native"]}}"#);
+        let (flags, _) = settled_rustflags(&plain, HOST, &print_cfg).unwrap();
+        assert_eq!(flags, ["-C", "target-cpu=native"]);
+    }
+
+    // Cargo asks rustc twice and no more. A table that would match only
+    // because of a flag from the second reading is not used: cargo ran
+    // rustc without `--cfg from_flag` for this, and said that the
+    // configuration depends on itself.
+    #[test]
+    fn flags_that_do_not_settle_are_those_of_the_second_reading() {
+        let unsettled = config(
+            r#"{"build":{"rustflags":["--cfg","from_build"]},
+                "target":{"cfg(unix)":{"rustflags":["--cfg","from_unix"]},
+                          "cfg(from_unix)":{"rustflags":["--cfg","from_flag"]}}}"#,
+        );
+        let (flags, cfgs) = settled_rustflags(&unsettled, HOST, &print_cfg).unwrap();
+        assert_eq!(flags, ["--cfg", "from_unix"]);
+        // The cfgs are those of the flags that are used.
+        assert!(CfgExpr::matches_key("cfg(from_unix)", &cfgs));
+        assert!(!CfgExpr::matches_key("cfg(from_build)", &cfgs));
+    }
+
+    #[test]
+    fn settings_that_are_not_applied_are_named() {
+        let config = config(
+            r#"{"build":{"rustc-wrapper":"sccache","rustflags":["-C","link-arg=-fuse-ld=mold"]},
+                "target":{"aarch64-apple-darwin":{"linker":"clang"},
+                          "cfg(unix)":{"runner":"valgrind"},
+                          "cfg(windows)":{"linker":"lld-link"},
+                          "x86_64-unknown-linux-gnu":{"linker":"clang"}}}"#,
+        );
+        assert_eq!(
+            unapplied(&config, HOST, &cfgs()),
+            [
+                "target.'aarch64-apple-darwin'.linker",
+                "target.'cfg(unix)'.runner",
+                "build.rustc-wrapper"
+            ]
+        );
+        assert!(unapplied(&serde_json::json!({}), HOST, &cfgs()).is_empty());
     }
 
     #[test]
@@ -344,18 +493,22 @@ mod tests {
                           "aarch64-apple-darwin":{"linker":"clang"}}}"#,
         );
         assert_eq!(
-            rustflags(&config, HOST, &cfgs()),
+            rustflags(&config, HOST, Some(&cfgs())),
             ["-C", "target-cpu=native", "--cfg", "from_build"]
         );
-        assert!(rustflags(&serde_json::json!({}), HOST, &cfgs()).is_empty());
-        assert!(!has_cfg_rustflags(
-            &serde_json::json!({"target":{"cfg(unix)":{"runner":"x"}}})
+        assert!(rustflags(&serde_json::json!({}), HOST, Some(&cfgs())).is_empty());
+        assert!(!has_cfg_tables(
+            &serde_json::json!({"target":{"aarch64-apple-darwin":{"linker":"x"}}})
         ));
     }
 
     const SHOW_ORIGIN: &str = r#"env.FIXTURE_DATA.relative = true # /src/.cargo/config.toml
 env.FIXTURE_DATA.value = "data/message.txt" # /src/.cargo/config.toml
 env.FIXTURE_PLAIN = "plain" # /src/ws/.cargo/config.toml
+env.INCLUDED.relative = true # /src/ws/.cargo/extra/env.toml
+env.INCLUDED.value = "x" # /src/ws/.cargo/extra/env.toml
+env.FROM_CLI.relative = true # --config cli option
+env.FROM_CLI.value = "y" # --config cli option
 env.TERM.force = true # /src/ws/.cargo/config.toml
 env.TERM.value = "dumb" # /src/ws/.cargo/config.toml
 env.WS_ROOT.relative = true # /src/ws/.cargo/config.toml
@@ -368,7 +521,7 @@ env.WS_ROOT.value = "" # /src/ws/.cargo/config.toml
         assert_eq!(origins["FIXTURE_DATA"], "/src/.cargo/config.toml");
         assert_eq!(origins["FIXTURE_PLAIN"], "/src/ws/.cargo/config.toml");
         assert_eq!(origins["WS_ROOT"], "/src/ws/.cargo/config.toml");
-        assert_eq!(origins.len(), 4);
+        assert_eq!(origins.len(), 6);
     }
 
     #[test]
@@ -380,6 +533,9 @@ env.WS_ROOT.value = "" # /src/ws/.cargo/config.toml
                 "TERM":{"force":true,"value":"dumb"},
                 "WS_ROOT":{"relative":true,"value":""},
                 "UP":{"relative":true,"value":"../shared"},
+                "INCLUDED":{"relative":true,"value":"x"},
+                "FROM_CLI":{"relative":true,"value":"y"},
+                "ABSOLUTE":{"relative":true,"value":"/opt/data"},
                 "OUTSIDE":{"relative":true,"value":"../../elsewhere"}}}"#,
         );
         let entries = env(&config, &origins(SHOW_ORIGIN), "/src", "/src/ws");
@@ -408,6 +564,21 @@ env.WS_ROOT.value = "" # /src/ws/.cargo/config.toml
         assert!(!entry("FIXTURE_DATA").unwrap().slash);
         // No origin is known for these two: the workspace is the base.
         assert_eq!(entry("UP").unwrap().relative.as_deref(), Some("shared"));
+        // The directory above the file's, whatever that directory is
+        // called: a file that `.cargo/config.toml` includes from
+        // `.cargo/extra/` has `.cargo` for its base.
+        assert_eq!(
+            entry("INCLUDED").unwrap().relative.as_deref(),
+            Some("ws/.cargo/x")
+        );
+        // An origin that is no file has no directory.
+        assert_eq!(entry("FROM_CLI").unwrap().relative.as_deref(), Some("ws/y"));
+        // Joined to a directory, an absolute path stays what it is.
+        let absolute = entry("ABSOLUTE").unwrap();
+        assert_eq!(
+            (absolute.value.as_str(), absolute.relative),
+            ("/opt/data", None)
+        );
         // A path outside the source cannot be given to a derivation.
         assert_eq!(entry("OUTSIDE"), None);
         assert!(env(&serde_json::json!({}), &BTreeMap::new(), "/src", "/src").is_empty());

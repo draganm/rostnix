@@ -93,6 +93,7 @@ toolchains can be passed but are not tested.
 | `doCheck` | `true` | Build and run the tests of the selected packages; see [Tests](#tests). |
 | `checkFlags` | `[ ]` | Arguments for every test executable, such as `[ "--skip" "needs_network" ]`. |
 | `skipTests` | `[ ]` | Names of test targets that are neither built nor run. |
+| `rustflags` | `null` | The flags every rustc gets. `null` means those of the project's [cargo configuration](#cargo-configuration); a list takes their place. |
 
 The selection means what it means to `cargo build`. With neither `bins` nor
 `examples`, cargo builds the library and every binary of the selected
@@ -199,7 +200,7 @@ Neither needs anything in Nix. A dependency from a git repository is
 fetched during evaluation, by Nix's `builtins.fetchGit`, at the revision
 `Cargo.lock` names and with your own git credentials; private repositories
 work if `git` can reach them. Cargo fetches the repository as well, to
-plan, and is told to use the `git` command for it unless your cargo
+plan, and is told to use the `git` command for it unless a cargo
 configuration or `CARGO_NET_GIT_FETCH_WITH_CLI` says otherwise, so that
 both read the same git and ssh settings.
 
@@ -229,25 +230,39 @@ their settings are applied:
 - **`[env]`**, for every rustc invocation, build script and test, with
   `force` meaning what it means to cargo.
 
-An `[env]` value with `relative = true` names a path of the source. A
-local package finds it in its own source; a test finds it in its writable
-copy. A crate from a registry or from git is handed a copy of just that
-path, so that a build script of, say, a `-sys` crate can be pointed at a
-configuration file of yours. One case is left out on purpose: when the
-path holds your packages, as with the usual
+An `[env]` value with `relative = true` names a path of the source, as in
+the usual
 
 ```toml
 [env]
 CARGO_WORKSPACE_DIR = { value = "", relative = true }
 ```
 
-crates from elsewhere are not given the variable. They would otherwise be
-rebuilt on every edit. Your own packages and their tests get it. A crate
-that does need it can be given it with `crateOverrides.<name>.env`.
+Your own packages find the path in their own source, and their tests in
+their writable copy. Crates from a registry or from git are not given such
+a variable, where cargo gives it to everything: a path of your source
+would become an input of every crate, and all of them would be rebuilt
+whenever something under it changes. A crate that does need one, a `-sys`
+crate whose build script is pointed at a configuration file of yours, can
+be given it:
 
-Other settings that act at build time are not applied: `linker` and
-`runner` of a `[target]` table, `build.rustc-wrapper`, and
-`profile.*.rustflags`.
+```nix
+crateOverrides.some-sys.env.SOME_CONFIG = "${./config/some.toml}";
+```
+
+Other settings that act at build time are not applied, and evaluation
+warns about them: `linker` and `runner` of a `[target]` table and
+`build.rustc-wrapper`. rostnix links with the C compiler of the nixpkgs you
+give it. If your configuration's flags only make sense with such a linker,
+`-C link-arg=-fuse-ld=mold` say, name the flags you do want:
+
+```nix
+rustEnv.buildRustApplication {
+  pname = "app";
+  src = ./.;
+  rustflags = [ "--cfg" "tokio_unstable" ];
+}
+```
 
 ### crateOverrides
 
@@ -290,10 +305,14 @@ directory, narrowed by three rules:
   an example, test or bench. Everything built as a test, unit tests
   included, keeps all three: a test may read whatever lies in its package.
 - The root files of the package's other binaries, examples, tests and
-  benches are left out, except one the step's own root file names as a
-  module: `tests/common.rs` stays for a test that says `mod common;`. A
-  build script's run still sees them all, since build scripts read source
-  files on their own.
+  benches are left out. A build script's run still sees them all, since
+  build scripts read source files on their own.
+
+A file that the step's own root file names stays in any case: by
+`mod common;`, by `#[path = "…"]`, or by `include_str!("…")` and its like
+with a literal path. So `tests/common.rs` stays for the tests that use it
+as a module, and an example stays for a library that includes it in its
+documentation.
 
 Editing `src/main.rs` therefore rebuilds the binary and not the library,
 and editing `tests/e2e.rs` builds and runs that test again and nothing

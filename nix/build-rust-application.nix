@@ -20,6 +20,9 @@
 , checkFlags ? [ ]
   # Names of test targets that are not run.
 , skipTests ? [ ]
+  # The flags every rustc gets. null means those of the project's cargo
+  # configuration; a list takes their place.
+, rustflags ? null
 , meta ? { }
 }:
 let
@@ -44,7 +47,7 @@ let
       rustc = "${rustc}/bin/rustc";
       src = srcStr;
       inherit (builtins) storeDir;
-      inherit cargoRoot packages bins examples features allFeatures noDefaultFeatures profile doCheck;
+      inherit cargoRoot packages bins examples features allFeatures noDefaultFeatures profile doCheck rustflags;
       overrideKeys = lib.attrNames crateOverrides;
     })
   ];

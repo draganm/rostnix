@@ -35,6 +35,10 @@ pub struct Request {
     pub override_keys: Vec<String>,
     /// Whether to plan the tests too.
     pub do_check: bool,
+    /// The flags every rustc gets, in place of those of the cargo
+    /// configuration, when the caller names them.
+    #[serde(default)]
+    pub rustflags: Option<Vec<String>>,
 }
 
 impl Request {
@@ -197,12 +201,19 @@ pub fn run(request: &str) -> Result<String> {
         serde_json::from_slice(&configured(&["--format", "json"])?).map_err(|err| {
             format!("cargo {cargo_version} printed a configuration this version cannot read: {err}")
         })?;
-    let cfgs = if config::has_cfg_rustflags(&cargo_config) {
-        config::parse_cfgs(&cargo.print_cfg()?)
+    let (configured_flags, cfgs) = if config::has_cfg_tables(&cargo_config) {
+        config::settled_rustflags(&cargo_config, &host, &|flags| cargo.print_cfg(flags))?
     } else {
-        Vec::new()
+        (config::rustflags(&cargo_config, &host, None), Vec::new())
     };
-    let rustflags = config::rustflags(&cargo_config, &host, &cfgs);
+    let rustflags = request.rustflags.clone().unwrap_or(configured_flags);
+    let unapplied = config::unapplied(&cargo_config, &host, &cfgs);
+    if !unapplied.is_empty() {
+        eprintln!(
+            "rostnix: warning: the cargo configuration sets {}, which is not applied: rostnix links with the C compiler of its nixpkgs and runs rustc and tests itself",
+            unapplied.join(", ")
+        );
+    }
     // Which file sets a relative variable decides what it is relative to.
     let has_relative = cargo_config
         .get("env")

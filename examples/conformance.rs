@@ -429,15 +429,6 @@ struct Relative<'a> {
     withheld: &'a BTreeSet<&'a str>,
 }
 
-/// A path below the root as `ROOT/…`.
-fn from_root(path: &str) -> String {
-    if path.is_empty() {
-        "ROOT".to_string()
-    } else {
-        format!("ROOT/{path}")
-    }
-}
-
 fn normalise(raws: &[Raw], relative: &Relative) -> Vec<Invocation> {
     // Each side names the same things by its own paths. An invocation says
     // which package its directories belong to.
@@ -531,12 +522,14 @@ fn normalise(raws: &[Raw], relative: &Relative) -> Vec<Invocation> {
             }
             flags.sort();
 
+            // What follows the root in a path below it: nothing, or a
+            // slash and the rest.
             let under_root = |path: &str| {
                 relative
                     .root
                     .and_then(|root| path.strip_prefix(root))
                     .filter(|rest| rest.is_empty() || rest.starts_with('/'))
-                    .map(|rest| rest.trim_start_matches('/').to_string())
+                    .map(str::to_string)
             };
             let is_local = raw
                 .env
@@ -555,10 +548,10 @@ fn normalise(raws: &[Raw], relative: &Relative) -> Vec<Invocation> {
                         // A relative variable of the cargo configuration:
                         // the path it names from the source root.
                         key if raw.relative_env.contains_key(key) => {
-                            from_root(&raw.relative_env[key])
+                            format!("ROOT{}", raw.relative_env[key])
                         }
                         key if relative.relative.contains(key) && under_root(value).is_some() => {
-                            from_root(&under_root(value).unwrap_or_default())
+                            format!("ROOT{}", under_root(value).unwrap_or_default())
                         }
                         "CARGO" | "RUSTC" | "RUSTDOC" => basename(value).to_string(),
                         // Where a binary is; which one is what matters.

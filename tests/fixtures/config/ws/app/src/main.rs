@@ -3,11 +3,13 @@
 fn main() {
     let mut buffer = itoa::Buffer::new();
     println!(
-        "config ok: plain={} message={} unix={} expression={} build={} script={} n={}",
+        "config ok: plain={} message={} unix={} expression={} triple={} flag={} build={} script={} n={}",
         env!("FIXTURE_PLAIN"),
         env!("MESSAGE"),
         cfg!(from_unix),
         cfg!(from_expression),
+        cfg!(from_triple),
+        cfg!(from_flag),
         cfg!(from_build),
         env!("SCRIPT_SAW"),
         buffer.format(7),

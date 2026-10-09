@@ -55,16 +55,6 @@ let
   relativeEnv = lib.filter (variable: variable.relative != null) configEnv;
   dataEnv = lib.filter (variable: !variable.holdsSource) relativeEnv;
 
-  # A store copy of the source that holds one such path and nothing else,
-  # for the units that have no view of the source to find it in.
-  dataCopies = lib.listToAttrs (map
-    (variable: lib.nameValuePair variable.name (mkLocalSource {
-      name = lib.strings.sanitizeDerivationName "rustenv-${variable.name}";
-      dir = variable.relative;
-      exclude = [ ];
-    }))
-    dataEnv);
-
   # The source tree of a unit: a fetched crate, or a view of the local
   # source. The package's override may widen the view, and the data a
   # relative variable names is part of every view.
@@ -77,23 +67,17 @@ let
     else src;
 
   # The [env] variables as a unit of a package gets them. A plain value
-  # goes to every unit. A unit of a local package finds a relative path in
-  # its own tree, so it is told the path and no value. Any other unit is
-  # given the copy that holds the path, unless the path is the source
-  # itself: a crate from elsewhere must not be rebuilt on every edit.
-  configEnvOf = package: lib.concatMap
-    (variable:
-      if variable.relative == null || package.local
-      then [{ inherit (variable) name value force relative slash; }]
-      else if variable.holdsSource then [ ]
-      else [{
-        inherit (variable) name force relative slash;
-        value = "${dataCopies.${variable.name}}/${variable.relative}${lib.optionalString variable.slash "/"}";
-      }])
-    configEnv;
+  # goes to every unit. A relative one names a path of the source, and goes
+  # to the units of local packages, each of which finds the path in its own
+  # tree. A crate from elsewhere is not handed paths into this source: it
+  # would be rebuilt whenever what lies there changes. One that needs such
+  # a variable gets it from crateOverrides.
+  configEnvOf = package:
+    lib.filter (variable: variable.relative == null || package.local)
+      (map (variable: { inherit (variable) name value force relative slash; }) configEnv);
   withheldEnvOf = package:
-    lib.optionals (!package.local)
-      (map (variable: variable.name) (lib.filter (variable: variable.holdsSource) relativeEnv));
+    lib.optionals (!package.local) (map (variable: variable.name) relativeEnv);
+
   # What the tool is told about a unit that rustc compiles.
   compileNode = node: override:
     let inherit (node) package;
@@ -149,8 +133,13 @@ in
   # A git repository at the revision Cargo.lock names, fetched during
   # evaluation by the git of whoever evaluates, with their credentials.
   # Cargo checks submodules out, so they are fetched too.
-  fetchGit = { name, url, rev }:
-    builtins.fetchGit { inherit name url rev; submodules = true; shallow = true; };
+  #
+  # The revision is what is fetched. The ref, the branch or tag the
+  # dependency asks for, is for a Nix that cannot fetch a revision by its
+  # name and looks for it there.
+  fetchGit = { name, url, rev, ref ? null }:
+    builtins.fetchGit ({ inherit name url rev; submodules = true; shallow = true; }
+      // lib.optionalAttrs (ref != null) { inherit ref; });
 
   # A view of the local source. It becomes a store path once the unit that
   # uses it knows what its package's override adds.

@@ -107,8 +107,8 @@ repeated here.
 | `builtins.fetchGit { url; rev; submodules = true; shallow = true; }` needs no `ref`, is allowed in pure evaluation, and gives the tree cargo checked out. | `diff -r` of the two for `serde`, the `.git` directory aside. |
 | A sparse registry's cache holds its `config.json`, with the download template, at `<cargo home>/registry/index/<directory>/config.json`. A crate's file is at `registry/cache/<directory>/`, under the same directory name as where it is unpacked. | crates.io, and the registry the tests serve. |
 | `cargo -Z unstable-options config get --format json` prints the merged configuration on stable cargo when `RUSTC_BOOTSTRAP=1`, and `--show-origin` names the file each value comes from. | Run on a project with `[build]`, `[target.*]` and `[env]`. |
-| When the table of the triple or a matching `[target.'cfg(…)']` table has `rustflags`, `build.rustflags` is not used. The triple's flags come first, then those of the matching `cfg` tables in the order of their keys. A string is split at whitespace. The flags are the last arguments cargo itself gives rustc, and they go to every unit, registry crates, build scripts and proc macros included. A build script is told them in `CARGO_ENCODED_RUSTFLAGS`, and its `CARGO_CFG_*` come from `rustc --print=cfg` run with them. | `cargo test -vv`. |
-| Every rustc invocation, build-script run and test run is given the `[env]` values, registry crates included. A value with `relative = true` is the path from the directory that holds the `.cargo` directory, joined as it is, so an empty value ends with a slash. A value is not set when the variable is already in cargo's environment, unless it says `force = true`. | Same log: `TERM` forced, `HOME` left alone. |
+| When the table of the triple or a matching `[target.'cfg(…)']` table has `rustflags`, `build.rustflags` is not used. The triple's flags come first, then those of the matching `cfg` tables in the order of their keys. A string is split at whitespace. Which `cfg` tables match is decided against `rustc --print=cfg` run with the flags found so far: cargo asks once without the `cfg` tables' flags and, if the answer changes the flags, once more with them, and then keeps them, saying "non-trivial mutual dependency" when they still do not hold. The flags are the last arguments cargo itself gives rustc, and they go to every unit, registry crates, build scripts and proc macros included. A build script is told them in `CARGO_ENCODED_RUSTFLAGS`, and its `CARGO_CFG_*` come from `rustc --print=cfg` run with them. | `cargo test -vv`. |
+| Every rustc invocation, build-script run and test run is given the `[env]` values, registry crates included. A value with `relative = true` is the path from the directory above the one the file is in, joined as it is, so an empty value ends with a slash and an absolute one stays what it is. A value is not set when the variable is already in cargo's environment, unless it says `force = true`. | Same log: `TERM` forced, `HOME` left alone. |
 
 ## User-facing API
 
@@ -173,6 +173,7 @@ toolchains can be passed but are not tested.
 | `doCheck` | `true` | Build and run the tests of the selected packages; see [Tests](#tests). |
 | `checkFlags` | `[ ]` | Arguments for every test executable. |
 | `skipTests` | `[ ]` | Names of test targets that are neither built nor run. |
+| `rustflags` | `null` | The flags every rustc gets. `null` means those of the project's cargo configuration; a list takes their place. |
 | `meta` | `{ }` | Passed through. |
 
 The selection means what it means to `cargo build`. With neither `bins` nor
@@ -365,12 +366,8 @@ source plans to the same graph in every shell.
   `GIT_ASKPASS` and `SSH_ASKPASS`.
 - **Set by the tool:** `CARGO_HOME` (the private home), `RUSTC`,
   `RUSTC_BOOTSTRAP=1`, `CARGO_TARGET_DIR` (a temporary directory that stays
-  empty), `CARGO_GC_AUTO_FREQUENCY=never`,
-  `CARGO_TERM_PROGRESS_WHEN=never`, and `CARGO_NET_GIT_FETCH_WITH_CLI=true`
-  unless the caller's environment or `[net]` table says which git to use.
-  Nix fetches a git dependency with the git command, which reads the
-  caller's git and ssh configuration; cargo's built-in git reads less of
-  it, and would fail where Nix succeeds.
+  empty), `CARGO_GC_AUTO_FREQUENCY=never` and
+  `CARGO_TERM_PROGRESS_WHEN=never`.
 - **Dropped:** everything else, among it `RUSTFLAGS`, `CARGO_BUILD_*`,
   `CARGO_PROFILE_*` and `RUSTC_WRAPPER`.
 
@@ -390,7 +387,18 @@ read, removed afterwards. It holds:
   come from and how to reach them: `[registries]`, `[registry]`,
   `[source]`, `[net]`, `[http]` and `[credential-alias]`. Everything else
   in the caller's file says how to build, and is left out: the build must
-  not depend on who evaluates.
+  not depend on who evaluates. A relative path in those tables, a vendor
+  directory or a certificate file, is made absolute, since it started at
+  the caller's home and the private one is elsewhere. The caller's file is
+  `config`, the older name, when both are there, as for cargo. One that
+  cannot be read is left out with a warning.
+
+  The file also says `net.git-fetch-with-cli = true`, unless the caller's
+  says which git to use. Nix fetches a git dependency with the git
+  command, which reads the caller's git and ssh configuration; cargo's
+  built-in git reads less of it, and would fail where Nix succeeds. As a
+  setting of the home's file it gives way to the project's own
+  configuration and to `CARGO_NET_GIT_FETCH_WITH_CLI`.
 
 Automatic cache cleaning is off because the private home has no record of
 what was used when.
@@ -455,11 +463,14 @@ graph.
 ### Git repositories
 
 A package whose source is `git+<url>?…#<revision>` comes from a repository
-that cargo has checked out. `b.fetchGit { name; url; rev; }` is
+that cargo has checked out. `b.fetchGit { name; url; rev; ref; }` is
 `builtins.fetchGit` with that URL and the revision from `Cargo.lock`, with
 submodules, as cargo checks them out, and without history. It runs during
 evaluation, as the user who evaluates and with their credentials, and
-gives the tree that cargo planned from.
+gives the tree that cargo planned from. The revision is what is fetched.
+`ref` is the branch or the tag the dependency asks for, when it asks for
+one, for a Nix that cannot fetch a revision by its name and looks for it
+there.
 
 Every package of one repository at one revision is built from that one
 tree. A package's `manifestDir` is its directory in it, found from where
@@ -498,12 +509,17 @@ package directory, narrowed by three rules:
    Where cargo found such a target as a directory, `src/bin/<name>/main.rs`
    and its like under `examples/`, `tests/` and `benches/`, the directory is
    left out. A `main.rs` anywhere else hides only itself, since its
-   directory may hold other targets' modules. A root that the unit's own
-   root names as a module stays: `tests/common.rs` is a test of its own to
-   cargo, and a module to the tests beside it that say `mod common;`.
-   `resolve` finds such declarations, and `#[path = "…"]` attributes, by
-   searching the text of the root file. One written by a macro, or
-   declared in a module file rather than in the root, is not found.
+   directory may hold other targets' modules.
+
+A file that the unit's own root names stays, whatever these rules say of
+it. `tests/common.rs` is a test of its own to cargo, and a module to the
+tests beside it that say `mod common;`. A library whose documentation is
+`include_str!("../examples/demo.rs")` reads a file of a directory it would
+not see; ruff's `ruff_annotate_snippets` does. `resolve` finds `mod`
+declarations, `#[path = "…"]` attributes and the literal arguments of
+`include_str!`, `include_bytes!` and `include!` by searching the text of
+the root file. One written by a macro, put together with `concat!`, or
+standing in a module file rather than in the root, is not found.
 
 A build-script run is exempt from the third rule. Build scripts read source
 files that rustc is never told about, the roots of the package's
@@ -532,7 +548,6 @@ error that names it.
 | crate file | `<name>-<version>.crate` | registry crate version |
 | crate source | `rustsrc-<name>-<version>` | registry crate version |
 | git repository | `rustsrc-<repository>-<short revision>` | repository and revision; fetched during evaluation, not a derivation |
-| data a relative variable names | `rustenv-<NAME>` | relative `[env]` variable; a filtered copy of `src`, not a derivation |
 | build-script compile | `rustbs-<name>-<version>` | unit |
 | build-script run | `rustbsrun-<name>-<version>` | unit |
 | library | `rustlib-<name>-<version>` | unit |
@@ -660,13 +675,30 @@ every unit is given them.
 **`rustflags`.** By cargo's rule: if the table of the machine's triple or a
 `[target.'cfg(…)']` table that matches has flags, those are the flags, the
 triple's first and then the matching `cfg` tables' in the order of their
-keys; otherwise `build.rustflags`. `resolve` matches the `cfg` keys with
-cargo's own parser against `rustc --print=cfg`. The flags go to every
-rustc invocation: without `--target`, cargo makes no difference between a
-build script and the program. A build-script run is told them in
-`CARGO_ENCODED_RUSTFLAGS`, and its `CARGO_CFG_*` come from
+keys; otherwise `build.rustflags`. Which `cfg` tables match depends on the
+machine's cfgs, and those on the flags: the triple's table may turn a
+target feature on that a `cfg` table asks about. `resolve` settles this as
+cargo does. It starts from the flags that need no cfgs, asks
+`rustc --print=cfg` with them, and matches the `cfg` keys with cargo's own
+parser. If that gives other flags it asks once more with those and keeps
+them, with cargo's warning when they still do not hold.
+
+The flags go to every rustc invocation: without `--target`, cargo makes no
+difference between a build script and the program. A build-script run is
+told them in `CARGO_ENCODED_RUSTFLAGS`, and its `CARGO_CFG_*` come from
 `rustc --print=cfg` run with them, so that a `--cfg` or a target feature
 they turn on is among them.
+
+The `rustflags` argument of `buildRustApplication` takes the place of the
+configuration's flags. A project whose configuration links with `mold` on
+its developers' machines needs it: the flag would reach a linker here that
+has no such thing.
+
+Other settings of the configuration that act when things are built are not
+applied: a `linker` or a `runner` of a `[target]` table that applies,
+`build.rustc-wrapper`. rostnix links with the C compiler of its nixpkgs and
+runs rustc and tests itself. `resolve` warns when the configuration has
+one, naming the key.
 
 **`[env]`.** Every rustc invocation, build-script run and test is given
 the variables, under cargo's rules: never in place of a variable cargo
@@ -674,28 +706,39 @@ itself sets, and in place of one the builder's environment already has
 only with `force = true`. A `crateOverrides` entry's `env` goes on top.
 
 A value with `relative = true` is a path. Cargo makes it from the
-directory that holds the `.cargo` directory of the file that sets the
-variable, which `cargo config get --show-origin` names. In a derivation
-the path must be in the store, and what it is depends on the unit:
+directory above the one the file that sets the variable is in, which is
+the directory that holds `.cargo` for a `.cargo/config.toml`;
+`cargo config get --show-origin` names the file. In a derivation the path
+must be in the store, and what it is depends on the unit:
 
 - **A unit of a local package** finds the path in its own view of the
   source; a test finds it in its writable copy. The path is added to the
   view of every local unit, as `extraSrc` would add it, unless a local
-  package lies at it or under it.
-- **Any other unit**, of a crate from a registry or a git repository, has
-  no view of the source. It is given a store copy that holds the path and
-  nothing else. When a local package lies at the path or under it, it is
-  given nothing. The path is then the source itself, as with the usual
-  `CARGO_WORKSPACE_DIR = { value = "", relative = true }`, and a crate from
-  elsewhere that depended on it would be rebuilt on every edit. A crate
-  that does need such a variable gets it from `crateOverrides.<name>.env`.
+  package lies at it or under it: then it is the source itself, as with
+  the usual `CARGO_WORKSPACE_DIR = { value = "", relative = true }`, and
+  the unit has its own part of it already.
+- **Any other unit**, of a crate from a registry or a git repository, is
+  not given the variable. Cargo gives it to every unit. Here that would
+  make a path of this source an input of every crate of the build, and all
+  of them would be rebuilt whenever something under it changes: a query
+  added to `.sqlx`, or any edit at all when the path is the workspace. A
+  crate that does need such a variable, a `-sys` crate whose build script
+  is pointed at a configuration file, gets it from
+  `crateOverrides.<name>.env`.
 
 A relative value that names a path outside `src` is left out with a
-warning. An empty value, or one that ends with a slash, keeps the slash at
-its end, as cargo's does: code that appends to the variable counts on it.
+warning. One that is an absolute path is that path, as for cargo. An empty
+value, or one that ends with a slash, keeps the slash at its end, as
+cargo's does: code that appends to the variable counts on it.
 
-A unit's record names the relative variables it was given, each by its
-path from the source root, and those withheld from it.
+"Already in the environment" means the environment of the derivation's
+builder, which is Nix's and, for a unit built with stdenv, stdenv's. A
+variable that stdenv exports, `CC` say, is therefore left alone in a unit
+that links and set in one that does not, unless the configuration forces
+it.
+
+A unit's record names the relative variables it was given, each by what
+follows the source root in its value, and those withheld from it.
 
 ## Build scripts
 
@@ -788,9 +831,9 @@ means both sides have the same units. Normalising removes these differences:
   describe the machine;
 - a relative variable of the cargo configuration, which each side sets to
   a path of its own: it is compared as a path from the source root, which
-  the test names for cargo's side and each record for rostnix's. A
-  variable that rostnix withholds from crates that are not local is taken
-  out of what cargo gave them.
+  the test names for cargo's side and each record for rostnix's. Such a
+  variable is taken out of what cargo gave crates that are not local,
+  which rostnix gives none.
 
 Tests are compared the same way, against `cargo test -vv`: what is compiled
 for them, and each run of a test executable with its arguments and the
@@ -982,7 +1025,8 @@ derivations, sccache or any compiler wrapper, dependencies built as Rust
 
 Of the cargo configuration only `rustflags` and `[env]` are applied. A
 `linker` or a `runner` of a `[target]` table, `build.rustc-wrapper` and
-`profile.*.rustflags` are not.
+`profile.*.rustflags` are not, and a file that a configuration file
+`include`s in the caller's cargo home is not read for registries.
 
 Known gaps, none of which the fixtures meet:
 
@@ -992,9 +1036,10 @@ Known gaps, none of which the fixtures meet:
 - A registry whose index is a git repository has no download address in
   the graph, since cargo keeps its `config.json` inside the index. Its
   crates build where the project is evaluated.
-- A `[source]` table of the caller's cargo home that names a directory by
-  a relative path is read by cargo from the private home, where the path
-  leads elsewhere.
+- A relative path in the caller's cargo configuration is made absolute
+  only where it is a source's `directory` or `local-registry` or
+  `http.cainfo`. Another one, a credential provider's say, leads elsewhere
+  from the private home.
 - An integration test is given `CARGO_BIN_EXE_<name>` for the binaries
   cargo plans to build for it. Cargo also sets the variable for a binary
   it does not build because its `required-features` are off.
@@ -1028,7 +1073,7 @@ Known gaps, none of which the fixtures meet:
 - The Nix emitter, with golden files.
 - Parsing of build-script output, every directive in both forms.
 - Source views: the exclusion rules on sample package layouts, and the
-  search for module declarations.
+  search for the files a root names.
 - The plans of the `gitdeps` fixture, recorded from cargo 1.95: which
   repository each package comes from and where in it the package lies.
 - Reading git sources, cargo's checkouts and a registry's download
@@ -1050,7 +1095,7 @@ sandbox because they need `exec` and the network.
 | `buildscript` | A local build script that generates code into `OUT_DIR`, compiles C, sets `links` and metadata read by a dependent's build script; `rustc-cfg` and `rustc-env`; a `crateOverrides` entry that supplies zlib through `pkg-config`; `extraSrc`. Tests: unit tests that call the C function and read `OUT_DIR` and the script's `rustc-env` value at run time. |
 | `profiles` | One project built under four profiles: fat LTO with `panic = "abort"`, `opt-level = "s"`, `codegen-units` and a per-package override; thin LTO; no LTO; and `dev`. Tests: one that expects a panic, which cargo has unwind under every profile. |
 | `gitdeps` | Dependencies from git repositories: `serde` by tag, a workspace with a proc macro, build scripts and packages that depend on each other by path, and `itoa` by revision. |
-| `config` | A workspace below the source root with cargo configuration at both levels: `rustflags` from `cfg` tables, which take the place of `[build]`'s, and `[env]` variables that are plain, forced, not forced, relative to a data file outside the workspace, and relative to the workspace itself. |
+| `config` | A workspace below the source root with cargo configuration at both levels: `rustflags` from the triple's table and from `cfg` tables, one of which matches only because of the triple's flag, all of which take the place of `[build]`'s; and `[env]` variables that are plain, forced, not forced, relative to a data file outside the workspace, and relative to the workspace itself. |
 | `registry` | A crate from a sparse registry that `tests/registry.py` serves on this machine, named in a cargo home made up for the test, which also says how to build and is not listened to in that. |
 | core-rs | Patient zero at its pinned commit, fetched with `builtins.fetchTree`: the `amber-store` example, and its test suite: 21 of 22 test executables, with one test skipped by name. |
 | rostnix | rostnix builds itself with `buildRustApplication` and runs its own unit tests. |
@@ -1068,11 +1113,11 @@ Each fixture asserts:
 
 For the new fixtures the driver also checks that each git repository is
 fetched at the revision `Cargo.lock` names; that editing the file a relative
-variable names rebuilds every unit that was given the variable, the
-registry crate among them, while an edit to the source does not rebuild the
-registry crate although another variable names the workspace; that the
-registry's own download address reproduces the pre-seeded file; and that a
-crate with no usable address explains itself.
+variable names rebuilds the units of the local package and not the
+registry crate; that the `rustflags` argument takes the place of the
+configuration's flags, and that a `linker` in the configuration is warned
+about; that the registry's own download address reproduces the pre-seeded
+file; and that a crate with no usable address explains itself.
 
 The driver also checks that a failing test fails the build and is named,
 that `skipTests` leaves a test out and warns about an entry that matches
@@ -1102,7 +1147,7 @@ src/graph.rs         the graph model: units, packages, keys, closures
 src/lto.rs           cargo's per-unit LTO rules
 src/lints.rs         [lints] tables to flags
 src/flags.rs         the rustc flags that do not depend on paths
-src/localsrc.rs      source views of local packages, module declarations
+src/localsrc.rs      source views of local packages, the files a root names
 src/storepath.rs     fixed-output store paths, name sanitising
 src/seed.rs          pre-seeding .crate files
 src/emit.rs          graph to Nix

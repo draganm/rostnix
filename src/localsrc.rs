@@ -34,15 +34,17 @@ pub fn is_under(path: &str, dir: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// The files a crate root names as its modules, as paths from the root's
-/// directory: `name.rs` and `name/mod.rs` for `mod name;`, and what a
-/// `#[path = "…"]` attribute says.
+/// The files a crate root names, as paths from the root's directory:
+/// `name.rs` and `name/mod.rs` for `mod name;`, what a `#[path = "…"]`
+/// attribute says, and what `include_str!`, `include_bytes!` and `include!`
+/// are given as a literal.
 ///
-/// The text is searched, not parsed. A declaration in a block comment or in
-/// a string is taken for one, which only shows a unit a file it does not
-/// need. One that a macro writes is missed, and so is one inside an inline
-/// module or in a module file rather than in the root.
-pub fn declared_modules(source: &str) -> Vec<String> {
+/// The text is searched, not parsed. What looks like one of these in a
+/// block comment or in a string is taken for one, which only shows a unit
+/// a file it does not need. One that a macro writes is missed, and so is
+/// one inside an inline module or in a module file rather than in the
+/// root, and a path that is put together with `concat!`.
+pub fn named_files(source: &str) -> Vec<String> {
     let is_ident = |c: char| c.is_alphanumeric() || c == '_';
     let mut found = Vec::new();
     for line in source.lines() {
@@ -56,6 +58,20 @@ pub fn declared_modules(source: &str) -> Vec<String> {
                     continue;
                 }
                 if let Some(path) = value[1..].trim_start().strip_prefix('"') {
+                    found.push(path.split('"').next().unwrap_or_default().to_string());
+                }
+            }
+        }
+        // `include_str!("…")` and its like: a library's documentation is
+        // often its README, or an example.
+        for include in ["include_str!", "include_bytes!", "include!"] {
+            for (at, _) in line.match_indices(include) {
+                let before = line[..at].chars().next_back();
+                let argument = line[at + include.len()..].trim_start();
+                let literal = argument
+                    .strip_prefix('(')
+                    .and_then(|rest| rest.trim_start().strip_prefix('"'));
+                if let (false, Some(path)) = (before.is_some_and(is_ident), literal) {
                     found.push(path.split('"').next().unwrap_or_default().to_string());
                 }
             }
@@ -97,9 +113,11 @@ pub fn resolve(dir: &str, rel: &str) -> String {
 /// package in `pkg_dir`: sorted, and none under another. A unit built as a
 /// test keeps `examples/`, `tests/` and `benches/` whatever its target is,
 /// and loses only the root files of other targets in them. `keep` names
-/// files the unit's root declares as its modules; they stay even when they
-/// are other targets' roots, as `tests/common.rs` is when the tests beside
-/// it say `mod common;`.
+/// the files the unit's root names, as modules or to include. They stay
+/// even when they are other targets' roots, as `tests/common.rs` is when
+/// the tests beside it say `mod common;`, and they keep a directory the
+/// unit would not see, as an example does that a library includes in its
+/// documentation.
 pub fn exclusions(
     pkg_dir: &str,
     other_pkg_dirs: &[String],
@@ -298,7 +316,7 @@ mod sys;
 fn f() { let path = "not/this.rs"; }
 "#;
         assert_eq!(
-            declared_modules(source),
+            named_files(source),
             [
                 "common.rs",
                 "common/mod.rs",
@@ -318,7 +336,49 @@ fn f() { let path = "not/this.rs"; }
                 "sys/mod.rs",
             ]
         );
-        assert!(declared_modules("fn main() {}").is_empty());
+        assert!(named_files("fn main() {}").is_empty());
+    }
+
+    // ruff's ruff_annotate_snippets does this: its documentation is an
+    // example and a picture of what the example prints.
+    #[test]
+    fn included_files_are_found_in_the_text() {
+        let source = r#"
+#![doc = include_str!("../examples/expected_type.rs")]
+#![doc = include_str!( "../examples/expected_type.svg" )]
+const DATA: &[u8] = include_bytes!("data.bin");
+include!("generated.rs");
+const NOT_A_LITERAL: &str = include_str!(concat!(env!("OUT_DIR"), "/x"));
+fn reinclude_str!() {}
+"#;
+        assert_eq!(
+            named_files(source),
+            [
+                "../examples/expected_type.rs",
+                "../examples/expected_type.svg",
+                "data.bin",
+                "generated.rs",
+            ]
+        );
+    }
+
+    // A library whose documentation includes one of its examples sees the
+    // examples directory, without the other examples.
+    #[test]
+    fn a_file_the_root_includes_keeps_its_directory() {
+        let targets = vec![
+            target("lib", "src/lib.rs"),
+            target("example", "examples/expected_type.rs"),
+            target("example", "examples/other.rs"),
+        ];
+        let keep = [
+            "examples/expected_type.rs".to_string(),
+            "examples/expected_type.svg".to_string(),
+        ];
+        assert_eq!(
+            exclusions("", &[], &targets, &targets[0], false, &keep),
+            ["benches", "examples/other.rs", "tests"]
+        );
     }
 
     #[test]

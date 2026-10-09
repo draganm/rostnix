@@ -30,6 +30,7 @@ This plan fixes files, interfaces and acceptance checks. It does not repeat the 
 | A sparse registry's cache holds its `config.json`, with the download template, at `<cargo home>/registry/index/<directory>/config.json`; a crate's file is at `registry/cache/<directory>/`, beside where it is unpacked. | Looked at for crates.io. |
 | `cargo -Z unstable-options config get --format json` prints the merged configuration on stable cargo when `RUSTC_BOOTSTRAP=1`; `--show-origin` names the file each value comes from. | Run on a project with `[build]`, `[target.*]` and `[env]`. |
 | When any `[target.<triple>]` or matching `[target.'cfg(…)']` table has `rustflags`, `build.rustflags` is not used. The triple's flags come first, then those of the matching `cfg` tables in the order of their keys. A string is split at whitespace. | `cargo test -vv`. |
+| Which `cfg` tables match is decided against `rustc --print=cfg` run with the flags found so far. Cargo asks once without the `cfg` tables' flags and, if the answer changes the flags, once more; then it keeps them, warning of a "non-trivial mutual dependency" when they still do not hold. | A triple table with `--cfg foo` and a `cfg(foo)` table gave both flags; a `cfg` table matching on another `cfg` table's flag was not used and drew the warning. |
 | The flags are the last arguments cargo itself gives rustc, after `--cap-lints`, and they go to every unit: registry crates, build scripts and proc macros included. A build script is told them in `CARGO_ENCODED_RUSTFLAGS`, separated by `0x1f`, and its `CARGO_CFG_*` come from `rustc --print=cfg` run with them. | Same log. |
 | Every rustc invocation, build-script run and test run is given the `[env]` values, registry crates included. A value with `relative = true` is the path from the directory that holds the `.cargo` directory. A value is not set when the variable is already in cargo's environment, unless it says `force = true`. | Same log: `TERM` forced, `HOME` left alone. |
 
@@ -47,26 +48,27 @@ This plan fixes files, interfaces and acceptance checks. It does not repeat the 
 
 Links to the caller's `registry`, `git`, `.package-cache`, `.package-cache-mutate`, `credentials.toml` and `credentials`. A `config.toml` with the tables `registries`, `registry`, `source`, `net`, `http` and `credential-alias` of the caller's `config.toml`, where it has them.
 
-Carried over from the caller's environment, beside what stage 1 lists: `CARGO_REGISTRIES_*`, `CARGO_REGISTRY_*`, `SSH_AUTH_SOCK`, `GIT_SSH`, `GIT_SSH_COMMAND`, `GIT_ASKPASS` and `SSH_ASKPASS`. `CARGO_NET_GIT_FETCH_WITH_CLI=true` is set unless the caller's environment or `[net]` table says otherwise: Nix fetches the same repositories with the git command, and both should succeed or fail together.
+Carried over from the caller's environment, beside what stage 1 lists: `CARGO_REGISTRIES_*`, `CARGO_REGISTRY_*`, `SSH_AUTH_SOCK`, `GIT_SSH`, `GIT_SSH_COMMAND`, `GIT_ASKPASS` and `SSH_ASKPASS`. The private `config.toml` says `net.git-fetch-with-cli = true` unless the caller's says which git to use: Nix fetches the same repositories with the git command, and both should succeed or fail together. As a setting of the home's file it gives way to the project's configuration and to the caller's environment.
 
 ### The generated graph
 
 ```nix
   rustflags = [ "--cfg" "from_config" ];
   configEnv = [
-    { name = "PLAIN"; value = "plain"; force = false; relative = null; holdsSource = false; }
-    { name = "DATA"; value = ""; force = false; relative = "data/message.txt"; holdsSource = false; }
+    { name = "PLAIN"; value = "plain"; force = false; relative = null; slash = false; holdsSource = false; }
+    { name = "DATA"; value = ""; force = false; relative = "data/message.txt"; slash = false; holdsSource = false; }
   ];
   sources."git-serde-a866b336f14a" = b.fetchGit {
     name = "rustsrc-serde-a866b33";
     url = "https://github.com/serde-rs/serde";
     rev = "a866b336f14aa57a07f0d0be9f8762746e64ecb4";
+    ref = "refs/tags/v1.0.228";   # null for a dependency pinned by revision
   };
   sources."dep-0.1.0" = b.fetchCrate { pname = "dep"; version = "0.1.0"; sha256 = "…"; url = null; registry = "sparse+https://…"; };
   packages."serde_core-1.0.228" = { /* … */ manifestDir = "serde_core"; local = false; };
 ```
 
-`relative` is a path from the source root, `""` for the root itself. `holdsSource` says that a local package lies at or under it. `url = null` stands for a crate whose registry gives no download address that works without credentials.
+`relative` is a path from the source root, `""` for the root itself; `slash` says that cargo ends the value with a slash. `holdsSource` says that a local package lies at or under the path. `url = null` stands for a crate whose registry gives no download address that works without credentials.
 
 ### What each unit gets
 
@@ -74,7 +76,7 @@ Carried over from the caller's environment, beside what stage 1 lists: `CARGO_RE
 - **`configEnv`**: every compile, build-script run and test, laid under what cargo sets and over nothing that is already in the builder's environment unless `force`.
   - A plain value goes to every unit as it is.
   - A relative value, for a unit of a local package: the path in the unit's own view, which for a test is its writable copy. The path is added to the view unless it holds local packages.
-  - A relative value, for any other unit: a store copy that holds that path alone. Withheld when the path holds local packages.
+  - A relative value, for any other unit: withheld. (First built as a store copy holding that path alone; see the review.)
 - A unit's record names the relative values it was given, by path from the source root, and the names withheld from it.
 
 ### Conformance
@@ -87,52 +89,73 @@ Carried over from the caller's environment, beside what stage 1 lists: `CARGO_RE
 
 **Files:** `src/cargohome.rs`, `src/graph.rs`, `src/emit.rs`, `src/lints.rs`, `nix/builders.nix`, `tests/fixtures/gitdeps/`, `testdata/gitdeps/`
 
-- [ ] The cargo home links `git`, carries the SSH and git variables and defaults to the git command.
-- [ ] `graph`: a git source per repository and revision; a package's directory inside it; lints inherited from the repository's own workspace root.
-- [ ] `b.fetchGit`.
-- [ ] Tests against recorded cargo output for the fixture; the fixture builds and runs, and conforms.
+- [x] The cargo home links `git`, carries the SSH and git variables and defaults to the git command.
+- [x] `graph`: a git source per repository and revision; a package's directory inside it; lints inherited from the repository's own workspace root.
+- [x] `b.fetchGit`.
+- [x] Tests against recorded cargo output for the fixture; the fixture builds and runs, and conforms.
 
 ### Task 2: `rustflags`
 
 **Files:** `src/config.rs`, `src/resolve.rs`, `src/graph.rs`, `src/emit.rs`, `src/compile.rs`, `src/buildscript.rs`, `src/node.rs`, `nix/builders.nix`
 
-- [ ] `config::rustflags(config, host, cfgs)` with cargo's precedence; `resolve` reads the configuration and `rustc --print=cfg`.
-- [ ] Compiles append them; build-script runs encode them and print cfgs with them.
+- [x] `config::rustflags(config, host, cfgs)` with cargo's precedence; `resolve` reads the configuration and `rustc --print=cfg`.
+- [x] Compiles append them; build-script runs encode them and print cfgs with them.
 
 ### Task 3: `[env]`
 
 **Files:** `src/config.rs`, `src/resolve.rs`, `src/graph.rs`, `src/emit.rs`, `src/compile.rs`, `src/buildscript.rs`, `src/testrun.rs`, `src/node.rs`, `nix/builders.nix`
 
-- [ ] `config::env(config, origins, src, local package directories)`: plain and relative entries, `force`, the base of a relative value from the file that sets it, `holdsSource`.
-- [ ] The three builders apply them as described above.
+- [x] `config::env(config, origins, src, local package directories)`: plain and relative entries, `force`, the base of a relative value from the file that sets it, `holdsSource`.
+- [x] The three builders apply them as described above.
 
 ### Task 4: Other registries
 
 **Files:** `src/cargohome.rs`, `src/graph.rs`, `src/emit.rs`, `nix/builders.nix`
 
-- [ ] The cargo home's `config.toml` and credential links, and the carried registry variables.
-- [ ] `graph`: any `registry+` or `sparse+` source; the download address from the registry's cached `config.json`; none when it requires authentication or cannot be read.
-- [ ] `fetchCrate` with `url = null` fails with what to do.
+- [x] The cargo home's `config.toml` and credential links, and the carried registry variables.
+- [x] `graph`: any `registry+` or `sparse+` source; the download address from the registry's cached `config.json`; none when it requires authentication or cannot be read.
+- [x] `fetchCrate` with `url = null` fails with what to do.
 
 ### Task 5: Fixtures and conformance
 
 **Files:** `tests/fixtures/{gitdeps,config,registry}/`, `tests/registry.py`, `tests/fixtures.nix`, `examples/conformance.rs`, `flake.nix`
 
-- [ ] `gitdeps`: `serde` with `derive` by tag (a workspace with a proc macro, build scripts and symlinks) and `itoa` by revision.
-- [ ] `config`: a workspace below the source root, configuration files at both levels, `rustflags` from `cfg` tables over `[build]`, and `[env]` plain, forced, not forced, relative to a data file and relative to the workspace root.
-- [ ] `registry`: a crate from a sparse registry served on localhost, configured in the caller's cargo home.
-- [ ] `conformance --root`.
+- [x] `gitdeps`: `serde` with `derive` by tag (a workspace with a proc macro, build scripts and symlinks) and `itoa` by revision.
+- [x] `config`: a workspace below the source root, configuration files at both levels, `rustflags` from `cfg` tables over `[build]`, and `[env]` plain, forced, not forced, relative to a data file and relative to the workspace root.
+- [x] `registry`: a crate from a sparse registry served on localhost, configured in the caller's cargo home.
+- [x] `conformance --root`.
 
 ### Task 6: The driver
 
 **Files:** `tests/run.sh`
 
-- [ ] Each new fixture builds, runs its tests and conforms. Editing the data file a relative variable names rebuilds what was given it. A source edit does not rebuild a registry crate although a variable names the workspace root.
-- [ ] The registry fixture builds with the registry reachable, its download reproduces the pre-seeded file, and the derivation for a registry without a usable address explains itself.
-- [ ] Verify: `tests/run.sh` ends with `all integration checks passed`.
+- [x] Each new fixture builds, runs its tests and conforms. Editing the data file a relative variable names rebuilds what was given it. A source edit does not rebuild a registry crate although a variable names the workspace root.
+- [x] The registry fixture builds with the registry reachable, its download reproduces the pre-seeded file, and the derivation for a registry without a usable address explains itself.
+- [x] Verify: `tests/run.sh` ends with `all integration checks passed`.
 
-### Task 7: Documents
+### Task 7: What an independent review found
+
+**Files:** `src/config.rs`, `src/cargohome.rs`, `src/graph.rs`, `src/resolve.rs`, `nix/builders.nix`, `nix/build-rust-application.nix`, `examples/conformance.rs`, `tests/run.sh`, the `config` fixture
+
+- [x] A relative variable was handed to crates from elsewhere as a copy of its path. `SQLX_OFFLINE_DIR = ".sqlx"` or a path inside a package would have rebuilt every registry crate on every change under it. Crates that are not local are given no relative variable now; `crateOverrides.<name>.env` gives one to a crate that needs it.
+- [x] `cfg` tables were matched against the cfgs of a rustc run without flags. Cargo runs it with the flags found so far, twice at most; so does `config::settled_rustflags`.
+- [x] A relative value that is an absolute path is that path. The base of a relative value is the directory above the file's, whatever that is called.
+- [x] A `linker`, a `runner` or a `rustc-wrapper` in the configuration is warned about, and the `rustflags` argument can take the place of flags that only make sense with them.
+- [x] `builtins.fetchGit` is told the branch or tag beside the revision.
+- [x] The private cargo home: relative paths of the kept tables are made absolute, `config` is read before `config.toml`, a file that cannot be read is a warning, and the git command is chosen in the file, not in the environment, so that the project's configuration can say otherwise.
+- [x] Conformance compares a relative variable by what follows the root, a slash at the end included. `check_registry` makes sure the server that answers is the one it started.
+
+### Task 8: What building ruff found
+
+**Files:** `src/localsrc.rs`, `src/graph.rs`
+
+ruff 0.15.5 takes `salsa`, a workspace, and a fork of `lsp-types` from git repositories. Its graph has 451 units.
+
+- [x] `ruff_annotate_snippets` includes an example and a picture from its `examples/` directory in its documentation, and a library does not see that directory. A unit keeps the files its root names with `include_str!`, `include_bytes!` or `include!`, as it keeps those it names as modules.
+- [x] Verify: the `ruff` binary builds and checks a file.
+
+### Task 9: Documents
 
 **Files:** the spec, `README.md`
 
-- [ ] The spec describes git sources, registries and configuration where it describes the rest, and "Later stages" keeps stage 4 only. README: the three additions, what evaluation needs for them, what is still not supported.
+- [x] The spec describes git sources, registries and configuration where it describes the rest, and "Later stages" keeps stage 4 only. README: the three additions, what evaluation needs for them, what is still not supported.

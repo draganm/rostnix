@@ -81,6 +81,10 @@ pub struct GitSource {
     pub name: String,
     pub url: String,
     pub rev: String,
+    /// The branch or the tag the dependency asks for, as a git ref. The
+    /// revision is what is fetched; a Nix that cannot fetch a revision by
+    /// its name looks for it in this.
+    pub git_ref: Option<String>,
 }
 
 impl GitSource {
@@ -88,10 +92,17 @@ impl GitSource {
     /// `Cargo.lock` and `cargo metadata` name a git source.
     pub fn parse(source: &str) -> Option<GitSource> {
         let (url, rev) = source.strip_prefix("git+")?.rsplit_once('#')?;
-        let url = url.split('?').next().unwrap_or(url);
+        let (url, query) = url.split_once('?').unwrap_or((url, ""));
         if url.is_empty() || rev.is_empty() || !rev.chars().all(|c| c.is_ascii_hexdigit()) {
             return None;
         }
+        let git_ref = query
+            .split('&')
+            .find_map(|pair| match pair.split_once('=')? {
+                ("branch", branch) => Some(format!("refs/heads/{}", percent_decoded(branch))),
+                ("tag", tag) => Some(format!("refs/tags/{}", percent_decoded(tag))),
+                _ => None,
+            });
         let repo = url
             .trim_end_matches('/')
             .rsplit('/')
@@ -102,6 +113,7 @@ impl GitSource {
             name: sanitize_name(&format!("rustsrc-{repo}-{}", &rev[..rev.len().min(7)])),
             url: url.to_string(),
             rev: rev.to_string(),
+            git_ref,
         })
     }
 
@@ -111,6 +123,31 @@ impl GitSource {
         let repo = repo.rsplit_once('-').map_or(repo, |(repo, _)| repo);
         format!("git-{repo}-{}", &self.rev[..self.rev.len().min(12)])
     }
+}
+
+/// A part of a URL with its `%XX` escapes read: cargo writes a branch
+/// `feature/x` as `feature%2Fx`.
+fn percent_decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let escaped = (bytes[i] == b'%')
+            .then(|| text.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escaped {
+            Some(byte) => {
+                out.push(byte);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The checkout of a git repository a manifest lies in, and the manifest's
@@ -1223,7 +1260,7 @@ fn local_src(
         .map_or("", |(dir, _)| dir);
     let keep: Vec<String> = (ctx.inp.read_source)(&unit.target.src_path)
         .map(|text| {
-            localsrc::declared_modules(&text)
+            localsrc::named_files(&text)
                 .iter()
                 .map(|module| localsrc::resolve(root_dir, module))
                 .collect()
@@ -1377,6 +1414,7 @@ mod tests {
                 name: "rustsrc-serde-a866b33".to_string(),
                 url: "https://github.com/serde-rs/serde".to_string(),
                 rev: "a866b336f14aa57a07f0d0be9f8762746e64ecb4".to_string(),
+                git_ref: Some("refs/tags/v1.0.228".to_string()),
             }
         );
         // Only what comes from a registry is a crate to download.
@@ -1460,6 +1498,16 @@ mod tests {
         assert_eq!(git.rev, "a866b336f14aa57a07f0d0be9f8762746e64ecb4");
         assert_eq!(git.name, "rustsrc-serde-a866b33");
         assert_eq!(git.key(), "git-serde-a866b336f14a");
+        assert_eq!(git.git_ref.as_deref(), Some("refs/tags/v1.0.228"));
+        // A branch, with the slash in its name as cargo writes it; and a
+        // revision, which names no ref.
+        let branch = GitSource::parse("git+https://example.com/x?branch=feature%2Fx#0123abcd");
+        assert_eq!(
+            branch.unwrap().git_ref.as_deref(),
+            Some("refs/heads/feature/x")
+        );
+        let rev = GitSource::parse("git+https://example.com/x?rev=0123abc#0123abcd").unwrap();
+        assert_eq!(rev.git_ref, None);
         // No query, a `.git` at the end, another scheme.
         let git = GitSource::parse("git+ssh://git@example.com/team/my-crate.git#0123abcd").unwrap();
         assert_eq!(git.url, "ssh://git@example.com/team/my-crate.git");
