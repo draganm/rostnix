@@ -1,6 +1,6 @@
 //! Compares what rostnix ran with what cargo runs.
 //!
-//!     conformance [--compile-only] [--without <crate>]... <cargo-log> <unit-records-dir>
+//!     conformance [--compile-only] [--without <crate>]... [--root <dir>] <cargo-log> <unit-records-dir>
 //!
 //! `cargo-log` is the stderr of `cargo build -vv` or `cargo test -vv`, which
 //! prints every rustc command line, every build-script run and every test
@@ -13,6 +13,13 @@
 //! made with `cargo test --no-run`. `--without` leaves out what is done for
 //! one crate, for a test that rostnix was told to skip and so did not
 //! compile either.
+//!
+//! `--root` names the source root cargo ran in. A variable the cargo
+//! configuration sets to a path relative to its own directory is then
+//! compared as a path from that root: cargo names it in the source, rostnix
+//! in a copy of what the unit sees. And a variable rostnix withholds from
+//! crates that are not local, because it names the source itself, is taken
+//! out of what cargo gave those crates.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -26,6 +33,11 @@ struct Raw {
     env: BTreeMap<String, String>,
     program: String,
     args: Vec<String>,
+    /// From a record: the variables set from relative values of the cargo
+    /// configuration, with the path each names from the source root.
+    relative_env: BTreeMap<String, String>,
+    /// From a record: the names of such variables the unit was not given.
+    withheld_env: Vec<String>,
 }
 
 /// The same, with everything that legitimately differs taken out.
@@ -81,6 +93,7 @@ fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut compile_only = false;
     let mut without: Vec<String> = Vec::new();
+    let mut root: Option<String> = None;
     loop {
         match args.first().map(String::as_str) {
             Some("--compile-only") => {
@@ -91,12 +104,16 @@ fn main() -> ExitCode {
                 without.push(args.remove(1));
                 args.remove(0);
             }
+            Some("--root") if args.len() > 1 => {
+                root = Some(args.remove(1).trim_end_matches('/').to_string());
+                args.remove(0);
+            }
             _ => break,
         }
     }
     let [log, records] = &args[..] else {
         eprintln!(
-            "usage: conformance [--compile-only] [--without <crate>]... <cargo-log> <unit-records-dir>"
+            "usage: conformance [--compile-only] [--without <crate>]... [--root <dir>] <cargo-log> <unit-records-dir>"
         );
         return ExitCode::from(2);
     };
@@ -107,8 +124,32 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let mut cargo = normalise(&cargo);
-    let mut rostnix = normalise(&rostnix);
+    // What rostnix says of the relative variables tells which of cargo's
+    // are meant.
+    let relative: BTreeSet<&str> = rostnix
+        .iter()
+        .flat_map(|raw| raw.relative_env.keys().map(String::as_str))
+        .collect();
+    let withheld: BTreeSet<&str> = rostnix
+        .iter()
+        .flat_map(|raw| raw.withheld_env.iter().map(String::as_str))
+        .collect();
+    let mut cargo = normalise(
+        &cargo,
+        &Relative {
+            root: root.as_deref(),
+            relative: &relative,
+            withheld: &withheld,
+        },
+    );
+    let mut rostnix = normalise(
+        &rostnix,
+        &Relative {
+            root: None,
+            relative: &relative,
+            withheld: &BTreeSet::new(),
+        },
+    );
     for side in [&mut cargo, &mut rostnix] {
         side.retain(|inv| !(compile_only && inv.program == "test"));
         side.retain(|inv| !without.contains(&inv.crate_name));
@@ -247,6 +288,8 @@ fn parse_cargo_log(log: &str) -> Vec<Raw> {
             env,
             program,
             args: words.collect(),
+            relative_env: BTreeMap::new(),
+            withheld_env: Vec::new(),
         });
     }
     raws
@@ -350,6 +393,8 @@ fn read_records(dir: &str) -> Vec<Raw> {
             env,
             program: argv[0].clone(),
             args: argv[1..].to_vec(),
+            relative_env: map(&record["relativeEnv"]),
+            withheld_env: strings(&record["withheldEnv"]),
         });
     }
     raws
@@ -371,7 +416,29 @@ fn test_crate(program: &str) -> &str {
     }
 }
 
-fn normalise(raws: &[Raw]) -> Vec<Invocation> {
+/// How the variables that the cargo configuration sets to relative paths
+/// are brought to one form.
+struct Relative<'a> {
+    /// The source root on cargo's side. A record of rostnix's names the
+    /// paths itself.
+    root: Option<&'a str>,
+    /// The names of all such variables.
+    relative: &'a BTreeSet<&'a str>,
+    /// Those that are taken out of invocations for packages outside the
+    /// root.
+    withheld: &'a BTreeSet<&'a str>,
+}
+
+/// A path below the root as `ROOT/…`.
+fn from_root(path: &str) -> String {
+    if path.is_empty() {
+        "ROOT".to_string()
+    } else {
+        format!("ROOT/{path}")
+    }
+}
+
+fn normalise(raws: &[Raw], relative: &Relative) -> Vec<Invocation> {
     // Each side names the same things by its own paths. An invocation says
     // which package its directories belong to.
     let mut paths: Vec<(String, String)> = Vec::new();
@@ -464,12 +531,35 @@ fn normalise(raws: &[Raw]) -> Vec<Invocation> {
             }
             flags.sort();
 
+            let under_root = |path: &str| {
+                relative
+                    .root
+                    .and_then(|root| path.strip_prefix(root))
+                    .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+                    .map(|rest| rest.trim_start_matches('/').to_string())
+            };
+            let is_local = raw
+                .env
+                .get("CARGO_MANIFEST_DIR")
+                .is_some_and(|dir| under_root(dir).is_some());
             let env = raw
                 .env
                 .iter()
                 .filter(|(key, _)| !IGNORED_ENV.contains(&key.as_str()))
+                .filter(|(key, _)| is_local || !relative.withheld.contains(key.as_str()))
                 .map(|(key, value)| {
                     let value = match key.as_str() {
+                        // Cargo's log has the flags without the separator
+                        // that is between them, a control character.
+                        "CARGO_ENCODED_RUSTFLAGS" => value.replace('\x1f', ""),
+                        // A relative variable of the cargo configuration:
+                        // the path it names from the source root.
+                        key if raw.relative_env.contains_key(key) => {
+                            from_root(&raw.relative_env[key])
+                        }
+                        key if relative.relative.contains(key) && under_root(value).is_some() => {
+                            from_root(&under_root(value).unwrap_or_default())
+                        }
                         "CARGO" | "RUSTC" | "RUSTDOC" => basename(value).to_string(),
                         // Where a binary is; which one is what matters.
                         key if key.starts_with("CARGO_BIN_EXE_") => basename(value).to_string(),

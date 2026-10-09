@@ -1,0 +1,16 @@
+[build]
+# Not used: a target table that matches has flags of its own.
+rustflags = ["--cfg", "from_build"]
+
+[target.'cfg(unix)']
+rustflags = ["--cfg", "from_unix", "-A", "dead_code"]
+
+[target.'cfg(all(unix, any(target_os = "macos", target_os = "linux")))']
+rustflags = "--cfg from_expression"
+
+[target.'cfg(windows)']
+rustflags = ["--cfg", "from_windows"]
+
+[env]
+# The workspace itself: the usual way to tell code where its workspace is.
+FIXTURE_WORKSPACE = { value = "", relative = true }

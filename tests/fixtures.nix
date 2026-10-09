@@ -51,6 +51,22 @@ in
     };
   };
 
+  # Dependencies from git repositories: a workspace with a proc macro and
+  # build scripts, by tag, and a single package by revision.
+  gitdeps = rustEnv.buildRustApplication {
+    pname = "gitdeps";
+    src = ./fixtures/gitdeps;
+  };
+
+  # A workspace below the source root, with cargo configuration at both
+  # levels: rustflags from target tables, and [env] variables that are
+  # plain, forced, and relative to a data file and to the workspace.
+  config = rustEnv.buildRustApplication {
+    pname = "config";
+    src = ./fixtures/config;
+    cargoRoot = "ws";
+  };
+
   # One project under four profiles: fat LTO with panic=abort, thin LTO,
   # no LTO, and dev with debug information.
   profiles-release = profiles "release";

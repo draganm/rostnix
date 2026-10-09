@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::cargohome::Cargo;
+use crate::config;
 use crate::graph::{self, Graph, Inputs};
 use crate::lockfile::Checksums;
 use crate::metadata::Metadata;
@@ -182,6 +183,41 @@ pub fn run(request: &str) -> Result<String> {
             |err| format!("cargo {cargo_version} printed metadata this version cannot read: {err}"),
         )?;
 
+    // What the project's cargo configuration says about how to build.
+    // Cargo merges its configuration files; only the project's own can say
+    // anything of the kind, since the private cargo home says none of it.
+    let configured = |what: &[&str]| -> Result<Vec<u8>> {
+        let mut args: Vec<String> = ["-Z", "unstable-options", "config", "get"]
+            .map(String::from)
+            .to_vec();
+        args.extend(what.iter().map(|arg| arg.to_string()));
+        cargo.output_quietly(&workspace, &args)
+    };
+    let cargo_config: serde_json::Value =
+        serde_json::from_slice(&configured(&["--format", "json"])?).map_err(|err| {
+            format!("cargo {cargo_version} printed a configuration this version cannot read: {err}")
+        })?;
+    let cfgs = if config::has_cfg_rustflags(&cargo_config) {
+        config::parse_cfgs(&cargo.print_cfg()?)
+    } else {
+        Vec::new()
+    };
+    let rustflags = config::rustflags(&cargo_config, &host, &cfgs);
+    // Which file sets a relative variable decides what it is relative to.
+    let has_relative = cargo_config
+        .get("env")
+        .and_then(|env| env.as_object())
+        .is_some_and(|env| env.values().any(|value| value.get("relative").is_some()));
+    let origins = if has_relative {
+        config::origins(&String::from_utf8_lossy(&configured(&[
+            "--show-origin",
+            "env",
+        ])?))
+    } else {
+        Default::default()
+    };
+    let config_env = config::env(&cargo_config, &origins, src, &workspace.to_string_lossy());
+
     let build = |test_units: Option<&UnitGraph>| {
         graph::build(&Inputs {
             units: &units,
@@ -199,6 +235,8 @@ pub fn run(request: &str) -> Result<String> {
                 toml::from_str(&text).map_err(|err| format!("parsing {path}: {err}").into())
             },
             read_source: &|path| fs::read_to_string(path).ok(),
+            rustflags: &rustflags,
+            config_env: &config_env,
         })
     };
     let graph = match build(test_units.as_ref()) {

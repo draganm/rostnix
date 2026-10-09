@@ -40,6 +40,23 @@ pub struct PkgRef {
     pub version: String,
 }
 
+/// A variable of the project's cargo configuration, as one unit gets it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfigEnv {
+    pub name: String,
+    /// The value. A unit of a local package finds the path of a relative
+    /// variable in its own tree and has no value here.
+    pub value: String,
+    /// Whether the variable is set although the environment has it.
+    pub force: bool,
+    /// The path a relative value names, from the source root.
+    pub relative: Option<String>,
+    /// Whether the path ends with a slash, as cargo writes a directory
+    /// named by an empty value.
+    #[serde(default)]
+    pub slash: bool,
+}
+
 /// The node of a `compile` derivation.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,6 +86,15 @@ pub struct CompileNode {
     pub pass_l: bool,
     #[serde(default)]
     pub override_env: BTreeMap<String, String>,
+    /// The flags of the project's cargo configuration.
+    #[serde(default)]
+    pub rustflags: Vec<String>,
+    /// The variables of its `[env]` table that the unit is given, and the
+    /// names of those it is not.
+    #[serde(default)]
+    pub config_env: Vec<ConfigEnv>,
+    #[serde(default)]
+    pub withheld_env: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +121,12 @@ pub struct RunNode {
     pub links_deps: Vec<LinksDep>,
     #[serde(default)]
     pub override_env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub rustflags: Vec<String>,
+    #[serde(default)]
+    pub config_env: Vec<ConfigEnv>,
+    #[serde(default)]
+    pub withheld_env: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,6 +167,10 @@ pub struct TestRecord {
     pub env: BTreeMap<String, String>,
     pub override_env: BTreeMap<String, String>,
     pub cwd: String,
+    #[serde(default)]
+    pub relative_env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub withheld_env: Vec<String>,
 }
 
 /// What a `compile` leaves behind.
@@ -163,6 +199,13 @@ pub struct CompileRecord {
     #[serde(rename = "overrideEnv", default)]
     pub override_env: BTreeMap<String, String>,
     pub cwd: String,
+    /// The variables set from relative values of the cargo configuration,
+    /// each with the path it names from the source root; and the names of
+    /// those the unit was not given because they name the source itself.
+    #[serde(rename = "relativeEnv", default)]
+    pub relative_env: BTreeMap<String, String>,
+    #[serde(rename = "withheldEnv", default)]
+    pub withheld_env: Vec<String>,
 }
 
 /// What a `run-build-script` leaves behind: the directives its script
@@ -186,6 +229,10 @@ pub struct RunRecord {
     pub env_recorded: BTreeMap<String, String>,
     pub override_env: BTreeMap<String, String>,
     pub cwd: String,
+    #[serde(default)]
+    pub relative_env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub withheld_env: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

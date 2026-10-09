@@ -49,7 +49,12 @@ let
     })
   ];
 
-  graph = graphFn (mkBuilders { inherit srcStr crateOverrides checkFlags; });
+  # The builders are told what the graph says of the cargo configuration.
+  # That part of the graph does not depend on them, so this is no circle.
+  graph = graphFn (mkBuilders {
+    inherit srcStr crateOverrides checkFlags;
+    inherit (graph) rustflags configEnv;
+  });
 
   # A misspelt attribute would otherwise be ignored, and the build would
   # fail later for want of what it was meant to supply.

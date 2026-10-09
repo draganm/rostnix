@@ -7,6 +7,7 @@ use std::rc::Rc;
 use sha2::{Digest, Sha256};
 use toml::Table;
 
+use crate::config::EnvEntry;
 use crate::flags::{self, UnitFlags};
 use crate::localsrc::{self, TargetInfo};
 use crate::lockfile::Checksums;
@@ -23,6 +24,8 @@ pub struct Graph {
     pub cargo_version: String,
     pub host: String,
     pub sources: BTreeMap<String, Source>,
+    /// The git repositories packages come from, each at one revision.
+    pub git_sources: BTreeMap<String, GitSource>,
     pub packages: BTreeMap<String, PackageNode>,
     pub units: BTreeMap<String, UnitNode>,
     /// Target name of each binary and example the selection builds, and its
@@ -39,6 +42,20 @@ pub struct Graph {
     /// unit both plan alike is in both.
     pub build_units: Vec<String>,
     pub test_units: Vec<String>,
+    /// The flags and the variables of the project's cargo configuration,
+    /// which every unit is given.
+    pub rustflags: Vec<String>,
+    pub config_env: Vec<ConfigEnv>,
+}
+
+/// A variable of the `[env]` table of the cargo configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigEnv {
+    pub entry: EnvEntry,
+    /// Whether a relative value names the source itself: a local package
+    /// lies at the path or under it. Such a path is not handed to a crate
+    /// from elsewhere, which would then be rebuilt on every edit.
+    pub holds_source: bool,
 }
 
 /// A registry crate.
@@ -47,9 +64,138 @@ pub struct Source {
     pub pname: String,
     pub version: String,
     pub sha256: String,
-    pub url: String,
+    /// Where the crate file can be downloaded without credentials, if
+    /// anywhere.
+    pub url: Option<String>,
+    /// The registry, as `Cargo.lock` names it, when it is not crates.io.
+    pub registry: Option<String>,
     /// Where cargo unpacked the crate. Not part of the generated graph.
     pub cargo_src_dir: String,
+}
+
+/// A git repository at one revision. Every package cargo takes from it is
+/// built from the one tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitSource {
+    /// The derivation name of the fetched tree.
+    pub name: String,
+    pub url: String,
+    pub rev: String,
+}
+
+impl GitSource {
+    /// Reads `git+<url>?<what was asked for>#<revision>`, the form in which
+    /// `Cargo.lock` and `cargo metadata` name a git source.
+    pub fn parse(source: &str) -> Option<GitSource> {
+        let (url, rev) = source.strip_prefix("git+")?.rsplit_once('#')?;
+        let url = url.split('?').next().unwrap_or(url);
+        if url.is_empty() || rev.is_empty() || !rev.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let repo = url
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(".git");
+        Some(GitSource {
+            name: sanitize_name(&format!("rustsrc-{repo}-{}", &rev[..rev.len().min(7)])),
+            url: url.to_string(),
+            rev: rev.to_string(),
+        })
+    }
+
+    /// The key of the source in the graph.
+    fn key(&self) -> String {
+        let repo = self.name.strip_prefix("rustsrc-").unwrap_or(&self.name);
+        let repo = repo.rsplit_once('-').map_or(repo, |(repo, _)| repo);
+        format!("git-{repo}-{}", &self.rev[..self.rev.len().min(12)])
+    }
+}
+
+/// The checkout of a git repository a manifest lies in, and the manifest's
+/// directory inside it. Cargo keeps a checkout at
+/// `git/checkouts/<repository>-<hash>/<short revision>`.
+fn git_checkout(manifest_dir: &str) -> Option<(String, String)> {
+    const CHECKOUTS: &str = "/git/checkouts/";
+    let at = manifest_dir.rfind(CHECKOUTS)? + CHECKOUTS.len();
+    let mut rest = manifest_dir[at..].splitn(3, '/');
+    let (repo, rev) = (rest.next()?, rest.next()?);
+    if repo.is_empty() || rev.is_empty() {
+        return None;
+    }
+    Some((
+        format!("{}{repo}/{rev}", &manifest_dir[..at]),
+        rest.next().unwrap_or_default().to_string(),
+    ))
+}
+
+/// Where a crate of a registry other than crates.io can be downloaded
+/// without credentials, from the registry's own `config.json`, which cargo
+/// keeps beside its index. `None` when cargo keeps none there to read, as
+/// for an index that is a git repository, or when the registry wants a
+/// token for downloads.
+fn registry_download_url(
+    read: &dyn Fn(&str) -> Option<String>,
+    cargo_src_dir: &str,
+    name: &str,
+    version: &str,
+    sha256: &str,
+) -> Option<String> {
+    let (home, rest) = cargo_src_dir.rsplit_once("/registry/src/")?;
+    let index = rest.split('/').next()?;
+    let config: serde_json::Value = serde_json::from_str(&read(&format!(
+        "{home}/registry/index/{index}/config.json"
+    ))?)
+    .ok()?;
+    if config.get("auth-required").and_then(|v| v.as_bool()) == Some(true) {
+        return None;
+    }
+    let dl = config.get("dl")?.as_str()?;
+    let prefix = match name.len() {
+        0 => return None,
+        1 => "1".to_string(),
+        2 => "2".to_string(),
+        3 => format!("3/{}", &name[..1]),
+        _ => format!("{}/{}", name.get(..2)?, name.get(2..4)?),
+    };
+    let markers = [
+        ("{crate}", name.to_string()),
+        ("{version}", version.to_string()),
+        ("{prefix}", prefix.clone()),
+        ("{lowerprefix}", prefix.to_lowercase()),
+        ("{sha256-checksum}", sha256.to_string()),
+    ];
+    if !markers.iter().any(|(marker, _)| dl.contains(marker)) {
+        return Some(format!("{dl}/{name}/{version}/download"));
+    }
+    let mut url = dl.to_string();
+    for (marker, value) in &markers {
+        url = url.replace(marker, value);
+    }
+    Some(url)
+}
+
+/// The manifest of the workspace a package of a git repository belongs to:
+/// the nearest `Cargo.toml` with a `[workspace]` table, from the package's
+/// own up to the root of the checkout.
+fn git_workspace_manifest(
+    read_manifest: &dyn Fn(&str) -> Result<Table>,
+    manifest_dir: &str,
+    checkout: &str,
+) -> Option<Table> {
+    let mut dir = manifest_dir;
+    loop {
+        if let Ok(manifest) = read_manifest(&format!("{dir}/Cargo.toml")) {
+            if manifest.contains_key("workspace") {
+                return Some(manifest);
+            }
+        }
+        if dir == checkout || !dir.starts_with(checkout) {
+            return None;
+        }
+        dir = dir.rsplit_once('/')?.0;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +217,8 @@ pub struct PackageNode {
 pub enum SrcRef {
     /// A key of `Graph::sources`.
     Registry(String),
+    /// A key of `Graph::git_sources`.
+    Git(String),
     /// A view of the local source: `dir` without `exclude`.
     Local {
         name: String,
@@ -163,6 +311,9 @@ pub struct Inputs<'a> {
     pub read_manifest: &'a dyn Fn(&str) -> Result<Table>,
     /// Reads a source file of the tree, if it is there to be read.
     pub read_source: &'a dyn Fn(&str) -> Option<String>,
+    /// The flags and the variables of the project's cargo configuration.
+    pub rustflags: &'a [String],
+    pub config_env: &'a [EnvEntry],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +396,8 @@ struct PkgInfo<'a> {
     declared_features: Vec<String>,
     lint_flags: Vec<String>,
     manifest: Table,
+    /// Where the package's source comes from, when it is not local.
+    fetched: Option<SrcRef>,
 }
 
 /// What the units of every plan are built from.
@@ -417,6 +570,18 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
     let mut out = Graph {
         cargo_version: inp.cargo_version.to_string(),
         host: inp.host.to_string(),
+        rustflags: inp.rustflags.to_vec(),
+        config_env: inp
+            .config_env
+            .iter()
+            .map(|entry| ConfigEnv {
+                entry: entry.clone(),
+                holds_source: entry
+                    .relative
+                    .as_ref()
+                    .is_some_and(|path| local_dirs.iter().any(|dir| localsrc::is_under(dir, path))),
+            })
+            .collect(),
         ..Graph::default()
     };
     let mut infos: HashMap<&str, PkgInfo> = HashMap::new();
@@ -428,24 +593,40 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
             base
         };
         let local = pkg.source.is_none();
-        let rel_dir = if local {
-            relative_to(pkg.manifest_dir(), src_root).ok_or_else(|| {
+        let source = pkg.source.as_deref().unwrap_or_default();
+        // The workspace a `lints.workspace = true` of the package refers to.
+        let mut lints_from: Option<Table> = None;
+        let (rel_dir, fetched) = if local {
+            let rel_dir = relative_to(pkg.manifest_dir(), src_root).ok_or_else(|| {
                 format!(
                     "{} {} is a path dependency at {}, outside the source tree {src_root}",
                     pkg.name,
                     pkg.version,
                     pkg.manifest_dir()
                 )
-            })?
-        } else {
-            let source = pkg.source.as_deref().unwrap_or_default();
-            if source != CRATES_IO {
-                return Err(format!(
-                    "{} {} comes from {source}; this version builds packages from crates.io and from the source tree only",
-                    pkg.name, pkg.version
+            })?;
+            (rel_dir, None)
+        } else if let Some(git) = GitSource::parse(source) {
+            let (checkout, sub) = git_checkout(pkg.manifest_dir()).ok_or_else(|| {
+                format!(
+                    "{} {} comes from the git repository {}, but its manifest at {} is not in one of cargo's checkouts",
+                    pkg.name, pkg.version, git.url, pkg.manifest_path
                 )
-                .into());
+            })?;
+            // Two repositories of one name at revisions that begin alike
+            // are told apart by what `Cargo.lock` calls them.
+            let mut git_key = git.key();
+            if out
+                .git_sources
+                .get(&git_key)
+                .is_some_and(|other| *other != git)
+            {
+                git_key = format!("{git_key}-{}", &hash(&[source])[..8]);
             }
+            out.git_sources.insert(git_key.clone(), git);
+            lints_from = git_workspace_manifest(inp.read_manifest, pkg.manifest_dir(), &checkout);
+            (sub, Some(SrcRef::Git(git_key)))
+        } else if source.starts_with("registry+") || source.starts_with("sparse+") {
             let sha256 = inp
                 .checksums
                 .get(&pkg.name, &pkg.version, source)
@@ -455,24 +636,49 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
                         pkg.name, pkg.version
                     )
                 })?;
+            let (url, registry) = if source == CRATES_IO {
+                let url = format!(
+                    "https://static.crates.io/crates/{0}/{0}-{1}.crate",
+                    pkg.name, pkg.version
+                );
+                (Some(url), None)
+            } else {
+                let url = registry_download_url(
+                    inp.read_source,
+                    pkg.manifest_dir(),
+                    &pkg.name,
+                    &pkg.version,
+                    sha256,
+                );
+                (url, Some(source.to_string()))
+            };
             out.sources.insert(
                 key.clone(),
                 Source {
                     pname: pkg.name.clone(),
                     version: pkg.version.clone(),
                     sha256: sha256.to_string(),
-                    url: format!(
-                        "https://static.crates.io/crates/{0}/{0}-{1}.crate",
-                        pkg.name, pkg.version
-                    ),
+                    url,
+                    registry,
                     cargo_src_dir: pkg.manifest_dir().to_string(),
                 },
             );
-            String::new()
+            (String::new(), Some(SrcRef::Registry(key.clone())))
+        } else {
+            return Err(format!(
+                "{} {} comes from {source}, a kind of source this version does not build: it builds packages from the source tree, from registries and from git repositories",
+                pkg.name, pkg.version
+            )
+            .into());
         };
 
         let manifest = (inp.read_manifest)(&pkg.manifest_path)?;
-        let lint_flags = lints::rustflags(&manifest, local.then_some(&workspace_manifest))
+        let lints_workspace = if local {
+            Some(&workspace_manifest)
+        } else {
+            lints_from.as_ref()
+        };
+        let lint_flags = lints::rustflags(&manifest, lints_workspace)
             .map_err(|err| format!("{}: {err}", pkg.manifest_path))?;
 
         out.packages.insert(
@@ -505,6 +711,7 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
                 declared_features: pkg.features.keys().cloned().collect(),
                 lint_flags,
                 manifest,
+                fetched,
             },
         );
     }
@@ -638,7 +845,10 @@ fn add_plan(ctx: &Ctx, graph: &UnitGraph, kinds: &[Kind], out: &mut Graph) -> Re
                 kind == Kind::Test,
             )
         } else {
-            SrcRef::Registry(pkg_info.key.clone())
+            pkg_info
+                .fetched
+                .clone()
+                .unwrap_or_else(|| SrcRef::Registry(pkg_info.key.clone()))
         };
 
         if kind == Kind::Run {
@@ -1098,6 +1308,8 @@ mod tests {
             override_keys,
             read_manifest: &|_| Ok(Table::new()),
             read_source: &|_| None,
+            rustflags: &[],
+            config_env: &[],
         })
     }
 
@@ -1113,20 +1325,292 @@ mod tests {
             .unwrap()
     }
 
+    /// The graph of the gitdeps fixture from what cargo 1.95 printed for
+    /// it: serde, a workspace, by tag, and itoa by revision.
+    fn gitdeps() -> Graph {
+        let units: UnitGraph =
+            serde_json::from_str(include_str!("../testdata/gitdeps/build-graph.json")).unwrap();
+        let tests: UnitGraph =
+            serde_json::from_str(include_str!("../testdata/gitdeps/test-graph.json")).unwrap();
+        let metadata: Metadata =
+            serde_json::from_str(include_str!("../testdata/gitdeps/metadata.json")).unwrap();
+        let mut lock = String::new();
+        for pkg in &metadata.packages {
+            if pkg.source.as_deref() == Some(CRATES_IO) {
+                lock.push_str(&format!(
+                    "[[package]]\nname = \"{}\"\nversion = \"{}\"\nsource = \"{CRATES_IO}\"\nchecksum = \"sum\"\n\n",
+                    pkg.name, pkg.version
+                ));
+            }
+        }
+        let checksums = Checksums::parse(&lock).unwrap();
+        build(&Inputs {
+            units: &units,
+            test_units: Some(&tests),
+            metadata: &metadata,
+            checksums: &checksums,
+            src: "/src",
+            cargo_root: "",
+            host: "aarch64-apple-darwin",
+            cargo_version: "1.95.0",
+            override_keys: &[],
+            read_manifest: &|_| Ok(Table::new()),
+            read_source: &|_| None,
+            rustflags: &[],
+            config_env: &[],
+        })
+        .unwrap()
+    }
+
+    // Every package cargo takes from one repository is built from the one
+    // tree, each in its own directory of it.
     #[test]
-    fn packages_from_git_or_another_registry_are_refused_by_name() {
-        for source in [
-            "git+https://github.com/KokaKiwi/rust-hex#abcdef",
-            "registry+https://example.com/index",
-        ] {
-            let err = rejection(|_, metadata, _| {
-                package_mut(metadata, "hex").source = Some(source.to_string())
-            });
+    fn git_packages_are_built_from_their_repository() {
+        let graph = gitdeps();
+        assert_eq!(
+            graph.git_sources.keys().collect::<Vec<_>>(),
+            ["git-itoa-af77385d0daf", "git-serde-a866b336f14a"]
+        );
+        assert_eq!(
+            graph.git_sources["git-serde-a866b336f14a"],
+            GitSource {
+                name: "rustsrc-serde-a866b33".to_string(),
+                url: "https://github.com/serde-rs/serde".to_string(),
+                rev: "a866b336f14aa57a07f0d0be9f8762746e64ecb4".to_string(),
+            }
+        );
+        // Only what comes from a registry is a crate to download.
+        for name in ["serde", "serde_core", "serde_derive", "itoa"] {
             assert!(
-                err.contains("hex 0.4.3") && err.contains(source) && err.contains("crates.io"),
-                "{err}"
+                !graph
+                    .sources
+                    .keys()
+                    .any(|key| key.starts_with(&format!("{name}-"))),
+                "{name} is a crate source"
             );
         }
+        assert!(graph.sources.contains_key("proc-macro2-1.0.107") || !graph.sources.is_empty());
+
+        let serde = SrcRef::Git("git-serde-a866b336f14a".to_string());
+        let core = &graph.packages["serde_core-1.0.228"];
+        assert!(!core.local);
+        assert_eq!(core.manifest_dir, "serde_core");
+        assert_eq!(core.work_dir, "");
+        assert_eq!(
+            graph.packages["serde_derive-1.0.228"].manifest_dir,
+            "serde_derive"
+        );
+        assert_eq!(graph.packages["itoa-1.0.18"].manifest_dir, "");
+
+        let lib = compile(&graph, "serde_core-1.0.228-lib-")[0];
+        assert_eq!(lib.src, serde);
+        assert_eq!(lib.src_path, "src/lib.rs");
+        assert_eq!(lib.tail_args, ["--cap-lints", "allow"]);
+        let derive = compile(&graph, "serde_derive-1.0.228-proc-macro-")[0];
+        assert_eq!(derive.src, serde);
+        // A build script of the repository and its run read the same tree.
+        let script = compile(&graph, "serde_core-1.0.228-build-script-")[0];
+        assert_eq!(script.src, serde);
+        assert_eq!(script.src_path, "build.rs");
+        let run = graph
+            .units
+            .iter()
+            .find(|(key, _)| key.starts_with("serde_core-1.0.228-run-build-script-"))
+            .map(|(_, unit)| unit)
+            .unwrap();
+        assert!(matches!(run, UnitNode::Run(run) if run.src == serde));
+        let itoa = compile(&graph, "itoa-1.0.18-lib-")[0];
+        assert_eq!(itoa.src, SrcRef::Git("git-itoa-af77385d0daf".to_string()));
+    }
+
+    #[test]
+    fn a_source_of_an_unknown_kind_is_refused_by_name() {
+        let err = rejection(|_, metadata, _| {
+            package_mut(metadata, "hex").source = Some("directory+/vendor/hex".to_string())
+        });
+        assert!(
+            err.contains("hex 0.4.3") && err.contains("directory+/vendor/hex"),
+            "{err}"
+        );
+    }
+
+    // Cargo says where it checked a git package out. One that is anywhere
+    // else cannot be placed in its repository.
+    #[test]
+    fn a_git_package_outside_cargos_checkouts_is_refused() {
+        let err = rejection(|_, metadata, _| {
+            package_mut(metadata, "hex").source =
+                Some("git+https://github.com/KokaKiwi/rust-hex#0123456789abcdef".to_string())
+        });
+        assert!(
+            err.contains("hex 0.4.3")
+                && err.contains("https://github.com/KokaKiwi/rust-hex")
+                && err.contains("checkouts"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn git_sources_are_read_as_cargo_writes_them() {
+        let git = GitSource::parse(
+            "git+https://github.com/serde-rs/serde?tag=v1.0.228#a866b336f14aa57a07f0d0be9f8762746e64ecb4",
+        )
+        .unwrap();
+        assert_eq!(git.url, "https://github.com/serde-rs/serde");
+        assert_eq!(git.rev, "a866b336f14aa57a07f0d0be9f8762746e64ecb4");
+        assert_eq!(git.name, "rustsrc-serde-a866b33");
+        assert_eq!(git.key(), "git-serde-a866b336f14a");
+        // No query, a `.git` at the end, another scheme.
+        let git = GitSource::parse("git+ssh://git@example.com/team/my-crate.git#0123abcd").unwrap();
+        assert_eq!(git.url, "ssh://git@example.com/team/my-crate.git");
+        assert_eq!(git.name, "rustsrc-my-crate-0123abc");
+        assert_eq!(git.key(), "git-my-crate-0123abcd");
+        for not_git in [
+            "registry+https://github.com/rust-lang/crates.io-index",
+            "git+https://example.com/x",
+            "git+https://example.com/x#not-a-revision",
+            "git+#0123abcd",
+        ] {
+            assert_eq!(GitSource::parse(not_git), None, "{not_git}");
+        }
+    }
+
+    #[test]
+    fn checkouts_are_found_in_manifest_paths() {
+        assert_eq!(
+            git_checkout("/home/git/checkouts/serde-1b10f8d7b61b7b51/a866b33/serde_core"),
+            Some((
+                "/home/git/checkouts/serde-1b10f8d7b61b7b51/a866b33".to_string(),
+                "serde_core".to_string()
+            ))
+        );
+        assert_eq!(
+            git_checkout("/home/git/checkouts/itoa-a8525d7cabd73149/af77385"),
+            Some((
+                "/home/git/checkouts/itoa-a8525d7cabd73149/af77385".to_string(),
+                String::new()
+            ))
+        );
+        assert_eq!(
+            git_checkout("/home/git/checkouts/repo-0/abc/crates/deep/er").map(|(_, sub)| sub),
+            Some("crates/deep/er".to_string())
+        );
+        assert_eq!(git_checkout("/home/registry/src/index/hex-0.4.3"), None);
+        assert_eq!(git_checkout("/home/git/checkouts/repo-0"), None);
+    }
+
+    // A registry says in its config.json where its crates are downloaded.
+    #[test]
+    fn download_addresses_follow_the_registrys_template() {
+        let url = |config: &str, name: &str| {
+            registry_download_url(
+                &|path| {
+                    (path == "/home/registry/index/example.com-0123/config.json")
+                        .then(|| config.to_string())
+                },
+                &format!("/home/registry/src/example.com-0123/{name}-1.2.3"),
+                name,
+                "1.2.3",
+                "abc",
+            )
+        };
+        // No marker: cargo appends the crate, the version and `download`.
+        assert_eq!(
+            url(r#"{"dl":"https://example.com/api/v1/crates"}"#, "my-dep").as_deref(),
+            Some("https://example.com/api/v1/crates/my-dep/1.2.3/download")
+        );
+        assert_eq!(
+            url(
+                r#"{"dl":"https://dl.example.com/{prefix}/{crate}/{crate}-{version}.crate?sum={sha256-checksum}"}"#,
+                "My-dep"
+            )
+            .as_deref(),
+            Some("https://dl.example.com/My/-d/My-dep/My-dep-1.2.3.crate?sum=abc")
+        );
+        assert_eq!(
+            url(
+                r#"{"dl":"https://dl.example.com/{lowerprefix}/{crate}"}"#,
+                "Abc"
+            )
+            .as_deref(),
+            Some("https://dl.example.com/3/a/Abc")
+        );
+        assert_eq!(
+            url(r#"{"dl":"https://dl.example.com/{prefix}/{crate}"}"#, "ab").as_deref(),
+            Some("https://dl.example.com/2/ab")
+        );
+        // A registry that wants a token for downloads has no address a
+        // derivation could use.
+        assert_eq!(
+            url(
+                r#"{"dl":"https://example.com/dl","auth-required":true}"#,
+                "my-dep"
+            ),
+            None
+        );
+        // Nor has one whose configuration cargo keeps elsewhere.
+        assert_eq!(url("not json", "my-dep"), None);
+        assert_eq!(
+            registry_download_url(
+                &|_| None,
+                "/home/registry/src/x/my-dep-1.2.3",
+                "my-dep",
+                "1.2.3",
+                "abc"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_crate_of_another_registry_is_a_source_with_its_registry_named() {
+        let source = "sparse+https://crates.example.com/index/";
+        let graph = core_rs_with(&[], |_, metadata, lock| {
+            package_mut(metadata, "hex").source = Some(source.to_string());
+            *lock = lock.replace(
+                &format!("name = \"hex\"\nversion = \"0.4.3\"\nsource = \"{CRATES_IO}\""),
+                &format!("name = \"hex\"\nversion = \"0.4.3\"\nsource = \"{source}\""),
+            );
+        })
+        .unwrap();
+        let hex = &graph.sources["hex-0.4.3"];
+        assert_eq!(hex.registry.as_deref(), Some(source));
+        assert_eq!(hex.sha256, "sum-hex");
+        // Nothing is known of the registry here, so no address.
+        assert_eq!(hex.url, None);
+        // crates.io is not named.
+        assert_eq!(graph.sources["redb-2.6.3"].registry, None);
+    }
+
+    #[test]
+    fn the_workspace_of_a_git_package_is_the_nearest_one_above_it() {
+        let read = |path: &str| -> Result<Table> {
+            match path {
+                "/co/repo/abc/Cargo.toml" => Ok(toml::from_str("[workspace]\nmembers = []")?),
+                "/co/repo/abc/crates/a/Cargo.toml" => {
+                    Ok(toml::from_str("[package]\nname = \"a\"")?)
+                }
+                "/co/repo/abc/nested/Cargo.toml" => Ok(toml::from_str(
+                    "[workspace]\n[workspace.lints.rust]\nx = \"deny\"",
+                )?),
+                "/co/repo/abc/nested/b/Cargo.toml" => {
+                    Ok(toml::from_str("[package]\nname = \"b\"")?)
+                }
+                other => Err(format!("no {other}").into()),
+            }
+        };
+        let found = |dir: &str| git_workspace_manifest(&read, dir, "/co/repo/abc");
+        assert!(found("/co/repo/abc/crates/a")
+            .unwrap()
+            .contains_key("workspace"));
+        assert!(found("/co/repo/abc").is_some());
+        assert!(found("/co/repo/abc/nested/b").unwrap()["workspace"]
+            .get("lints")
+            .is_some());
+        assert_eq!(
+            git_workspace_manifest(&read, "/co/other/abc/x", "/co/other/abc"),
+            None
+        );
     }
 
     #[test]
@@ -1304,8 +1788,8 @@ mod tests {
             "sum-zstd-sys"
         );
         assert_eq!(
-            graph.sources["lz4-sys-1.11.1+lz4-1.10.0"].url,
-            "https://static.crates.io/crates/lz4-sys/lz4-sys-1.11.1+lz4-1.10.0.crate"
+            graph.sources["lz4-sys-1.11.1+lz4-1.10.0"].url.as_deref(),
+            Some("https://static.crates.io/crates/lz4-sys/lz4-sys-1.11.1+lz4-1.10.0.crate")
         );
     }
 
@@ -1459,6 +1943,16 @@ mod tests {
         change: impl FnOnce(&mut UnitGraph),
         read_source: &dyn Fn(&str) -> Option<String>,
     ) -> Result<Graph> {
+        hello_configured(with_tests, change, read_source, &[])
+    }
+
+    /// The same, with variables of a cargo configuration.
+    fn hello_configured(
+        with_tests: bool,
+        change: impl FnOnce(&mut UnitGraph),
+        read_source: &dyn Fn(&str) -> Option<String>,
+        config_env: &[EnvEntry],
+    ) -> Result<Graph> {
         let units: UnitGraph =
             serde_json::from_str(include_str!("../testdata/hello/build-graph.json")).unwrap();
         let mut tests: UnitGraph =
@@ -1486,6 +1980,8 @@ mod tests {
             override_keys: &[],
             read_manifest: &|_| Ok(Table::new()),
             read_source,
+            rustflags: &[],
+            config_env,
         })
     }
 
@@ -1641,6 +2137,41 @@ mod tests {
                 "src/main.rs",
                 "tests/cli.rs",
                 "tests/smoke.rs"
+            ]
+        );
+    }
+
+    // `CARGO_WORKSPACE_DIR = { value = "", relative = true }` names the
+    // source itself. A data file does not.
+    #[test]
+    fn a_relative_variable_that_names_a_package_holds_source() {
+        let entry = |name: &str, relative: Option<&str>| EnvEntry {
+            name: name.to_string(),
+            value: String::new(),
+            force: false,
+            relative: relative.map(String::from),
+            slash: false,
+        };
+        let entries = [
+            entry("ROOT", Some("")),
+            entry("DATA", Some("data/message.txt")),
+            entry("INSIDE", Some("tests/data")),
+            entry("PLAIN", None),
+        ];
+        let graph = hello_configured(false, |_| {}, &|_| None, &entries).unwrap();
+        let holds: Vec<(&str, bool)> = graph
+            .config_env
+            .iter()
+            .map(|env| (env.entry.name.as_str(), env.holds_source))
+            .collect();
+        // hello's one package is the source root.
+        assert_eq!(
+            holds,
+            [
+                ("ROOT", true),
+                ("DATA", false),
+                ("INSIDE", false),
+                ("PLAIN", false)
             ]
         );
     }

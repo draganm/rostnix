@@ -44,9 +44,11 @@ check_bins() {
 
 # compare_with_cargo <fixture> <shell> <records attribute> <conformance flag or ""> <cargo arguments...>
 # Runs cargo on a copy of the fixture's source, in the named flake shell and
-# with a cargo home that shares only the download cache, as resolve's does.
+# with a cargo home that shares only the download caches, as resolve's does.
 # What cargo ran must be what the fixture's records say rostnix ran, apart
-# from what the spec lists. The flags are split into words.
+# from what the spec lists. The flags are split into words. CARGO_ROOT names
+# the workspace's directory in the source, when it is not the root. Cargo
+# fetches git repositories with the git command, as rostnix has it do.
 compare_with_cargo() {
   local fixture="$1" shell="$2" attr="$3" flag="$4" src dir records
   shift 4
@@ -54,16 +56,18 @@ compare_with_cargo() {
   dir="$work/conformance-$fixture-$attr"
   mkdir -p "$dir/home" "$dir/src"
   ln -s "${CARGO_HOME:-$HOME/.cargo}/registry" "$dir/home/registry"
+  ln -s "${CARGO_HOME:-$HOME/.cargo}/git" "$dir/home/git"
   cp -R "$src/." "$dir/src/"
   chmod -R u+w "$dir/src"
-  (cd "$dir/src" &&
+  (cd "$dir/src/${CARGO_ROOT:-.}" &&
     env -u RUSTFLAGS -u CARGO_BUILD_TARGET -u RUSTC_WRAPPER \
-      CARGO_HOME="$dir/home" CARGO_TARGET_DIR="$dir/target" \
+      CARGO_HOME="$dir/home" CARGO_TARGET_DIR="$dir/target" CARGO_NET_GIT_FETCH_WITH_CLI=true \
       nix develop "$flake#$shell" --command cargo "$@" >"$dir/cargo.out" 2>"$dir/cargo.log") ||
     fail "$fixture: the reference cargo $1 failed; see $(tail -n 5 "$dir/cargo.log")"
   records="$(build "fixtures.$fixture.$attr")"
   CARGO_TARGET_DIR="$work/target" nix develop "$flake" --command \
-    cargo run --quiet --manifest-path "$root/Cargo.toml" --example conformance -- $flag "$dir/cargo.log" "$records" ||
+    cargo run --quiet --manifest-path "$root/Cargo.toml" --example conformance -- \
+    $flag --root "$(cd "$dir/src" && pwd -P)" "$dir/cargo.log" "$records" ||
     fail "$fixture: rostnix does not run what cargo $1 runs (differences above)"
   rm -rf "$dir"
 }
