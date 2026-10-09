@@ -167,7 +167,8 @@ packages. With either, it builds only what they name.
 Every binary and example the selection builds lands in `$out/bin` under its
 target name. A selection that builds neither is an error that names `bins`
 and `examples`. `passthru` exposes `graph`, `units`
-and `bins`, each unit a derivation, so one unit can be built alone.
+and `bins`, each unit a derivation, so one unit can be built alone, and
+`unitRecords`, a directory of every unit's `unit.json`.
 
 ## Components
 
@@ -438,7 +439,7 @@ Runs rustc once. Outputs:
 - `$out/lib/`: the rlib of a library, and the dynamic library of a proc
   macro or `cdylib`;
 - `$out/bin/<name>` for a binary, an example or a build script;
-- `$out/unit.json`: the artifacts, what dependents need (below), and the
+- `$out/unit.json`: the artifact, what dependents need (below), and the
   arguments and environment rustc ran with.
 
 **Dependencies.** rustc needs the rlib of every transitive dependency, not
@@ -533,7 +534,7 @@ It reads `cargo::` and `cargo:` lines from the script's stdout:
 | `rustc-cfg`, `rustc-check-cfg`, `rustc-env` | Flags and environment of the package's own units. |
 | `rustc-link-arg` and its `-bin`, `-bins`, `-cdylib`, `-examples`, `-tests`, `-benches` forms | `-C link-arg` on the kinds of unit each form names. |
 | `metadata`, and any other `KEY=VALUE` in the one-colon form | `DEP_<LINKS>_<KEY>` for the build scripts of packages that depend on this one, when this package sets `links`. |
-| `warning` | Printed to the build log. |
+| `warning` | Printed to the build log for a local package. A foreign package's warnings stay in `$out/output`, as cargo shows them only with `-vv`. |
 | `error` | The derivation fails. |
 | `rerun-if-changed`, `rerun-if-env-changed` | Ignored: Nix decides when to rerun. |
 
@@ -592,6 +593,10 @@ means both sides have the same units. Normalising removes these differences:
 - `--extern` naming an `.rmeta` under cargo, which pipelines, and the rlib
   under rostnix;
 - `--remap-path-prefix`, which rostnix adds;
+- `--cap-lints warn`, which cargo passes for foreign packages in place of
+  `allow` because `-vv` asks to see their warnings;
+- what a `crateOverrides` entry adds to the environment, which `unit.json`
+  records apart from what cargo would set;
 - `NUM_JOBS`, `CARGO_MAKEFLAGS` and the library path variables, which
   describe the machine.
 

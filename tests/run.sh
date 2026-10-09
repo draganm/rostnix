@@ -44,7 +44,9 @@ check_bins() {
 
 # check_conformance <fixture> <shell> <cargo build arguments...>
 # Every rustc invocation and build-script run must be what `cargo build -vv`
-# runs for the same source, apart from what the spec lists. The reference
+# runs for the same source, apart from what the spec lists. The arguments
+# name the fixture's profile and selection, release included: cargo's own
+# default is dev. The reference
 # build runs in the named flake shell, with a cargo home that shares only
 # the download cache, as resolve's does.
 check_conformance() {
@@ -69,11 +71,12 @@ check_conformance() {
   echo "ok: $fixture: every invocation is cargo's"
 }
 
-# check_incremental <fixture directory or store path> <arguments> <file to append to> <what must change>
+# check_incremental <fixture directory or store path> <arguments> <file to append to> <what must change> [label]
 # Evaluates the project from two copies that differ in one file and lists
 # the derivation names of the units that differ.
 check_incremental() {
   local src="$1" args="$2" file="$3" want="$4" a b got
+  local label="${5:-$(basename "$1")}"
   a="$(mktemp -d "$work/a.XXXXXX")"
   b="$(mktemp -d "$work/b.XXXXXX")"
   cp -R "$src/." "$a/"
@@ -94,8 +97,8 @@ check_incremental() {
     in builtins.concatStringsSep \" \" (pkgs.lib.unique (map (n: a.units.\${n}.name) changed))
   ")"
   rm -rf "$a" "$b"
-  [ "$got" = "$want" ] || fail "$(basename "$src"): editing $file changed [$got], want [$want]"
-  echo "ok: $(basename "$src"): editing $file changes [$want]"
+  [ "$got" = "$want" ] || fail "$label: editing $file changed [$got], want [$want]"
+  echo "ok: $label: editing $file changes [$want]"
 }
 
 # Without the option, evaluation must say what to set. The option is
@@ -244,7 +247,7 @@ check_stdenv() {
 }
 
 check_run hello hello '{"greeting":"hello","n":42}'
-check_conformance hello default
+check_conformance hello default --profile release
 check_main_program hello hello
 check_stdenv hello
 check_no_intermediate_refs hello
@@ -255,10 +258,10 @@ check_fetch_fallback hello anyhow
 check_run workspace ws-app "hello from ws-app: 3"
 check_run workspace ws-tool "ws-tool ok 7"
 check_bins workspace "ws-app ws-tool"
-check_conformance workspace default
+check_conformance workspace default --profile release
 check_run workspace-shout ws-app "HELLO FROM WS-APP: 3"
 check_bins workspace-shout "ws-app"
-check_conformance workspace-shout default --package ws-app --bin ws-app --features shout
+check_conformance workspace-shout default --profile release --package ws-app --bin ws-app --features shout
 
 # Build scripts. The note comes from an override's env, the message from a
 # file an override's extraSrc adds, and pc from the pkg-config and zlib that
@@ -266,7 +269,7 @@ check_conformance workspace-shout default --package ws-app --bin ws-app --featur
 zlib_version="$(nix eval --raw "$flake#fixtureShell.buildInputs" --apply 'inputs: (builtins.head inputs).version')"
 check_run buildscript consumer \
   "add=5 answer=42 note=from-override generated=from-build-script cfg=yes old=yes msg=shared-message zlib=ok pc=$zlib_version"
-ROSTNIX_FIXTURE_NOTE=from-override check_conformance buildscript fixtureShell
+ROSTNIX_FIXTURE_NOTE=from-override check_conformance buildscript fixtureShell --profile release
 check_no_intermediate_refs buildscript
 check_override_typo
 check_override_unmatched
@@ -291,9 +294,14 @@ check_no_intermediate_refs core-rs
 
 # rostnix builds itself.
 self="$(build fixtures.self)"
-"$self/bin/rostnix" 2>&1 | grep -q 'usage: rostnix' || fail "self: the self-built rostnix does not print its usage"
+# Without a command it prints its usage and exits 2.
+usage="$("$self/bin/rostnix" 2>&1 || true)"
+case "$usage" in
+  'usage: rostnix'*) ;;
+  *) fail "self: the self-built rostnix printed '$usage', not its usage" ;;
+esac
 echo "ok: self: rostnix builds itself"
-check_conformance self default
+check_conformance self default --profile release
 
 # An edit rebuilds the units that see the file and what depends on them.
 hello="$root/tests/fixtures/hello"
@@ -318,9 +326,9 @@ check_incremental "$buildscript" '{ crateOverrides.consumer.extraSrc = [ "shared
 
 core_rs_src="$(nix eval --raw "${exec_opt[@]}" "$flake#fixtures.core-rs.src")"
 check_incremental "$core_rs_src" '{ examples = [ "amber-store" ]; }' src/lib.rs \
-  "rustbin-amber-store rustlib-amber-store-core-0.10.0"
-check_incremental "$core_rs_src" '{ examples = [ "amber-store" ]; }' tests/cbor.rs ""
-check_incremental "$core_rs_src" '{ examples = [ "amber-store" ]; }' examples/amber-bench.rs ""
+  "rustbin-amber-store rustlib-amber-store-core-0.10.0" core-rs
+check_incremental "$core_rs_src" '{ examples = [ "amber-store" ]; }' tests/cbor.rs "" core-rs
+check_incremental "$core_rs_src" '{ examples = [ "amber-store" ]; }' examples/amber-bench.rs "" core-rs
 
 check_exec_error
 check_no_executable_error

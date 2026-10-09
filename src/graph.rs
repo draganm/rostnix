@@ -652,8 +652,17 @@ mod tests {
     use super::*;
 
     fn core_rs(override_keys: &[String]) -> Graph {
-        let units: UnitGraph = serde_json::from_str(include_str!("../testdata/core-rs/unit-graph.json")).unwrap();
-        let metadata: Metadata = serde_json::from_str(include_str!("../testdata/core-rs/metadata.json")).unwrap();
+        core_rs_with(override_keys, |_, _, _| {}).unwrap()
+    }
+
+    /// The graph of core-rs as recorded, after `change` has had its way
+    /// with cargo's output and the lockfile.
+    fn core_rs_with(
+        override_keys: &[String],
+        change: impl FnOnce(&mut UnitGraph, &mut Metadata, &mut String),
+    ) -> Result<Graph> {
+        let mut units: UnitGraph = serde_json::from_str(include_str!("../testdata/core-rs/unit-graph.json")).unwrap();
+        let mut metadata: Metadata = serde_json::from_str(include_str!("../testdata/core-rs/metadata.json")).unwrap();
         // Every registry package gets a checksum made of its name.
         let mut lock = String::new();
         for pkg in metadata.packages.iter().filter(|p| p.source.is_some()) {
@@ -662,6 +671,7 @@ mod tests {
                 pkg.name, pkg.version, pkg.name
             ));
         }
+        change(&mut units, &mut metadata, &mut lock);
         let checksums = Checksums::parse(&lock).unwrap();
         build(&Inputs {
             units: &units,
@@ -674,7 +684,53 @@ mod tests {
             override_keys,
             read_manifest: &|_| Ok(Table::new()),
         })
-        .unwrap()
+    }
+
+    fn rejection(change: impl FnOnce(&mut UnitGraph, &mut Metadata, &mut String)) -> String {
+        core_rs_with(&[], change).unwrap_err().to_string()
+    }
+
+    fn package_mut<'a>(metadata: &'a mut Metadata, name: &str) -> &'a mut Package {
+        metadata.packages.iter_mut().find(|p| p.name == name).unwrap()
+    }
+
+    #[test]
+    fn packages_from_git_or_another_registry_are_refused_by_name() {
+        for source in ["git+https://github.com/KokaKiwi/rust-hex#abcdef", "registry+https://example.com/index"] {
+            let err = rejection(|_, metadata, _| package_mut(metadata, "hex").source = Some(source.to_string()));
+            assert!(err.contains("hex 0.4.3") && err.contains(source) && err.contains("crates.io"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_path_dependency_outside_the_source_is_refused() {
+        let err = rejection(|_, metadata, _| {
+            let hex = package_mut(metadata, "hex");
+            hex.source = None;
+            hex.manifest_path = "/elsewhere/hex/Cargo.toml".to_string();
+        });
+        assert!(err.contains("hex 0.4.3") && err.contains("/elsewhere/hex") && err.contains("outside the source tree /src"), "{err}");
+    }
+
+    #[test]
+    fn a_unit_for_another_target_is_refused() {
+        let err = rejection(|units, _, _| units.units[0].platform = Some("x86_64-unknown-linux-gnu".to_string()));
+        assert!(err.contains("x86_64-unknown-linux-gnu") && err.contains("cross-compilation"), "{err}");
+    }
+
+    #[test]
+    fn a_mode_that_is_not_built_is_refused() {
+        let err = rejection(|units, _, _| {
+            let root = units.roots[0];
+            units.units[root].mode = "test".to_string();
+        });
+        assert!(err.contains("amber-store of amber-store-core 0.10.0") && err.contains("'test'"), "{err}");
+    }
+
+    #[test]
+    fn a_registry_package_without_checksum_is_refused() {
+        let err = rejection(|_, _, lock| *lock = lock.replace("name = \"hex\"", "name = \"other\""));
+        assert_eq!(err, "Cargo.lock has no checksum for hex 0.4.3");
     }
 
     fn compile<'a>(graph: &'a Graph, key_prefix: &str) -> Vec<&'a CompileUnit> {
