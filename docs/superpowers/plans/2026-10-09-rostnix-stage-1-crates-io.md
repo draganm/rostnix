@@ -132,10 +132,10 @@ As in the spec: `b: rec { cargoVersion; host; sources.<key>; packages.<key>; uni
 
 **Files:** `flake.nix`, `default.nix`, `Cargo.toml`, `Cargo.lock`, `src/main.rs`, `src/lib.rs`, `nix/tool.nix`, `nix/mk-rust-env.nix`, `.gitignore`, `.envrc`, `LICENSE`
 
-- [ ] Flake on `nixos-26.05` with a dev shell holding `cargo rustc rustfmt clippy`; `lib.mkRustEnv`; `packages.rostnix`; `legacyPackages.<system>.{rustEnv,fixtures}`.
-- [ ] `nix/tool.nix`: `rustPlatform.buildRustPackage` with `cargoLock.lockFile` and a `lib.fileset` source of `Cargo.toml`, `Cargo.lock` and `src/` only, `doCheck = false`.
-- [ ] `rostnix` with no arguments prints usage and exits 2.
-- [ ] Verify: `nix build --no-link .#rostnix` succeeds; `nix develop --command cargo test` passes.
+- [x] Flake on `nixos-26.05` with a dev shell holding `cargo rustc rustfmt clippy`; `lib.mkRustEnv`; `packages.rostnix`; `legacyPackages.<system>.{rustEnv,fixtures}`.
+- [x] `nix/tool.nix`: `rustPlatform.buildRustPackage` with `cargoLock.lockFile` and a `lib.fileset` source of `Cargo.toml`, `Cargo.lock` and `src/` only, `doCheck = false`.
+- [x] `rostnix` with no arguments prints usage and exits 2.
+- [x] Verify: `nix build --no-link .#rostnix` succeeds; `nix develop --command cargo test` passes.
 
 ### Task 2: Store paths and the lockfile
 
@@ -143,9 +143,9 @@ As in the spec: `b: rec { cargoVersion; host; sources.<key>; packages.<key>; uni
 
 **Produces:** `storepath::fixed_flat_sha256(store_dir: &str, name: &str, sha256_hex: &str) -> String`; `storepath::sanitize_name(&str) -> String`; `lockfile::Checksums::parse(&str) -> Result<Checksums>`; `Checksums::get(name, version, source) -> Option<&str>`.
 
-- [ ] Test `fixed_flat_sha256("/nix/store", "anyhow-1.0.104.crate", "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470")` equals `/nix/store/7xybb3ddg063d2g44a5sc5rf6rdz77dc-anyhow-1.0.104.crate`.
-- [ ] Test a name with `+` is kept and a name with `@` or a space is sanitised to `-`.
-- [ ] Test `Checksums` on a lockfile with a registry package, a path package without checksum, and two versions of one crate.
+- [x] Test `fixed_flat_sha256("/nix/store", "anyhow-1.0.104.crate", "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470")` equals `/nix/store/7xybb3ddg063d2g44a5sc5rf6rdz77dc-anyhow-1.0.104.crate`.
+- [x] Test a name with `+` is kept and a name with `@` or a space is sanitised to `-`.
+- [x] Test `Checksums` on a lockfile with a registry package, a path package without checksum, and two versions of one crate.
 
 ### Task 3: Decoding cargo's output
 
@@ -153,8 +153,8 @@ As in the spec: `b: rec { cargoVersion; host; sources.<key>; packages.<key>; uni
 
 **Produces:** `unitgraph::{UnitGraph, Unit, Target, Profile, UnitDep}`, `metadata::{Metadata, Package, MetaTarget}`, all `Deserialize`. `Profile::strip() -> Option<String>`, `Profile::debuginfo() -> Option<String>` render the two fields cargo encodes as JSON values.
 
-- [ ] Record both files from core-rs at its pinned commit with cargo 1.95 and paths rewritten to `/src` and `/cargo-home`.
-- [ ] Test: 103 units, one root, modes are only `build` and `run-custom-build`, `libc` has two `lib` units.
+- [x] Record both files from core-rs at its pinned commit with cargo 1.95 and paths rewritten to `/src` and `/cargo-home`.
+- [x] Test: 103 units, one root, modes are only `build` and `run-custom-build`, `libc` has two `lib` units.
 
 ### Task 4: LTO, lints and flags
 
@@ -162,10 +162,10 @@ As in the spec: `b: rec { cargoVersion; host; sources.<key>; packages.<key>; uni
 
 **Produces:** `lto::generate(&UnitGraph) -> Vec<Lto>` indexed by unit; `lints::rustflags(manifest: &toml::Table, workspace: Option<&toml::Table>) -> Result<Vec<String>>`; `flags::base_args(unit, lto, declared_features, lint_flags, metadata, primary) -> Vec<String>`; `flags::tail_args(unit, local) -> Vec<String>`.
 
-- [ ] `lto.rs` is a port of cargo's `lto.rs`: `generate` and `calculate` with the same merge table.
-- [ ] Tests on hand-built graphs: thin LTO bin with an rlib dependency gives `Run(thin)` and `OnlyBitcode`; a `cdylib`+`rlib` dependency gives `ObjectAndBitcode` and passes it down; `lto = "off"` gives `Off`; `false` gives `OnlyObject`; proc macros and build scripts and their dependencies give `OnlyObject`.
-- [ ] Lints: levels as strings and as tables, priority ordering then reverse name, tools other than `rust` prefixed, `cargo` lints dropped, `unexpected_cfgs.check-cfg` appended, `workspace = true` inherits.
-- [ ] Flags test against the recorded cargo 1.95 lines for `probe` in the spec's probes: a build script, a proc macro, a library under thin LTO and the final binary.
+- [x] `lto.rs` is a port of cargo's `lto.rs`: `generate` and `calculate` with the same merge table.
+- [x] Tests on hand-built graphs: thin LTO bin with an rlib dependency gives `Run(thin)` and `OnlyBitcode`; a `cdylib`+`rlib` dependency gives `ObjectAndBitcode` and passes it down; `lto = "off"` gives `Off`; `false` gives `OnlyObject`; proc macros and build scripts and their dependencies give `OnlyObject`.
+- [x] Lints: levels as strings and as tables, priority ordering then reverse name, tools other than `rust` prefixed, `cargo` lints dropped, `unexpected_cfgs.check-cfg` appended, `workspace = true` inherits.
+- [x] Flags test against the recorded cargo 1.95 lines for `probe` in the spec's probes: a build script, a proc macro, a library under thin LTO and the final binary.
 
 ### Task 5: Source views
 
@@ -173,7 +173,7 @@ As in the spec: `b: rec { cargoVersion; host; sources.<key>; packages.<key>; uni
 
 **Produces:** `localsrc::exclusions(pkg_dir: &str, other_pkg_dirs: &[String], targets: &[TargetInfo], unit_target: &TargetInfo) -> Vec<String>`, paths relative to `src`, sorted, with no entry under another entry.
 
-- [ ] Tests: core-rs library (`examples`, `tests`, `benches`); core-rs example `amber-store` (`tests`, `benches`, the other two example files); a package with `src/main.rs` and `src/bin/tool/main.rs` seen from the library and from each binary; a nested package.
+- [x] Tests: core-rs library (`examples`, `tests`, `benches`); core-rs example `amber-store` (`tests`, `benches`, the other two example files); a package with `src/main.rs` and `src/bin/tool/main.rs` seen from the library and from each binary; a nested package.
 
 ### Task 6: The graph and the emitter
 
@@ -181,10 +181,10 @@ As in the spec: `b: rec { cargoVersion; host; sources.<key>; packages.<key>; uni
 
 **Produces:** `graph::build(inputs: GraphInputs) -> Result<Graph>` where `Graph { cargo_version, host, sources, packages, units, bins, roots }`; `emit::to_nix(&Graph) -> String`; `emit::quote(&str) -> String`.
 
-- [ ] `graph::build` joins units with packages on the opaque package id, classifies packages, rejects what stage 1 rejects, computes `metadata` bottom-up, unit keys, `overrides` closures, `passL`, static env and args.
-- [ ] Test on the recorded core-rs graph: 103 units, distinct keys, `libc` twice, one `bins` entry `amber-store`, `zstd-safe`'s run lists `zstd-sys`'s run in `linksDeps`.
-- [ ] Test `emit::quote` round-trips `${`, `"`, `\`, newline and `''` through `nix eval`.
-- [ ] Golden test of `to_nix` for a three-unit graph.
+- [x] `graph::build` joins units with packages on the opaque package id, classifies packages, rejects what stage 1 rejects, computes `metadata` bottom-up, unit keys, `overrides` closures, `passL`, static env and args.
+- [x] Test on the recorded core-rs graph: 103 units, distinct keys, `libc` twice, one `bins` entry `amber-store`, `zstd-safe`'s run lists `zstd-sys`'s run in `linksDeps`.
+- [x] Test `emit::quote` round-trips `${`, `"`, `\`, newline and `''` through `nix eval`.
+- [x] Golden test of `to_nix` for a three-unit graph.
 
 ### Task 7: Resolve
 
@@ -192,50 +192,50 @@ As in the spec: `b: rec { cargoVersion; host; sources.<key>; packages.<key>; uni
 
 **Produces:** `rostnix resolve '<json>'` printing the graph. Request fields: `cargo`, `rustc`, `src`, `storeDir`, `cargoRoot`, `packages`, `bins`, `examples`, `features`, `allFeatures`, `noDefaultFeatures`, `profile`, `overrideKeys`.
 
-- [ ] Private cargo home with the three symlinks, clean environment as in the spec, temporary target directory, both removed on exit.
-- [ ] Pre-seed concurrently; a path mismatch is an error naming the crate and the cache file; a failing `nix` is a warning.
-- [ ] Verify by hand: `rostnix resolve` on a store copy of core-rs prints Nix that `nix-instantiate --parse` accepts.
+- [x] Private cargo home with the three symlinks, clean environment as in the spec, temporary target directory, both removed on exit.
+- [x] Pre-seed concurrently; a path mismatch is an error naming the crate and the cache file; a failing `nix` is a warning.
+- [x] Verify by hand: `rostnix resolve` on a store copy of core-rs prints Nix that `nix-instantiate --parse` accepts.
 
 ### Task 8: Build-time subcommands
 
 **Files:** `src/node.rs`, `src/compile.rs`, `src/buildscript.rs`
 
-- [ ] `buildscript::parse_output(stdout, pkg_name) -> Result<ScriptOutput>` with tests for every directive in both forms, `cargo::error`, unknown one-colon keys as metadata, and noise.
-- [ ] `run-build-script`: `CARGO_CFG_*` from `rustc --print=cfg` plus `feature` and the profile's `debug_assertions`, `DEP_*` from `linksDeps`, `OUT_DIR=$out/out`, cwd the package directory.
-- [ ] `compile`: argv and environment as in the spec; renames the executable to the target name; writes `unit.json`.
+- [x] `buildscript::parse_output(stdout, pkg_name) -> Result<ScriptOutput>` with tests for every directive in both forms, `cargo::error`, unknown one-colon keys as metadata, and noise.
+- [x] `run-build-script`: `CARGO_CFG_*` from `rustc --print=cfg` plus `feature` and the profile's `debug_assertions`, `DEP_*` from `linksDeps`, `OUT_DIR=$out/out`, cwd the package directory.
+- [x] `compile`: argv and environment as in the spec; renames the executable to the target name; writes `unit.json`.
 
 ### Task 9: The Nix library
 
 **Files:** `nix/builders.nix`, `nix/build-rust-application.nix`, `nix/mk-rust-env.nix`, `tests/fixtures.nix`, `tests/fixtures/hello/`
 
-- [ ] `fetchCrate`, `localSource`, `compile` (bare derivation unless it links or its package has an override), `runBuildScript`, the application.
-- [ ] Checks in `build-rust-application.nix`: `builtins.exec` present; unknown override attributes; unmatched override keys warned; no binary or example.
-- [ ] Verify: `fixtures.hello` builds and prints `{"greeting":"hello","n":42}`.
+- [x] `fetchCrate`, `localSource`, `compile` (bare derivation unless it links or its package has an override), `runBuildScript`, the application.
+- [x] Checks in `build-rust-application.nix`: `builtins.exec` present; unknown override attributes; unmatched override keys warned; no binary or example.
+- [x] Verify: `fixtures.hello` builds and prints `{"greeting":"hello","n":42}`.
 
 ### Task 10: Patient zero
 
 **Files:** `tests/fixtures.nix`
 
-- [ ] `fixtures.core-rs` from `builtins.fetchTree` at `e6e900b7a0f41b3540a319c1367fd167921d5d8c` with `examples = [ "amber-store" ]`.
-- [ ] Verify: it builds; `amber-store --help` exits 0; a store round trip with the binary works.
+- [x] `fixtures.core-rs` from `builtins.fetchTree` at `e6e900b7a0f41b3540a319c1367fd167921d5d8c` with `examples = [ "amber-store" ]`.
+- [x] Verify: it builds; `amber-store --help` exits 0; a store round trip with the binary works.
 
 ### Task 11: Conformance
 
 **Files:** `examples/conformance.rs`, `nix/build-rust-application.nix` (`passthru.unitRecords`)
 
-- [ ] The example reads a `cargo build -vv` log and a directory of `unit.json` files, normalises both as the spec lists (and maps cargo's `--cap-lints warn`, which `-vv` causes, to `allow`), and prints every invocation present on one side only. Exit 1 on any difference.
-- [ ] Verify: no difference for `hello` and for core-rs. Fix `flags.rs`, `compile.rs` and `buildscript.rs` until that holds.
+- [x] The example reads a `cargo build -vv` log and a directory of `unit.json` files, normalises both as the spec lists (and maps cargo's `--cap-lints warn`, which `-vv` causes, to `allow`), and prints every invocation present on one side only. Exit 1 on any difference.
+- [x] Verify: no difference for `hello` and for core-rs. Fix `flags.rs`, `compile.rs` and `buildscript.rs` until that holds.
 
 ### Task 12: The remaining fixtures and the driver
 
 **Files:** `tests/fixtures/{workspace,buildscript,profiles}/`, `tests/fixtures.nix`, `tests/run.sh`
 
-- [ ] Fixtures as in the spec's table; `fixtures.self` builds rostnix with itself.
-- [ ] `tests/run.sh`: run checks, conformance per fixture, rebuild granularity (`check_incremental` over `units`), the missing-`exec` error, the no-executable error, override typo and unmatched-key checks, the fetch fallback with `--rebuild`, and that the application refers to no `rust*-` intermediate.
-- [ ] Verify: `tests/run.sh` ends with `all integration checks passed`.
+- [x] Fixtures as in the spec's table; `fixtures.self` builds rostnix with itself.
+- [x] `tests/run.sh`: run checks, conformance per fixture, rebuild granularity (`check_incremental` over `units`), the missing-`exec` error, the no-executable error, override typo and unmatched-key checks, the fetch fallback with `--rebuild`, and that the application refers to no `rust*-` intermediate.
+- [x] Verify: `tests/run.sh` ends with `all integration checks passed`.
 
 ### Task 13: README
 
 **Files:** `README.md`
 
-- [ ] Use, `mkRustEnv`, `buildRustApplication`, `crateOverrides`, what evaluation needs, what is not supported yet, development.
+- [x] Use, `mkRustEnv`, `buildRustApplication`, `crateOverrides`, what evaluation needs, what is not supported yet, development.

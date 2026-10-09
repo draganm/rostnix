@@ -707,9 +707,9 @@ sandbox because they need `exec` and the network.
 | Fixture | Covers |
 |---|---|
 | `hello` | One package with a library and a binary, crates.io dependencies with build scripts and a proc macro, the default selection. |
-| `workspace` | Three members, one of them a proc macro and one nested in another's directory; `packages`, `bins` and `features`; a renamed dependency. |
+| `workspace` | Four members, one of them a proc macro and one nested in another's directory; `packages`, `bins` and `features`; a renamed dependency; lints inherited from the workspace. |
 | `buildscript` | A local build script that generates code into `OUT_DIR`, compiles C, sets `links` and metadata read by a dependent's build script; `rustc-cfg` and `rustc-env`; a `crateOverrides` entry that supplies zlib through `pkg-config`; `extraSrc`. |
-| `profiles` | Fat, thin and no LTO, `panic = "abort"`, `opt-level = "s"`, `codegen-units`, a per-package override and a custom profile. |
+| `profiles` | One project built under four profiles: fat LTO with `panic = "abort"`, `opt-level = "s"`, `codegen-units` and a per-package override; thin LTO; no LTO; and `dev`. |
 | core-rs | Patient zero at its pinned commit, fetched with `builtins.fetchTree`: the `amber-store` example. |
 | rostnix | rostnix builds itself with `buildRustApplication`. |
 
@@ -752,9 +752,10 @@ src/node.rs          reading a derivation's node from its attributes
 src/compile.rs       the compile subcommand
 src/buildscript.rs   the run-build-script subcommand, directive parsing
 nix/                 mk-rust-env.nix, tool.nix, builders.nix, build-rust-application.nix
+examples/conformance.rs   comparing units with a cargo build -vv log
+testdata/            recorded cargo output for the unit tests
 tests/fixtures/      integration fixtures
-tests/patient-zero.nix
-tests/conformance/   comparing units with cargo build -vv
+tests/fixtures.nix   the fixtures, core-rs and rostnix itself as builds
 tests/run.sh         integration driver
 ```
 
