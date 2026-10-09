@@ -29,6 +29,13 @@ pub struct Graph {
     /// unit.
     pub bins: BTreeMap<String, String>,
     pub roots: Vec<String>,
+    /// The units that are tests: each compiles a test executable and runs
+    /// it.
+    pub tests: Vec<String>,
+    /// The units `cargo build` plans and the units `cargo test` plans. A
+    /// unit both plan alike is in both.
+    pub build_units: Vec<String>,
+    pub test_units: Vec<String>,
 }
 
 /// A registry crate.
@@ -80,7 +87,12 @@ pub struct CompileUnit {
     pub name: String,
     pub package: String,
     pub src: SrcRef,
+    /// What is built: `lib`, `proc-macro`, `bin`, `example`, `build-script`,
+    /// or `test` for any target built as a test.
     pub kind: &'static str,
+    /// What the target is, whatever it is built as: `lib`, `proc-macro`,
+    /// `bin`, `example`, `test`, `bench` or `custom-build`.
+    pub target_kind: &'static str,
     pub crate_name: String,
     pub target_name: String,
     pub edition: String,
@@ -99,6 +111,18 @@ pub struct CompileUnit {
     pub build_script: Option<String>,
     /// The overridden packages this unit links.
     pub overrides: Vec<String>,
+    /// What running the test needs, for a unit of kind `test`.
+    pub test: Option<TestInfo>,
+}
+
+/// What a test is run with, beside what it is compiled from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestInfo {
+    /// The profile's directory in cargo's target directory.
+    pub profile_dir: String,
+    /// The binaries and examples the test finds beside itself: those of
+    /// its package, for an integration test or a bench.
+    pub executables: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,7 +140,10 @@ pub struct RunUnit {
 }
 
 pub struct Inputs<'a> {
+    /// What `cargo build` plans.
     pub units: &'a UnitGraph,
+    /// What `cargo test --no-run` plans, when tests are wanted.
+    pub test_units: Option<&'a UnitGraph>,
     pub metadata: &'a Metadata,
     pub checksums: &'a Checksums,
     /// The source root as cargo saw it.
@@ -138,6 +165,11 @@ enum Kind {
     Example,
     BuildScript,
     Run,
+    /// Any target built as a test executable.
+    Test,
+    /// Planned by cargo and not built: doc tests, which rustdoc compiles
+    /// and runs, and what `cargo test` builds only to see that it compiles.
+    Skipped,
 }
 
 impl Kind {
@@ -145,6 +177,10 @@ impl Kind {
         let has = |kind: &str| unit.target.kind.iter().any(|k| k == kind);
         Some(if unit.mode == "run-custom-build" {
             Kind::Run
+        } else if unit.mode == "test" {
+            Kind::Test
+        } else if unit.mode == "doctest" {
+            Kind::Skipped
         } else if has("custom-build") {
             Kind::BuildScript
         } else if has("proc-macro") {
@@ -172,6 +208,8 @@ impl Kind {
             Kind::Example => "example",
             Kind::BuildScript => "build-script",
             Kind::Run => "run-build-script",
+            Kind::Test => "test",
+            Kind::Skipped => "skipped",
         }
     }
 
@@ -182,6 +220,8 @@ impl Kind {
             Kind::Bin | Kind::Example => "rustbin",
             Kind::BuildScript => "rustbs",
             Kind::Run => "rustbsrun",
+            Kind::Test => "rusttest",
+            Kind::Skipped => "skipped",
         }
     }
 }
@@ -196,19 +236,78 @@ struct PkgInfo<'a> {
     rel_dir: String,
     declared_features: Vec<String>,
     lint_flags: Vec<String>,
+    manifest: Table,
 }
 
-pub fn build(inp: &Inputs) -> Result<Graph> {
-    let graph = inp.units;
-    let src_root = inp.src.trim_end_matches('/');
-    let by_id: HashMap<&str, &Package> = inp
-        .metadata
-        .packages
-        .iter()
-        .map(|p| (p.id.as_str(), p))
-        .collect();
+/// What the units of every plan are built from.
+struct Ctx<'a> {
+    inp: &'a Inputs<'a>,
+    src_root: &'a str,
+    infos: &'a HashMap<&'a str, PkgInfo<'a>>,
+    local_dirs: &'a [String],
+    workspace_manifest: &'a Table,
+}
 
-    // What this version does not build is refused by name.
+/// The word for what a target is, whatever it is built as.
+fn target_kind(unit: &Unit) -> &'static str {
+    let has = |kind: &str| unit.target.kind.iter().any(|k| k == kind);
+    if has("custom-build") {
+        "custom-build"
+    } else if has("proc-macro") {
+        "proc-macro"
+    } else if has("bin") {
+        "bin"
+    } else if has("example") {
+        "example"
+    } else if has("test") {
+        "test"
+    } else if has("bench") {
+        "bench"
+    } else {
+        "lib"
+    }
+}
+
+/// Whether a test of this unit's target is run by the test harness: true
+/// unless the target's entry in the manifest says `harness = false`.
+fn harness(manifest: &Table, unit: &Unit) -> bool {
+    let entry = match (target_kind(unit), manifest) {
+        ("lib" | "proc-macro", manifest) => manifest.get("lib").and_then(|lib| lib.as_table()),
+        (table, manifest) => manifest
+            .get(table)
+            .and_then(|entries| entries.as_array())
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| entry.as_table())
+                    .find(|entry| {
+                        entry.get("name").and_then(|name| name.as_str())
+                            == Some(unit.target.name.as_str())
+                    })
+            }),
+    };
+    entry
+        .and_then(|entry| entry.get("harness"))
+        .and_then(|harness| harness.as_bool())
+        .unwrap_or(true)
+}
+
+/// The directory of a profile in cargo's target directory.
+fn profile_dir(profile: &str) -> String {
+    match profile {
+        "dev" | "test" => "debug".to_string(),
+        "bench" => "release".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Says what each unit of a plan is, and refuses by name what this version
+/// does not build.
+fn classify(
+    graph: &UnitGraph,
+    by_id: &HashMap<&str, &Package>,
+    test_plan: bool,
+) -> Result<Vec<Kind>> {
     let mut kinds = Vec::with_capacity(graph.units.len());
     for unit in &graph.units {
         let pkg = by_id.get(unit.pkg_id.as_str()).ok_or_else(|| {
@@ -221,7 +320,9 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
         if let Some(platform) = &unit.platform {
             return Err(format!("{what} is planned for the target {platform}; cross-compilation is not supported yet").into());
         }
-        if unit.mode != "build" && unit.mode != "run-custom-build" {
+        let built = matches!(unit.mode.as_str(), "build" | "run-custom-build")
+            || (test_plan && matches!(unit.mode.as_str(), "test" | "doctest"));
+        if !built {
             return Err(format!(
                 "{what} has the mode '{}', which this version does not build",
                 unit.mode
@@ -230,6 +331,13 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
         }
         let is_example = unit.target.kind.iter().any(|k| k == "example");
         if is_example && !unit.target.crate_types.iter().any(|ct| ct == "bin") {
+            // `cargo test` builds every example to see that it compiles.
+            // Nothing can use a library example yet, so it is left out
+            // there, and refused where someone asked for it.
+            if test_plan && unit.mode == "build" {
+                kinds.push(Kind::Skipped);
+                continue;
+            }
             return Err(format!(
                 "{what} is an example of crate type {}; only executable examples are built yet",
                 unit.target.crate_types.join(", ")
@@ -244,11 +352,34 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
         })?;
         kinds.push(kind);
     }
+    Ok(kinds)
+}
+
+pub fn build(inp: &Inputs) -> Result<Graph> {
+    let src_root = inp.src.trim_end_matches('/');
+    let by_id: HashMap<&str, &Package> = inp
+        .metadata
+        .packages
+        .iter()
+        .map(|p| (p.id.as_str(), p))
+        .collect();
+
+    // The build plan, and the test plan when tests are wanted.
+    let build_kinds = classify(inp.units, &by_id, false)?;
+    let test_plan = match inp.test_units {
+        Some(tests) => Some((tests, classify(tests, &by_id, true)?)),
+        None => None,
+    };
 
     // Package keys: name and version, told apart by a hash of the id in the
     // rare case that two sources provide the same name and version.
     let mut used: Vec<&Package> = Vec::new();
-    for unit in &graph.units {
+    let planned = inp
+        .units
+        .units
+        .iter()
+        .chain(test_plan.iter().flat_map(|(tests, _)| tests.units.iter()));
+    for unit in planned {
         let pkg = by_id[unit.pkg_id.as_str()];
         if !used.iter().any(|p| p.id == pkg.id) {
             used.push(pkg);
@@ -365,10 +496,71 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
                 rel_dir,
                 declared_features: pkg.features.keys().cloned().collect(),
                 lint_flags,
+                manifest,
             },
         );
     }
-    let info = |unit: &Unit| &infos[unit.pkg_id.as_str()];
+
+    let ctx = Ctx {
+        inp,
+        src_root,
+        infos: &infos,
+        local_dirs: &local_dirs,
+        workspace_manifest: &workspace_manifest,
+    };
+    let built = |keys: &[String], kinds: &[Kind]| -> Vec<String> {
+        let mut keys: Vec<String> = keys
+            .iter()
+            .zip(kinds)
+            .filter(|(_, kind)| **kind != Kind::Skipped)
+            .map(|(key, _)| key.clone())
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    };
+
+    let graph = inp.units;
+    let keys = add_plan(&ctx, graph, &build_kinds, &mut out)?;
+    out.build_units = built(&keys, &build_kinds);
+    for &root in &graph.roots {
+        out.roots.push(keys[root].clone());
+        if matches!(build_kinds[root], Kind::Bin | Kind::Example) {
+            let name = &graph.units[root].target.name;
+            match out.bins.insert(name.clone(), keys[root].clone()) {
+                Some(other) if other != keys[root] => {
+                    return Err(format!(
+                        "the selection builds two executables named {name} ({other} and {}), which would be installed under one name; select one of them with `packages`, `bins` or `examples`",
+                        keys[root]
+                    )
+                    .into());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if let Some((graph, kinds)) = &test_plan {
+        let keys = add_plan(&ctx, graph, kinds, &mut out)?;
+        out.test_units = built(&keys, kinds);
+        out.tests = keys
+            .iter()
+            .zip(kinds)
+            .filter(|(_, kind)| **kind == Kind::Test)
+            .map(|(key, _)| key.clone())
+            .collect();
+        out.tests.sort();
+        out.tests.dedup();
+    }
+    Ok(out)
+}
+
+/// Adds the units of one of cargo's plans to the graph and returns the key
+/// of each, by unit index. A unit an earlier plan described the same way
+/// has the same key and is the same node.
+fn add_plan(ctx: &Ctx, graph: &UnitGraph, kinds: &[Kind], out: &mut Graph) -> Result<Vec<String>> {
+    let inp = ctx.inp;
+    let info = |unit: &Unit| &ctx.infos[unit.pkg_id.as_str()];
 
     let ltos = lto::generate(graph);
     let primary: BTreeSet<&str> = graph
@@ -380,7 +572,7 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
     // Metadata hashes, dependencies first.
     let mut hashes: Vec<Option<String>> = vec![None; graph.units.len()];
     for index in 0..graph.units.len() {
-        unit_hash(graph, &infos, &ltos, &mut hashes, index);
+        unit_hash(graph, ctx.infos, &ltos, &primary, &mut hashes, index);
     }
     let hashes: Vec<String> = hashes.into_iter().map(Option::unwrap).collect();
 
@@ -390,7 +582,7 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
         .enumerate()
         .map(|(i, unit)| {
             let target = match kinds[i] {
-                Kind::Bin | Kind::Example => format!("-{}", unit.target.name),
+                Kind::Bin | Kind::Example | Kind::Test => format!("-{}", unit.target.name),
                 _ => String::new(),
             };
             format!(
@@ -404,11 +596,16 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
 
     let mut closures: Vec<Option<Rc<BTreeSet<String>>>> = vec![None; graph.units.len()];
     for (i, unit) in graph.units.iter().enumerate() {
+        let kind = kinds[i];
+        if kind == Kind::Skipped || out.units.contains_key(&keys[i]) {
+            continue;
+        }
         let pkg_info = info(unit);
         let pkg = pkg_info.pkg;
-        let kind = kinds[i];
         let name = sanitize_name(&match kind {
-            Kind::Bin | Kind::Example => format!("{}-{}", kind.name_prefix(), unit.target.name),
+            Kind::Bin | Kind::Example | Kind::Test => {
+                format!("{}-{}", kind.name_prefix(), unit.target.name)
+            }
             _ => format!("{}-{}", kind.name_prefix(), pkg_info.key),
         });
         let src = if pkg_info.local {
@@ -417,7 +614,14 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
             } else {
                 unit
             };
-            local_src(pkg_info, &local_dirs, src_root, view_of, kind == Kind::Run)
+            local_src(
+                pkg_info,
+                ctx.local_dirs,
+                ctx.src_root,
+                view_of,
+                kind == Kind::Run,
+                kind == Kind::Test,
+            )
         } else {
             SrcRef::Registry(pkg_info.key.clone())
         };
@@ -456,7 +660,7 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
                 ),
                 (
                     "PROFILE".to_string(),
-                    profile_root(&unit.profile.name, &workspace_manifest).to_string(),
+                    profile_root(&unit.profile.name, ctx.workspace_manifest).to_string(),
                 ),
                 ("TARGET".to_string(), inp.host.to_string()),
                 ("HOST".to_string(), inp.host.to_string()),
@@ -495,23 +699,60 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
             lint_flags: &pkg_info.lint_flags,
             metadata: &hashes[i],
             primary: is_primary,
+            harness: harness(&pkg_info.manifest, unit),
         });
 
+        let target_kind = target_kind(unit);
         let mut env = BTreeMap::from([("CARGO_CRATE_NAME".to_string(), unit.target.crate_name())]);
-        if matches!(kind, Kind::Bin | Kind::Example) {
+        if matches!(target_kind, "bin" | "example") {
             env.insert("CARGO_BIN_NAME".to_string(), unit.target.name.clone());
         }
         if is_primary {
             env.insert("CARGO_PRIMARY_PACKAGE".to_string(), "1".to_string());
         }
 
-        let linked = unit
-            .target
-            .crate_types
-            .iter()
-            .any(|ct| matches!(ct.as_str(), "bin" | "proc-macro" | "cdylib" | "dylib"));
+        // An integration test or a bench finds its package's binaries and
+        // examples in the target directory: `cargo test` builds them before
+        // it runs anything. A test depends on the binaries so that they are
+        // built, not to link them. Unit tests are promised none of this.
+        let test = (kind == Kind::Test).then(|| {
+            let mut executables: Vec<String> = Vec::new();
+            if matches!(target_kind, "test" | "bench") {
+                executables.extend(
+                    unit.dependencies
+                        .iter()
+                        .filter(|d| kinds[d.index] == Kind::Bin)
+                        .map(|d| keys[d.index].clone()),
+                );
+                executables.extend(
+                    graph
+                        .units
+                        .iter()
+                        .enumerate()
+                        .filter(|(j, other)| {
+                            kinds[*j] == Kind::Example && other.pkg_id == unit.pkg_id
+                        })
+                        .map(|(j, _)| keys[j].clone()),
+                );
+                executables.sort();
+                executables.dedup();
+            }
+            TestInfo {
+                profile_dir: profile_dir(&unit.profile.name),
+                executables,
+            }
+        });
+        let binary_of_a_test =
+            |d: &crate::unitgraph::UnitDep| kind == Kind::Test && kinds[d.index] == Kind::Bin;
+
+        let linked = kind == Kind::Test
+            || unit
+                .target
+                .crate_types
+                .iter()
+                .any(|ct| matches!(ct.as_str(), "bin" | "proc-macro" | "cdylib" | "dylib"));
         let overrides = if linked {
-            link_closure(graph, &infos, &kinds, &mut closures, i)
+            link_closure(graph, ctx.infos, kinds, &mut closures, i)
                 .iter()
                 .filter(|name| inp.override_keys.contains(name))
                 .cloned()
@@ -527,6 +768,7 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
                 package: pkg_info.key.clone(),
                 src,
                 kind: kind.word(),
+                target_kind,
                 crate_name: unit.target.crate_name(),
                 target_name: unit.target.name.clone(),
                 edition: unit.target.edition.clone(),
@@ -535,14 +777,14 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
                 linked,
                 // The script's `-l` flags go to the package's library, or to
                 // its executables when it has none.
-                pass_l: matches!(kind, Kind::Lib | Kind::ProcMacro) || !pkg.has_lib(),
+                pass_l: matches!(target_kind, "lib" | "proc-macro") || !pkg.has_lib(),
                 rustc_args,
                 tail_args: flags::tail_args(unit, pkg_info.local),
                 env,
                 deps: unit
                     .dependencies
                     .iter()
-                    .filter(|d| kinds[d.index] != Kind::Run)
+                    .filter(|d| kinds[d.index] != Kind::Run && !binary_of_a_test(d))
                     .map(|d| (d.extern_crate_name.clone(), keys[d.index].clone()))
                     .collect(),
                 build_script: unit
@@ -551,27 +793,11 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
                     .find(|d| kinds[d.index] == Kind::Run)
                     .map(|d| keys[d.index].clone()),
                 overrides,
+                test,
             }),
         );
     }
-
-    for &root in &graph.roots {
-        out.roots.push(keys[root].clone());
-        if matches!(kinds[root], Kind::Bin | Kind::Example) {
-            let name = &graph.units[root].target.name;
-            match out.bins.insert(name.clone(), keys[root].clone()) {
-                Some(other) if other != keys[root] => {
-                    return Err(format!(
-                        "the selection builds two executables named {name} ({other} and {}), which would be installed under one name; select one of them with `packages`, `bins` or `examples`",
-                        keys[root]
-                    )
-                    .into());
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(out)
+    Ok(keys)
 }
 
 /// `path` relative to `dir`, when it is `dir` or under it. `""` is `dir`
@@ -605,6 +831,7 @@ fn unit_hash(
     graph: &UnitGraph,
     infos: &HashMap<&str, PkgInfo>,
     ltos: &[lto::Lto],
+    primary: &BTreeSet<&str>,
     hashes: &mut Vec<Option<String>>,
     index: usize,
 ) -> String {
@@ -619,7 +846,7 @@ fn unit_hash(
     };
     let profile = &unit.profile;
     let mut parts = vec![
-        "rostnix-unit-1".to_string(),
+        "rostnix-unit-2".to_string(),
         info.pkg.name.clone(),
         info.pkg.version.clone(),
         source,
@@ -643,6 +870,9 @@ fn unit_hash(
             profile.strip()
         ),
         format!("{:?}", ltos[index]),
+        // Whether the package is one the plan was asked for reaches the
+        // unit's environment, and plans differ in what they were asked for.
+        format!("primary={}", primary.contains(unit.pkg_id.as_str())),
     ];
     let mut deps: Vec<String> = unit
         .dependencies
@@ -651,7 +881,7 @@ fn unit_hash(
             format!(
                 "{}={}",
                 dep.extern_crate_name,
-                unit_hash(graph, infos, ltos, hashes, dep.index)
+                unit_hash(graph, infos, ltos, primary, hashes, dep.index)
             )
         })
         .collect();
@@ -732,6 +962,7 @@ fn local_src(
     src_root: &str,
     unit: &Unit,
     sees_every_root: bool,
+    as_test: bool,
 ) -> SrcRef {
     let targets: Vec<TargetInfo> = info
         .pkg
@@ -754,7 +985,7 @@ fn local_src(
     SrcRef::Local {
         name: sanitize_name(&format!("rustsrc-{}", info.key)),
         dir: info.rel_dir.clone(),
-        exclude: localsrc::exclusions(&info.rel_dir, local_dirs, &targets, &unit_target),
+        exclude: localsrc::exclusions(&info.rel_dir, local_dirs, &targets, &unit_target, as_test),
     }
 }
 
@@ -813,6 +1044,7 @@ mod tests {
         let checksums = Checksums::parse(&lock).unwrap();
         build(&Inputs {
             units: &units,
+            test_units: None,
             metadata: &metadata,
             checksums: &checksums,
             src: "/src",
@@ -1168,6 +1400,252 @@ mod tests {
             Some("libsqlite3-sys")
         );
         assert_eq!(graph.packages["redb-2.6.3"].override_key, None);
+    }
+
+    /// The graph of the hello fixture from what cargo 1.95 printed for it:
+    /// the plan of `cargo build` and, with tests, that of `cargo test`.
+    fn hello_with(with_tests: bool, change: impl FnOnce(&mut UnitGraph)) -> Result<Graph> {
+        let units: UnitGraph =
+            serde_json::from_str(include_str!("../testdata/hello/build-graph.json")).unwrap();
+        let mut tests: UnitGraph =
+            serde_json::from_str(include_str!("../testdata/hello/test-graph.json")).unwrap();
+        let metadata: Metadata =
+            serde_json::from_str(include_str!("../testdata/hello/metadata.json")).unwrap();
+        let mut lock = String::new();
+        for pkg in metadata.packages.iter().filter(|p| p.source.is_some()) {
+            lock.push_str(&format!(
+                "[[package]]\nname = \"{}\"\nversion = \"{}\"\nsource = \"{CRATES_IO}\"\nchecksum = \"sum\"\n\n",
+                pkg.name, pkg.version
+            ));
+        }
+        change(&mut tests);
+        let checksums = Checksums::parse(&lock).unwrap();
+        build(&Inputs {
+            units: &units,
+            test_units: with_tests.then_some(&tests),
+            metadata: &metadata,
+            checksums: &checksums,
+            src: "/src",
+            cargo_root: "",
+            host: "aarch64-apple-darwin",
+            cargo_version: "1.95.0",
+            override_keys: &[],
+            read_manifest: &|_| Ok(Table::new()),
+        })
+    }
+
+    fn hello(with_tests: bool) -> Graph {
+        hello_with(with_tests, |_| {}).unwrap()
+    }
+
+    /// A key without the hash at its end.
+    fn unhashed(key: &str) -> &str {
+        key.rsplit_once('-').unwrap().0
+    }
+
+    /// The unit that builds a target of hello as a test.
+    fn hello_test<'a>(graph: &'a Graph, target_kind: &str, name: &str) -> &'a CompileUnit {
+        compile(graph, &format!("hello-0.1.0-test-{name}-"))
+            .into_iter()
+            .find(|unit| unit.target_kind == target_kind)
+            .unwrap()
+    }
+
+    fn excluded(src: &SrcRef) -> Vec<&str> {
+        let SrcRef::Local { exclude, .. } = src else {
+            panic!("not a local source")
+        };
+        exclude.iter().map(String::as_str).collect()
+    }
+
+    // Everything `cargo build` plans for hello, `cargo test` plans the same
+    // way: tests add units and take none away.
+    #[test]
+    fn a_unit_both_plans_describe_alike_is_one_node() {
+        let (plain, graph) = (hello(false), hello(true));
+        assert!(plain.tests.is_empty() && plain.test_units.is_empty());
+        assert_eq!(plain.build_units, graph.build_units);
+        assert_eq!(plain.build_units.len(), plain.units.len());
+        assert_eq!(plain.roots, graph.roots);
+        for key in &graph.build_units {
+            assert!(graph.test_units.contains(key), "{key} is planned twice");
+        }
+        let added: Vec<&str> = graph
+            .test_units
+            .iter()
+            .filter(|key| !graph.build_units.contains(key))
+            .map(|key| unhashed(key))
+            .collect();
+        assert_eq!(
+            added,
+            [
+                "hello-0.1.0-example-extra",
+                "hello-0.1.0-test-cli",
+                "hello-0.1.0-test-hello",
+                "hello-0.1.0-test-hello",
+                "hello-0.1.0-test-smoke"
+            ]
+        );
+        // The doc test cargo plans is not built.
+        assert_eq!(graph.units.len(), graph.test_units.len());
+        assert!(!graph.units.keys().any(|key| key.contains("skipped")));
+        // Only what is installed counts as a binary of the application.
+        assert_eq!(graph.bins.keys().collect::<Vec<_>>(), ["hello"]);
+    }
+
+    #[test]
+    fn a_test_is_an_executable_built_with_the_harness() {
+        let graph = hello(true);
+        let cli = hello_test(&graph, "test", "cli");
+        assert_eq!(cli.kind, "test");
+        assert_eq!(cli.name, "rusttest-cli");
+        assert!(cli.linked);
+        assert!(cli.rustc_args.contains(&"--test".to_string()));
+        assert!(!cli.rustc_args.contains(&"--crate-type".to_string()));
+        assert_eq!(cli.src_path, "tests/cli.rs");
+        // It links the library. The binary it depends on is something to
+        // run, and so is the example.
+        let deps: Vec<(&str, &str)> = cli
+            .deps
+            .iter()
+            .filter(|(name, _)| name == "hello")
+            .map(|(name, key)| (name.as_str(), unhashed(key)))
+            .collect();
+        assert_eq!(deps, [("hello", "hello-0.1.0-lib")]);
+        let info = cli.test.as_ref().unwrap();
+        assert_eq!(info.profile_dir, "release");
+        let executables: Vec<&str> = info.executables.iter().map(|key| unhashed(key)).collect();
+        assert_eq!(
+            executables,
+            ["hello-0.1.0-bin-hello", "hello-0.1.0-example-extra"]
+        );
+        // The binary the test runs is the one that is installed.
+        assert_eq!(info.executables[0], graph.bins["hello"]);
+        assert!(!cli.env.contains_key("CARGO_BIN_NAME"));
+
+        // Unit tests: the library and the binary, each built as a test.
+        let lib = hello_test(&graph, "lib", "hello");
+        assert_eq!(lib.src_path, "src/lib.rs");
+        assert!(lib.linked && lib.pass_l);
+        assert!(!lib.env.contains_key("CARGO_BIN_NAME"));
+        // Unit tests are promised no binary and no example.
+        assert!(lib.test.as_ref().unwrap().executables.is_empty());
+        // What is not a test has nothing to run.
+        assert_eq!(compile(&graph, "hello-0.1.0-lib-")[0].test, None);
+        let bin = hello_test(&graph, "bin", "hello");
+        assert_eq!(bin.src_path, "src/main.rs");
+        assert_eq!(bin.env["CARGO_BIN_NAME"], "hello");
+        assert_ne!(lib.metadata, bin.metadata);
+    }
+
+    #[test]
+    fn a_test_sees_tests_without_the_other_tests() {
+        let graph = hello(true);
+        assert_eq!(
+            excluded(&hello_test(&graph, "test", "cli").src),
+            ["benches", "examples", "src/main.rs", "tests/smoke.rs"]
+        );
+        assert_eq!(
+            excluded(&hello_test(&graph, "lib", "hello").src),
+            [
+                "benches",
+                "examples",
+                "src/main.rs",
+                "tests/cli.rs",
+                "tests/smoke.rs"
+            ]
+        );
+        assert_eq!(
+            excluded(&hello_test(&graph, "bin", "hello").src),
+            ["benches", "examples", "tests/cli.rs", "tests/smoke.rs"]
+        );
+        // What is installed sees no test at all.
+        let lib = compile(&graph, "hello-0.1.0-lib-")[0];
+        assert_eq!(
+            excluded(&lib.src),
+            ["benches", "examples", "src/main.rs", "tests"]
+        );
+    }
+
+    #[test]
+    fn tests_are_the_units_built_as_tests() {
+        let graph = hello(true);
+        let names: Vec<&str> = graph.tests.iter().map(|key| unhashed(key)).collect();
+        assert_eq!(
+            names,
+            [
+                "hello-0.1.0-test-cli",
+                "hello-0.1.0-test-hello",
+                "hello-0.1.0-test-hello",
+                "hello-0.1.0-test-smoke"
+            ]
+        );
+        for key in &graph.tests {
+            assert!(
+                matches!(&graph.units[key], UnitNode::Compile(unit) if unit.test.is_some()),
+                "{key}"
+            );
+        }
+    }
+
+    // `cargo test` builds every example to see that it compiles. One that
+    // is a library cannot be built yet, and nothing would use it.
+    #[test]
+    fn a_library_example_in_the_test_plan_is_left_out() {
+        let graph = hello_with(true, |tests| {
+            let example = tests
+                .units
+                .iter_mut()
+                .find(|unit| unit.target.kind == ["example"])
+                .unwrap();
+            example.target.crate_types = vec!["cdylib".to_string()];
+        })
+        .unwrap();
+        assert!(!graph.units.keys().any(|key| key.contains("-example-")));
+        let cli = hello_test(&graph, "test", "cli");
+        assert_eq!(cli.test.as_ref().unwrap().executables.len(), 1);
+    }
+
+    #[test]
+    fn a_mode_the_test_plan_cannot_have_is_refused() {
+        let err = hello_with(true, |tests| tests.units[0].mode = "check".to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'check'"), "{err}");
+    }
+
+    #[test]
+    fn harness_is_read_from_the_targets_entry() {
+        let manifest: Table = toml::from_str(
+            "[lib]\nharness = false\n\n[[test]]\nname = \"plain\"\nharness = false\n\n\
+             [[test]]\nname = \"other\"\n\n[[bin]]\nname = \"tool\"\nharness = false\n",
+        )
+        .unwrap();
+        let tests: UnitGraph =
+            serde_json::from_str(include_str!("../testdata/hello/test-graph.json")).unwrap();
+        let unit = |kind: &str, name: &str| {
+            let mut unit = tests.units[0].clone();
+            unit.target.kind = vec![kind.to_string()];
+            unit.target.name = name.to_string();
+            unit
+        };
+        assert!(!harness(&manifest, &unit("lib", "anything")));
+        assert!(!harness(&manifest, &unit("proc-macro", "anything")));
+        assert!(!harness(&manifest, &unit("test", "plain")));
+        assert!(harness(&manifest, &unit("test", "other")));
+        assert!(harness(&manifest, &unit("test", "found-by-cargo")));
+        assert!(!harness(&manifest, &unit("bin", "tool")));
+        assert!(harness(&manifest, &unit("example", "tool")));
+        assert!(harness(&Table::new(), &unit("lib", "anything")));
+    }
+
+    #[test]
+    fn profile_directories() {
+        assert_eq!(profile_dir("dev"), "debug");
+        assert_eq!(profile_dir("test"), "debug");
+        assert_eq!(profile_dir("release"), "release");
+        assert_eq!(profile_dir("bench"), "release");
+        assert_eq!(profile_dir("thin"), "thin");
     }
 
     #[test]

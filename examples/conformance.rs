@@ -1,12 +1,18 @@
 //! Compares what rostnix ran with what cargo runs.
 //!
-//!     conformance <cargo-log> <unit-records-dir>
+//!     conformance [--compile-only] [--without <crate>]... <cargo-log> <unit-records-dir>
 //!
-//! `cargo-log` is the stderr of `cargo build -vv`, which prints every rustc
-//! command line and every build-script run with the environment cargo set.
-//! `unit-records-dir` holds the `unit.json` of every unit rostnix built.
-//! Both are reduced to sets of normalised invocations, which must be equal.
+//! `cargo-log` is the stderr of `cargo build -vv` or `cargo test -vv`, which
+//! prints every rustc command line, every build-script run and every test
+//! run with the environment cargo set. `unit-records-dir` holds the
+//! `unit.json` of every unit rostnix built and of every test it ran. Both
+//! are reduced to sets of normalised invocations, which must be equal.
 //! Exits 1 and prints the differences when they are not.
+//!
+//! With `--compile-only` test runs are left out on both sides, for a log
+//! made with `cargo test --no-run`. `--without` leaves out what is done for
+//! one crate, for a test that rostnix was told to skip and so did not
+//! compile either.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -25,7 +31,7 @@ struct Raw {
 /// The same, with everything that legitimately differs taken out.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Invocation {
-    /// `rustc` or `build-script`.
+    /// `rustc`, `build-script` or `test`.
     program: String,
     package: String,
     crate_name: String,
@@ -72,9 +78,26 @@ const TWO_PART: &[&str] = &[
 ];
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let mut compile_only = false;
+    let mut without: Vec<String> = Vec::new();
+    loop {
+        match args.first().map(String::as_str) {
+            Some("--compile-only") => {
+                compile_only = true;
+                args.remove(0);
+            }
+            Some("--without") if args.len() > 1 => {
+                without.push(args.remove(1));
+                args.remove(0);
+            }
+            _ => break,
+        }
+    }
     let [log, records] = &args[..] else {
-        eprintln!("usage: conformance <cargo-log> <unit-records-dir>");
+        eprintln!(
+            "usage: conformance [--compile-only] [--without <crate>]... <cargo-log> <unit-records-dir>"
+        );
         return ExitCode::from(2);
     };
     let cargo = parse_cargo_log(&fs::read_to_string(log).expect("reading the cargo log"));
@@ -84,8 +107,12 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let cargo = normalise(&cargo);
-    let rostnix = normalise(&rostnix);
+    let mut cargo = normalise(&cargo);
+    let mut rostnix = normalise(&rostnix);
+    for side in [&mut cargo, &mut rostnix] {
+        side.retain(|inv| !(compile_only && inv.program == "test"));
+        side.retain(|inv| !without.contains(&inv.crate_name));
+    }
     let only_cargo: Vec<&Invocation> = cargo.iter().filter(|inv| !rostnix.contains(inv)).collect();
     let only_rostnix: Vec<&Invocation> =
         rostnix.iter().filter(|inv| !cargo.contains(inv)).collect();
@@ -196,6 +223,10 @@ fn parse_cargo_log(log: &str) -> Vec<Raw> {
         let Some(program) = words.next() else {
             continue;
         };
+        // Doc tests are not run.
+        if basename(&program) == "rustdoc" {
+            continue;
+        }
         raws.push(Raw {
             env,
             program,
@@ -205,13 +236,14 @@ fn parse_cargo_log(log: &str) -> Vec<Raw> {
     raws
 }
 
-/// `KEY=VALUE` with a variable name as the key.
+/// `KEY=VALUE` with a variable name as the key. A name may hold a hyphen:
+/// `CARGO_BIN_EXE_<name>` carries the binary's name as it is.
 fn assignment(word: &str) -> Option<(String, String)> {
     let (key, value) = word.split_once('=')?;
     let mut chars = key.chars();
     let first = chars.next()?;
     let is_name = (first.is_ascii_alphabetic() || first == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
     is_name.then(|| (key.to_string(), value.to_string()))
 }
 
@@ -311,6 +343,18 @@ fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// The crate a test executable was built from: its file name is the crate
+/// name and a hash of sixteen digits.
+fn test_crate(program: &str) -> &str {
+    let name = basename(program);
+    match name.rsplit_once('-') {
+        Some((stem, hash)) if hash.len() == 16 && hash.chars().all(|c| c.is_ascii_hexdigit()) => {
+            stem
+        }
+        _ => name,
+    }
+}
+
 fn normalise(raws: &[Raw]) -> Vec<Invocation> {
     // Each side names the same things by its own paths. An invocation says
     // which package its directories belong to.
@@ -349,10 +393,15 @@ fn normalise(raws: &[Raw]) -> Vec<Invocation> {
                 raw.env.get("CARGO_PKG_VERSION").map_or("", String::as_str)
             );
             let is_rustc = basename(&raw.program) == "rustc";
+            let is_build_script = basename(&raw.program).starts_with("build-script-");
             let mut flags = Vec::new();
             let mut lints = Vec::new();
             let mut link_order = Vec::new();
-            let mut crate_name = String::new();
+            let mut crate_name = if is_rustc || is_build_script {
+                String::new()
+            } else {
+                test_crate(&raw.program).to_string()
+            };
             let mut args = raw.args.iter();
             while let Some(arg) = args.next() {
                 if !is_rustc {
@@ -406,6 +455,8 @@ fn normalise(raws: &[Raw]) -> Vec<Invocation> {
                 .map(|(key, value)| {
                     let value = match key.as_str() {
                         "CARGO" | "RUSTC" | "RUSTDOC" => basename(value).to_string(),
+                        // Where a binary is; which one is what matters.
+                        key if key.starts_with("CARGO_BIN_EXE_") => basename(value).to_string(),
                         _ => symbolic(value),
                     };
                     (key.clone(), value)
@@ -414,10 +465,13 @@ fn normalise(raws: &[Raw]) -> Vec<Invocation> {
 
             Invocation {
                 program: if is_rustc {
-                    "rustc".to_string()
+                    "rustc"
+                } else if is_build_script {
+                    "build-script"
                 } else {
-                    "build-script".to_string()
-                },
+                    "test"
+                }
+                .to_string(),
                 package,
                 crate_name,
                 flags,

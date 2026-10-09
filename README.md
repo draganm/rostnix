@@ -13,6 +13,10 @@ does for Go. Cargo plans and rustc builds:
   invocation or one build-script run, is its own derivation. An edit
   rebuilds the steps that see the file and the steps that depend on them.
   Cargo does not run at build time.
+- **Tests are steps too.** Each test executable `cargo test` would build is
+  built and run in its own derivation, and the application is built only
+  when they pass. An edit runs again the tests that could tell the
+  difference.
 - **No lockfile for Nix.** Crate hashes are the checksums already in
   `Cargo.lock`. A Rust project commits no Nix code or hash that depends on
   `Cargo.toml` or `Cargo.lock`.
@@ -85,6 +89,9 @@ toolchains can be passed but are not tested.
 | `noDefaultFeatures` | `false` | As `--no-default-features`. |
 | `profile` | `"release"` | As `--profile`. |
 | `crateOverrides` | `{ }` | Libraries and tools for crates that need them; see [crateOverrides](#crateoverrides). |
+| `doCheck` | `true` | Build and run the tests of the selected packages; see [Tests](#tests). |
+| `checkFlags` | `[ ]` | Arguments for every test executable, such as `[ "--skip" "needs_network" ]`. |
+| `skipTests` | `[ ]` | Names of test targets that are neither built nor run. |
 
 The selection means what it means to `cargo build`. With neither `bins` nor
 `examples`, cargo builds the library and every binary of the selected
@@ -104,8 +111,8 @@ rustEnv.buildRustApplication {
 }
 ```
 
-The result's `passthru` has `units` and `bins`, each a set of derivations,
-so one step can be built alone:
+The result's `passthru` has `units`, `bins` and `tests`, each a set of
+derivations, so one step can be built alone:
 
 ```bash
 opt=(--option allow-unsafe-native-code-during-evaluation true)
@@ -115,6 +122,56 @@ nix build "${opt[@]}" '.#default.units."serde-1.0.229-lib-3fa94c1e"'
 
 A unit's output holds `unit.json`, which records the rustc command line and
 environment it ran with.
+
+### Tests
+
+With `doCheck`, which is on unless you turn it off, rostnix also asks cargo
+what `cargo test` would build for the selected packages, with the same
+features and profile: the unit tests of each library and binary, the
+integration tests, and the examples. `bins` and `examples` choose what is
+installed and do not narrow what is tested. Doc tests are not run.
+
+Each test executable is one derivation, which compiles it and runs it. The
+application depends on all of them, so a failing test fails the build and
+its output is in the build log. Everything a test shares with the
+application is built once: a dependency is built a second time only where
+cargo would build it differently for tests, for instance when a
+dev-dependency turns one of its features on.
+
+A test is compiled and run as under cargo:
+
+- in a writable copy of its package, so it can create files beside itself,
+  and a fixture it copies out of the source can be changed;
+- from `target/<profile>/deps/`, with the package's binaries and examples
+  in the directories beside for an integration test, which also gets
+  `CARGO_BIN_EXE_<name>` and `CARGO_TARGET_TMPDIR`;
+- with the arguments in `checkFlags`, and the tools and environment of its
+  package's `crateOverrides` entry.
+
+```nix
+rustEnv.buildRustApplication {
+  pname = "app";
+  src = ./.;
+  # tests/e2e.rs needs a server that is not there.
+  skipTests = [ "e2e" ];
+  # One test function in any test executable, by the harness's own flag.
+  checkFlags = [ "--skip" "resolves_the_public_name" ];
+}
+```
+
+`skipTests` takes target names: the file name of an integration test
+without `.rs`, or the name of a library or binary for its unit tests. An
+entry that names no test target gets a warning. One test can be built and
+run alone, and leaves what it printed in its output:
+
+```bash
+nix eval "${opt[@]}" .#default.tests --apply builtins.attrNames
+nix build "${opt[@]}" '.#default.tests."app-0.1.0-test-e2e-91d0c3aa"'
+cat result/log
+```
+
+What a Nix build forbids, a test cannot do: reach the network (in a
+sandboxed build), or create a setuid file.
 
 ### crateOverrides
 
@@ -139,8 +196,8 @@ rustEnv.buildRustApplication {
 | Attribute | Default | Meaning |
 |---|---|---|
 | `buildInputs` | `[ ]` | Libraries. The package's build-script run gets them, and so do the build scripts that build against its native library (those that depend on it through `links`) and every step that links the package. |
-| `nativeBuildInputs` | `[ ]` | Tools the package's build script and rustc invocations run, such as `pkg-config`. |
-| `env` | `{ }` | Environment of the package's build script and of its rustc invocations. |
+| `nativeBuildInputs` | `[ ]` | Tools the package's build script, rustc invocations and tests run, such as `pkg-config`. |
+| `env` | `{ }` | Environment of the package's build script, of its rustc invocations and of its tests. |
 | `extraSrc` | `[ ]` | Local packages only: files and directories, relative to `src`, that the package reads from outside what its steps see. |
 
 Any other attribute in an entry is an error, as is `extraSrc` for a crate
@@ -154,13 +211,17 @@ directory, narrowed by three rules:
 
 - Directories of other packages inside it are left out.
 - `examples/`, `tests/` and `benches/` are left out, unless the step builds
-  an example, test or bench.
+  an example, test or bench. Everything built as a test, unit tests
+  included, keeps `tests/`, where test data and helper modules live.
 - The root files of the package's other binaries, examples, tests and
-  benches are left out. A build script's run still sees them, since build
-  scripts read source files on their own.
+  benches are left out, except one the step's own root file names as a
+  module: `tests/common.rs` stays for a test that says `mod common;`. A
+  build script's run still sees them all, since build scripts read source
+  files on their own.
 
 Editing `src/main.rs` therefore rebuilds the binary and not the library,
-and editing a test rebuilds nothing. A step that reads a file outside this
+and editing `tests/e2e.rs` builds and runs that test again and nothing
+else. A step that reads a file outside this
 view, such as `include_str!("../../README.md")` from a workspace member,
 fails with "file not found" until `extraSrc` names the file.
 
@@ -190,13 +251,12 @@ it.
 
 ## Not yet supported
 
-Tests (`doCheck`, `checkFlags` and `skipTests` are accepted and ignored),
-dependencies from git repositories and from registries other than
+Dependencies from git repositories and from registries other than
 crates.io, path dependencies outside `src`, `rustflags` and `[env]` from
 `.cargo/config.toml`, cross-compilation, installing `cdylib` and `staticlib`
-targets, dependencies built as Rust `dylib`s, doc tests and benches. Git and registry dependencies, path
-dependencies outside `src` and builds for another target are rejected
-during evaluation with a message naming them.
+targets, dependencies built as Rust `dylib`s, doc tests and benches. Git
+and registry dependencies, path dependencies outside `src` and builds for
+another target are rejected during evaluation with a message naming them.
 
 Build scripts run with their package directory read-only: one that writes
 outside `OUT_DIR` fails.
@@ -213,9 +273,10 @@ tests/run.sh                       # integration tests: real nix builds
 
 The integration tests build small fixtures, rostnix itself, and
 [amber-store/core-rs](https://github.com/amber-store/core-rs) at a pinned
-commit. For each they compare every rustc invocation and build-script run
-with what `cargo build -vv` runs for the same source, and check that an
-edit rebuilds only the steps it should.
+commit, and run the test suite of each. For each they compare every rustc
+invocation, build-script run and test run with what `cargo build -vv` and
+`cargo test -vv` do for the same source, and check that an edit rebuilds
+only the steps it should.
 
 The design is in `docs/superpowers/specs/2026-10-09-rostnix-design.md`.
 

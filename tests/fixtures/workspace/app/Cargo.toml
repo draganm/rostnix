@@ -9,6 +9,10 @@ ws-nested = { path = "../crates/core/nested" }
 ws-macros = { path = "../crates/macros" }
 itoa = "1"
 
+# The tests get a louder ws-core than the installed binaries do.
+[dev-dependencies]
+core_renamed = { package = "ws-core", path = "../crates/core", features = ["loud"] }
+
 [features]
 shout = ["core_renamed/loud"]
 

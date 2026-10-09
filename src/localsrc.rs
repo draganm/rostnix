@@ -35,12 +35,15 @@ pub fn is_under(path: &str, dir: &str) -> bool {
 }
 
 /// The paths left out of the view a unit of `unit_target` gets of the
-/// package in `pkg_dir`: sorted, and none under another.
+/// package in `pkg_dir`: sorted, and none under another. A unit built as a
+/// test keeps `tests/` whatever its target is: unit tests read the data and
+/// the helper modules kept there as integration tests do.
 pub fn exclusions(
     pkg_dir: &str,
     other_pkg_dirs: &[String],
     targets: &[TargetInfo],
     unit_target: &TargetInfo,
+    as_test: bool,
 ) -> Vec<String> {
     let mut excluded: Vec<String> = Vec::new();
 
@@ -55,7 +58,10 @@ pub fn exclusions(
     // one of them, or has its root there by a `path` of its own.
     for dir in ["examples", "tests", "benches"] {
         let dir_path = join(pkg_dir, dir);
-        if unit_target.own_dir != Some(dir) && !is_under(&unit_target.src_path, &dir_path) {
+        let kept = unit_target.own_dir == Some(dir)
+            || is_under(&unit_target.src_path, &dir_path)
+            || (as_test && dir == "tests");
+        if !kept {
             excluded.push(dir_path);
         }
     }
@@ -128,7 +134,7 @@ mod tests {
     fn library_sees_no_examples_tests_or_benches() {
         let targets = core_rs();
         assert_eq!(
-            exclusions("", &[], &targets, &targets[0]),
+            exclusions("", &[], &targets, &targets[0], false),
             ["benches", "examples", "tests"]
         );
     }
@@ -137,7 +143,7 @@ mod tests {
     fn example_sees_its_directory_without_the_other_examples() {
         let targets = core_rs();
         assert_eq!(
-            exclusions("", &[], &targets, &targets[2]),
+            exclusions("", &[], &targets, &targets[2], false),
             [
                 "benches",
                 "examples/amber-bench.rs",
@@ -151,8 +157,35 @@ mod tests {
     fn test_sees_tests_without_the_other_tests() {
         let targets = core_rs();
         assert_eq!(
-            exclusions("", &[], &targets, &targets[4]),
+            exclusions("", &[], &targets, &targets[4], false),
             ["benches", "examples", "tests/cli_e2e.rs"]
+        );
+    }
+
+    // A library's unit tests and a binary's see tests/, with its data and
+    // helper modules, but none of the integration tests' own files.
+    #[test]
+    fn a_target_built_as_a_test_keeps_the_tests_directory() {
+        let mut targets = core_rs();
+        targets.push(target("bin", "src/main.rs"));
+        assert_eq!(
+            exclusions("", &[], &targets, &targets[0], true),
+            [
+                "benches",
+                "examples",
+                "src/main.rs",
+                "tests/cbor.rs",
+                "tests/cli_e2e.rs"
+            ]
+        );
+        assert_eq!(
+            exclusions("", &[], &targets, &targets[6], true),
+            ["benches", "examples", "tests/cbor.rs", "tests/cli_e2e.rs"]
+        );
+        // An integration test is unchanged by it.
+        assert_eq!(
+            exclusions("", &[], &targets, &targets[4], true),
+            exclusions("", &[], &targets, &targets[4], false)
         );
     }
 
@@ -166,7 +199,7 @@ mod tests {
             target("build-script", "app/build.rs"),
         ];
         let common = ["app/benches", "app/examples"];
-        let view = |i: usize| exclusions("app", &[], &targets, &targets[i]);
+        let view = |i: usize| exclusions("app", &[], &targets, &targets[i], false);
         assert_eq!(
             view(0),
             [
@@ -221,7 +254,7 @@ mod tests {
             target("bin", "src/cli/main.rs"),
         ];
         assert_eq!(
-            exclusions("", &[], &targets, &targets[0]),
+            exclusions("", &[], &targets, &targets[0], false),
             ["benches", "examples", "src/cli/main.rs", "tests"]
         );
     }
@@ -235,11 +268,11 @@ mod tests {
             target("example", "examples/demo.rs"),
         ];
         assert_eq!(
-            exclusions("", &[], &targets, &targets[0]),
+            exclusions("", &[], &targets, &targets[0], false),
             ["benches", "examples"]
         );
         assert_eq!(
-            exclusions("", &[], &targets, &targets[1]),
+            exclusions("", &[], &targets, &targets[1], false),
             ["benches", "examples/demo.rs", "tests"]
         );
     }
@@ -253,7 +286,7 @@ mod tests {
             "app".to_string(),
         ];
         assert_eq!(
-            exclusions("crates/core", &others, &targets, &targets[0]),
+            exclusions("crates/core", &others, &targets, &targets[0], false),
             [
                 "crates/core/benches",
                 "crates/core/examples",
@@ -266,7 +299,7 @@ mod tests {
         let root = vec![target("lib", "src/lib.rs")];
         let others = [others.to_vec(), vec!["crates/core".to_string()]].concat();
         assert_eq!(
-            exclusions("", &others, &root, &root[0]),
+            exclusions("", &others, &root, &root[0], false),
             [
                 "app",
                 "benches",

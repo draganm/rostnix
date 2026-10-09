@@ -6,3 +6,13 @@ pub fn greet(who: &str, n: u32) -> String {
         s
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn greets() {
+        assert_eq!(greet("x", 1).to_lowercase(), "hello from x: 1");
+    }
+}

@@ -119,16 +119,33 @@ pub fn to_nix(graph: &Graph) -> String {
     }
     let roots: Vec<String> = graph.roots.iter().map(|key| unit_ref(key)).collect();
     line(format!("  roots = [ {} ];", roots.join(" ")));
+
+    for key in &graph.tests {
+        line(format!("  tests.{} = {};", quote(key), unit_ref(key)));
+    }
+    // No tests were asked for, or the selection has none.
+    if graph.tests.is_empty() {
+        line("  tests = { };".to_string());
+    }
+    line(format!("  buildUnits = {};", list(&graph.build_units)));
+    line(format!("  testUnits = {};", list(&graph.test_units)));
     line("}".to_string());
     out
 }
 
 fn compile(line: &mut impl FnMut(String), key: &str, unit: &CompileUnit) {
-    line(format!("  units.{} = b.compile {{", quote(key)));
+    // A test is compiled like anything else, and then run.
+    let builder = if unit.test.is_some() {
+        "test"
+    } else {
+        "compile"
+    };
+    line(format!("  units.{} = b.{builder} {{", quote(key)));
     line(format!("    name = {};", quote(&unit.name)));
     line(format!("    package = packages.{};", quote(&unit.package)));
     line(format!("    src = {};", src(&unit.src)));
     line(format!("    kind = {};", quote(unit.kind)));
+    line(format!("    targetKind = {};", quote(unit.target_kind)));
     line(format!("    crateName = {};", quote(&unit.crate_name)));
     line(format!("    targetName = {};", quote(&unit.target_name)));
     line(format!("    edition = {};", quote(&unit.edition)));
@@ -152,6 +169,11 @@ fn compile(line: &mut impl FnMut(String), key: &str, unit: &CompileUnit) {
             .map_or("null".to_string(), unit_ref)
     ));
     line(format!("    overrides = {};", list(&unit.overrides)));
+    if let Some(test) = &unit.test {
+        line(format!("    profileDir = {};", quote(&test.profile_dir)));
+        let executables: Vec<String> = test.executables.iter().map(|key| unit_ref(key)).collect();
+        line(format!("    executables = [ {} ];", executables.join(" ")));
+    }
     line("  };".to_string());
 }
 
@@ -176,7 +198,7 @@ fn run(line: &mut impl FnMut(String), key: &str, unit: &RunUnit) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{PackageNode, Source};
+    use crate::graph::{PackageNode, Source, TestInfo};
 
     #[test]
     fn quote_escapes_what_nix_would_read() {
@@ -260,6 +282,7 @@ mod tests {
                 package: "dep-1.0.0+x".into(),
                 src: SrcRef::Registry("dep-1.0.0+x".into()),
                 kind: "build-script",
+                target_kind: "custom-build",
                 crate_name: "build_script_build".into(),
                 target_name: "build-script-build".into(),
                 edition: "2021".into(),
@@ -281,6 +304,7 @@ mod tests {
                 deps: vec![],
                 build_script: None,
                 overrides: vec![],
+                test: None,
             }),
         );
         graph.units.insert(
@@ -307,6 +331,7 @@ mod tests {
                     exclude: vec!["tests".into()],
                 },
                 kind: "bin",
+                target_kind: "bin",
                 crate_name: "app".into(),
                 target_name: "app".into(),
                 edition: "2021".into(),
@@ -320,12 +345,14 @@ mod tests {
                 deps: vec![("dep".into(), "dep-1.0.0+x-build-script-aaaaaaaa".into())],
                 build_script: Some("dep-1.0.0+x-run-build-script-bbbbbbbb".into()),
                 overrides: vec!["dep".into()],
+                test: None,
             }),
         );
         graph
             .bins
             .insert("app".into(), "app-0.1.0-bin-app-cccccccc".into());
         graph.roots.push("app-0.1.0-bin-app-cccccccc".into());
+        graph.build_units = graph.units.keys().cloned().collect();
         graph
     }
 
@@ -350,6 +377,7 @@ mod tests {
     package = packages."dep-1.0.0+x";
     src = b.localSource { name = "rustsrc-app-0.1.0"; dir = "."; exclude = [ "tests" ]; };
     kind = "bin";
+    targetKind = "bin";
     crateName = "app";
     targetName = "app";
     edition = "2021";
@@ -369,6 +397,7 @@ mod tests {
     package = packages."dep-1.0.0+x";
     src = sources."dep-1.0.0+x";
     kind = "build-script";
+    targetKind = "custom-build";
     crateName = "build_script_build";
     targetName = "build-script-build";
     edition = "2021";
@@ -395,9 +424,50 @@ mod tests {
   };
   bins."app" = units."app-0.1.0-bin-app-cccccccc";
   roots = [ units."app-0.1.0-bin-app-cccccccc" ];
+  tests = { };
+  buildUnits = [ "app-0.1.0-bin-app-cccccccc" "dep-1.0.0+x-build-script-aaaaaaaa" "dep-1.0.0+x-run-build-script-bbbbbbbb" ];
+  testUnits = [ ];
 }
 "#;
         assert_eq!(to_nix(&sample()), expected);
+    }
+
+    // A test is a unit like any other, built by another builder, which is
+    // told what to put beside the test before running it.
+    #[test]
+    fn a_test_is_a_unit_with_what_it_runs_beside() {
+        let mut graph = sample();
+        let UnitNode::Compile(app) = &graph.units["app-0.1.0-bin-app-cccccccc"] else {
+            panic!()
+        };
+        let mut test = app.clone();
+        test.name = "rusttest-cli".into();
+        test.kind = "test";
+        test.target_kind = "test";
+        test.test = Some(TestInfo {
+            profile_dir: "release".into(),
+            executables: vec!["app-0.1.0-bin-app-cccccccc".into()],
+        });
+        graph.units.insert(
+            "app-0.1.0-test-cli-dddddddd".into(),
+            UnitNode::Compile(test),
+        );
+        graph.tests = vec!["app-0.1.0-test-cli-dddddddd".into()];
+        graph.test_units = graph.tests.clone();
+        let nix = to_nix(&graph);
+        for expected in [
+            "  units.\"app-0.1.0-test-cli-dddddddd\" = b.test {\n    name = \"rusttest-cli\";\n",
+            "    kind = \"test\";\n    targetKind = \"test\";\n",
+            "    overrides = [ \"dep\" ];\n    profileDir = \"release\";\n    \
+             executables = [ units.\"app-0.1.0-bin-app-cccccccc\" ];\n  };\n",
+            "  tests.\"app-0.1.0-test-cli-dddddddd\" = units.\"app-0.1.0-test-cli-dddddddd\";\n",
+            "\n  testUnits = [ \"app-0.1.0-test-cli-dddddddd\" ];\n",
+        ] {
+            assert!(nix.contains(expected), "no {expected:?} in:\n{nix}");
+        }
+        assert!(!nix.contains("tests = { };"), "{nix}");
+        // What is not a test is told nothing of the kind.
+        assert_eq!(nix.matches("profileDir").count(), 1);
     }
 
     // A library-only selection has no executables, and a project without
@@ -421,8 +491,8 @@ mod tests {
             return;
         }
         let expr = format!(
-            "let g = ({nix}) {{ fetchCrate = a: a; localSource = a: a; compile = a: a; runBuildScript = a: a; }}; \
-             in [ (g.bins == {{ }}) (g.sources == {{ }}) ]"
+            "let g = ({nix}) {{ fetchCrate = a: a; localSource = a: a; compile = a: a; runBuildScript = a: a; test = a: a; }}; \
+             in [ (g.bins == {{ }}) (g.sources == {{ }}) (g.tests == {{ }}) ]"
         );
         let output = std::process::Command::new("nix-instantiate")
             .args(["--eval", "--strict", "--json", "--expr", &expr])
@@ -435,7 +505,7 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8_lossy(&output.stdout).trim(),
-            "[true,true]"
+            "[true,true,true]"
         );
     }
 

@@ -32,6 +32,8 @@ pub struct Request {
     pub no_default_features: bool,
     pub profile: String,
     pub override_keys: Vec<String>,
+    /// Whether to plan the tests too.
+    pub do_check: bool,
 }
 
 impl Request {
@@ -47,6 +49,29 @@ impl Request {
         if self.no_default_features {
             args.push("--no-default-features".to_string());
         }
+        args
+    }
+
+    /// What `cargo test` is asked to plan: the tests of the selected
+    /// packages. `bins` and `examples` narrow what is installed, not what
+    /// is tested.
+    fn test_graph_args(&self) -> Vec<String> {
+        let mut args: Vec<String> = [
+            "test",
+            "--no-run",
+            "--unit-graph",
+            "-Z",
+            "unstable-options",
+            "--locked",
+            "--profile",
+            &self.profile,
+        ]
+        .map(String::from)
+        .to_vec();
+        for package in &self.packages {
+            args.extend(["--package".to_string(), package.clone()]);
+        }
+        args.extend(self.feature_args());
         args
     }
 
@@ -131,15 +156,23 @@ pub fn run(request: &str) -> Result<String> {
     let host = cargo.host()?;
     let cargo_version = cargo.version(&workspace)?;
 
-    let units: UnitGraph = serde_json::from_slice(
-        &cargo.output(&workspace, &request.unit_graph_args())?,
-    )
-    .map_err(|err| {
-        format!("cargo {cargo_version} printed a unit graph this version cannot read: {err}")
-    })?;
-    if units.version != 1 {
-        return Err(format!("cargo {cargo_version} prints version {} of the unit graph; this version reads version 1", units.version).into());
-    }
+    let plan = |args: &[String]| -> Result<UnitGraph> {
+        let units: UnitGraph =
+            serde_json::from_slice(&cargo.output(&workspace, args)?).map_err(|err| {
+                format!(
+                    "cargo {cargo_version} printed a unit graph this version cannot read: {err}"
+                )
+            })?;
+        if units.version != 1 {
+            return Err(format!("cargo {cargo_version} prints version {} of the unit graph; this version reads version 1", units.version).into());
+        }
+        Ok(units)
+    };
+    let units = plan(&request.unit_graph_args())?;
+    let test_units = request
+        .do_check
+        .then(|| plan(&request.test_graph_args()))
+        .transpose()?;
     let metadata: Metadata =
         serde_json::from_slice(&cargo.output(&workspace, &request.metadata_args(&host))?).map_err(
             |err| format!("cargo {cargo_version} printed metadata this version cannot read: {err}"),
@@ -147,6 +180,7 @@ pub fn run(request: &str) -> Result<String> {
 
     let graph = graph::build(&Inputs {
         units: &units,
+        test_units: test_units.as_ref(),
         metadata: &metadata,
         checksums: &checksums,
         src,
@@ -196,7 +230,7 @@ mod tests {
         serde_json::from_str(&format!(
             r#"{{"cargo":"/c","rustc":"/r","src":"/s","storeDir":"/nix/store","cargoRoot":".",
                 "packages":[],"bins":[],"examples":[],"features":[],"allFeatures":false,
-                "noDefaultFeatures":false,"profile":"release","overrideKeys":[]{extra}}}"#
+                "noDefaultFeatures":false,"profile":"release","overrideKeys":[],"doCheck":true{extra}}}"#
         ))
         .unwrap()
     }
@@ -232,6 +266,26 @@ mod tests {
             .metadata_args("h")
             .join(" ")
             .ends_with("--features x,dep/y --all-features --no-default-features"));
+    }
+
+    // Tests are those of the selected packages, with the features of the
+    // build. Naming a binary to install does not narrow them.
+    #[test]
+    fn tests_are_planned_for_the_selected_packages() {
+        let mut req = request("");
+        assert_eq!(
+            req.test_graph_args().join(" "),
+            "test --no-run --unit-graph -Z unstable-options --locked --profile release"
+        );
+        req.packages = vec!["a".into()];
+        req.bins = vec!["tool".into()];
+        req.examples = vec!["demo".into()];
+        req.features = vec!["x".into()];
+        req.profile = "thin".into();
+        assert_eq!(
+            req.test_graph_args().join(" "),
+            "test --no-run --unit-graph -Z unstable-options --locked --profile thin --package a --features x"
+        );
     }
 
     #[test]

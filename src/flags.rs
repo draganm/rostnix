@@ -16,6 +16,9 @@ pub struct UnitFlags<'a> {
     pub metadata: &'a str,
     /// Whether the package is one the build was asked for.
     pub primary: bool,
+    /// Whether a test of this target is run by the test harness, which is
+    /// the case unless the manifest says `harness = false`.
+    pub harness: bool,
 }
 
 /// The flags from `--crate-type` up to where cargo names the output
@@ -26,8 +29,12 @@ pub fn base_args(flags: &UnitFlags) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     let mut push = |parts: &[&str]| args.extend(parts.iter().map(|p| p.to_string()));
 
-    for crate_type in &unit.target.crate_types {
-        push(&["--crate-type", crate_type]);
+    // A test is an executable whatever its target is.
+    let test = unit.mode == "test";
+    if !test {
+        for crate_type in &unit.target.crate_types {
+            push(&["--crate-type", crate_type]);
+        }
     }
 
     let has_dylib = unit.target.crate_types.iter().any(|ct| ct == "dylib");
@@ -74,6 +81,12 @@ pub fn base_args(flags: &UnitFlags) -> Vec<String> {
         }
     } else if !profile.overflow_checks {
         push(&["-C", "overflow-checks=off"]);
+    }
+
+    if test && flags.harness {
+        push(&["--test"]);
+    } else if test {
+        push(&["--cfg", "test"]);
     }
 
     for feature in &unit.features {
@@ -125,6 +138,10 @@ mod tests {
     const HOST: &str = r#"{"name":"release","opt_level":"0","lto":"thin","codegen_units":null,
         "debuginfo":0,"split_debuginfo":null,"debug_assertions":false,"overflow_checks":false,
         "rpath":false,"panic":"unwind","strip":{"resolved":{"Named":"debuginfo"}}}"#;
+    // A release profile without LTO, as the fixtures have it.
+    const HOST_RELEASE_OPT: &str = r#"{"name":"release","opt_level":"3","lto":"false","codegen_units":null,
+        "debuginfo":0,"split_debuginfo":null,"debug_assertions":false,"overflow_checks":false,
+        "rpath":false,"panic":"unwind","strip":{"resolved":{"Named":"debuginfo"}}}"#;
     const DEV: &str = r#"{"name":"dev","opt_level":"0","lto":"false","codegen_units":null,
         "debuginfo":2,"split_debuginfo":"unpacked","debug_assertions":true,"overflow_checks":true,
         "rpath":false,"panic":"unwind","strip":{"deferred":"None"}}"#;
@@ -150,6 +167,7 @@ mod tests {
             lint_flags: &lints,
             metadata: "M",
             primary: false,
+            harness: true,
         })
         .join(" ")
     }
@@ -230,6 +248,68 @@ mod tests {
              -C metadata=M -C extra-filename=-M -C strip=debuginfo"
         );
         assert!(tail_args(&unit, true).is_empty());
+    }
+
+    // The expectations are what `cargo test -vv --profile release` printed
+    // for the hello and workspace fixtures.
+
+    #[test]
+    fn test_of_a_library() {
+        let mut unit = unit("lib", "lib", "ws_core", HOST_RELEASE_OPT, &[]);
+        unit.mode = "test".to_string();
+        assert_eq!(
+            args(
+                &unit,
+                Lto::OnlyObject,
+                &["loud"],
+                &["--deny=unused_must_use", "--forbid=unsafe_code"]
+            ),
+            "-C opt-level=3 -C embed-bitcode=no --deny=unused_must_use --forbid=unsafe_code --test \
+             --check-cfg cfg(docsrs,test) --check-cfg cfg(feature, values(\"loud\")) \
+             -C metadata=M -C extra-filename=-M -C strip=debuginfo"
+        );
+    }
+
+    #[test]
+    fn test_of_a_proc_macro_stays_dynamic() {
+        let mut unit = unit(
+            "proc-macro",
+            "proc-macro",
+            "ws_macros",
+            HOST_RELEASE_OPT,
+            &[],
+        );
+        unit.mode = "test".to_string();
+        assert_eq!(
+            args(&unit, Lto::OnlyObject, &[], &[]),
+            "-C prefer-dynamic -C opt-level=3 -C embed-bitcode=no --test \
+             --check-cfg cfg(docsrs,test) --check-cfg cfg(feature, values()) \
+             -C metadata=M -C extra-filename=-M -C strip=debuginfo"
+        );
+        assert_eq!(tail_args(&unit, true), ["--extern", "proc_macro"]);
+    }
+
+    #[test]
+    fn test_without_the_harness_gets_the_cfg_only() {
+        let mut unit = unit("test", "bin", "plain", HOST_RELEASE_OPT, &[]);
+        unit.mode = "test".to_string();
+        let declared: Vec<String> = Vec::new();
+        let flags = base_args(&UnitFlags {
+            unit: &unit,
+            lto: &Lto::OnlyObject,
+            declared_features: &declared,
+            lint_flags: &[],
+            metadata: "M",
+            primary: true,
+            harness: false,
+        })
+        .join(" ");
+        assert_eq!(
+            flags,
+            "-C opt-level=3 -C embed-bitcode=no --cfg test \
+             --check-cfg cfg(docsrs,test) --check-cfg cfg(feature, values()) \
+             -C metadata=M -C extra-filename=-M -C strip=debuginfo"
+        );
     }
 
     #[test]
