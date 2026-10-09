@@ -568,7 +568,7 @@ A key is a package name.
 
 | Attribute | Default | Meaning |
 |---|---|---|
-| `buildInputs` | `[ ]` | Libraries. The package's build-script run gets them, and so does every unit that links and has the package in its closure. |
+| `buildInputs` | `[ ]` | Libraries. The package's build-script run gets them; so does every build-script run that depends on it through `links`, directly or not; and so does every unit that links and has the package in its closure. |
 | `nativeBuildInputs` | `[ ]` | Tools the package's build script and rustc invocations run, such as `pkg-config`. |
 | `env` | `{ }` | Environment of the package's build script and of its rustc invocations. |
 | `extraSrc` | `[ ]` | Local packages only: files and directories, relative to `src`, added to the view of every unit of the package. |

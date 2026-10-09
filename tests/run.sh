@@ -176,12 +176,14 @@ check_override_unmatched() {
 }
 
 # Libraries of an overridden package reach every unit that links it, and
-# only those.
+# the build scripts that depend on its build script through `links`, as
+# consumer's does on bs-native's. Nothing else gets them.
 check_override_inputs() {
-  local got
+  local got want
   got="$(fixture_with buildscript '{
       crateOverrides = {
         libz-sys.buildInputs = [ pkgs.zlib ];
+        bs-native.buildInputs = [ pkgs.lz4 ];
         consumer.extraSrc = [ "shared" ];
       };
     }' '
@@ -189,10 +191,11 @@ check_override_inputs() {
         units = builtins.attrValues app.units;
         named = name: builtins.filter (u: u.name == name) units;
         inputs = name: toString (map (i: i.pname) (builtins.head (named name)).buildInputs);
-      in "bin: ${inputs "rustbin-consumer"}; script: ${inputs "rustbs-bs-native-0.1.0"}"
+      in "bin: ${inputs "rustbin-consumer"}; native run: ${inputs "rustbsrun-bs-native-0.1.0"}; consumer run: ${inputs "rustbsrun-consumer-0.1.0"}; zlib run: ${inputs "rustbsrun-libz-sys-1.1.29"}; script: ${inputs "rustbs-bs-native-0.1.0"}"
     ')" || fail "crateOverrides: buildInputs do not evaluate"
-  [ "$got" = "bin: zlib; script: " ] || fail "crateOverrides: units got the inputs [$got], want [bin: zlib; script: ]"
-  echo "ok: crateOverrides: buildInputs reach the units that link the package"
+  want="bin: lz4 zlib; native run: lz4; consumer run: lz4; zlib run: zlib; script: "
+  [ "$got" = "$want" ] || fail "crateOverrides: units got the inputs [$got], want [$want]"
+  echo "ok: crateOverrides: buildInputs reach the units that link the package and the build scripts that depend on its"
 }
 
 # With one executable, nix run finds it through meta.mainProgram.

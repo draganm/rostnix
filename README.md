@@ -138,7 +138,7 @@ rustEnv.buildRustApplication {
 
 | Attribute | Default | Meaning |
 |---|---|---|
-| `buildInputs` | `[ ]` | Libraries. The package's build-script run gets them, and so does every step that links the package. |
+| `buildInputs` | `[ ]` | Libraries. The package's build-script run gets them, and so do the build scripts that build against its native library (those that depend on it through `links`) and every step that links the package. |
 | `nativeBuildInputs` | `[ ]` | Tools the package's build script and rustc invocations run, such as `pkg-config`. |
 | `env` | `{ }` | Environment of the package's build script and of its rustc invocations. |
 | `extraSrc` | `[ ]` | Local packages only: files and directories, relative to `src`, that the package reads from outside what its steps see. |

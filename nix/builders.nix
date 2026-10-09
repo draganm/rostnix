@@ -107,10 +107,17 @@ in
 
   # One run of a build script. Build scripts compile C and look for
   # libraries, so they always get stdenv and their package's override.
+  #
+  # A script that depends on another through `links` builds against that
+  # package's native library, so it gets the libraries of that package's
+  # override too, and of whatever that one depends on in turn. Outside Nix
+  # those are simply installed where every compiler finds them.
   runBuildScript = node:
     let
       inherit (node) package;
       override = overrideOf package;
+      libraries = lib.unique ((override.buildInputs or [ ])
+        ++ lib.concatMap (dep: dep.unit.libraries) node.linksDeps);
     in
     stdenv.mkDerivation {
       inherit (node) name;
@@ -129,7 +136,8 @@ in
         overrideEnv = override.env or { };
       };
       nativeBuildInputs = override.nativeBuildInputs or [ ];
-      buildInputs = override.buildInputs or [ ];
+      buildInputs = libraries;
       buildCommand = "${builder} run-build-script";
+      passthru = { inherit libraries; };
     };
 }
