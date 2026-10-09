@@ -69,11 +69,26 @@ pub fn seed(store_dir: &str, crates: &[Crate]) -> crate::Result<()> {
 /// Adds the file with `nix store add` and returns the path it printed.
 fn add(krate: &Crate) -> Result<String, String> {
     if !krate.cache_file.exists() {
-        return Err(format!("{} is not in cargo's cache", krate.cache_file.display()));
+        return Err(format!(
+            "{} is not in cargo's cache",
+            krate.cache_file.display()
+        ));
     }
     let output = Command::new("nix")
-        .args(["--extra-experimental-features", "nix-command", "store", "add"])
-        .args(["--mode", "flat", "--hash-algo", "sha256", "--name", &krate.name])
+        .args([
+            "--extra-experimental-features",
+            "nix-command",
+            "store",
+            "add",
+        ])
+        .args([
+            "--mode",
+            "flat",
+            "--hash-algo",
+            "sha256",
+            "--name",
+            &krate.name,
+        ])
         .arg(&krate.cache_file)
         .output()
         .map_err(|err| format!("running nix: {err}"))?;

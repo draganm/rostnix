@@ -113,8 +113,14 @@ pub struct CompileRecord {
     pub artifact: String,
     /// The directories dependents pass as `-L dependency=`.
     pub transitive: Vec<String>,
-    /// The `-L` values of every build script in the unit's closure.
+    /// The `-L` values of every build script in the unit's closure: those
+    /// inside the `OUT_DIR` of the script that printed them, and the others.
     pub native: Vec<String>,
+    #[serde(rename = "nativeExternal", default)]
+    pub native_external: Vec<String>,
+    /// Linker arguments the build scripts in the closure ask of any cdylib.
+    #[serde(rename = "cdylibLinkArgs", default)]
+    pub cdylib_link_args: Vec<String>,
     /// What rustc ran with: the environment cargo would set, and what the
     /// package's override added to it.
     pub argv: Vec<String>,
@@ -158,7 +164,8 @@ pub const RECORD_FILE: &str = "unit.json";
 
 pub fn read_record<R: DeserializeOwned>(unit_out: &str) -> Result<R> {
     let file = Path::new(unit_out).join(RECORD_FILE);
-    let text = fs::read_to_string(&file).map_err(|err| format!("reading {}: {err}", file.display()))?;
+    let text =
+        fs::read_to_string(&file).map_err(|err| format!("reading {}: {err}", file.display()))?;
     serde_json::from_str(&text).map_err(|err| format!("parsing {}: {err}", file.display()).into())
 }
 

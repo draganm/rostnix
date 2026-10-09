@@ -143,8 +143,9 @@ rustEnv.buildRustApplication {
 | `env` | `{ }` | Environment of the package's build script and of its rustc invocations. |
 | `extraSrc` | `[ ]` | Local packages only: files and directories, relative to `src`, that the package reads from outside what its steps see. |
 
-Any other attribute in an entry is an error, and a key that names no
-package of the build gets a warning, because such an entry changes nothing.
+Any other attribute in an entry is an error, as is `extraSrc` for a crate
+that is not part of the source tree. A key that names no package of the
+build gets a warning, because such an entry changes nothing.
 
 ### What a step sees of a local package
 
@@ -155,7 +156,8 @@ directory, narrowed by three rules:
 - `examples/`, `tests/` and `benches/` are left out, unless the step builds
   an example, test or bench.
 - The root files of the package's other binaries, examples, tests and
-  benches are left out.
+  benches are left out. A build script's run still sees them, since build
+  scripts read source files on their own.
 
 Editing `src/main.rs` therefore rebuilds the binary and not the library,
 and editing a test rebuilds nothing. A step that reads a file outside this
@@ -192,7 +194,7 @@ Tests (`doCheck`, `checkFlags` and `skipTests` are accepted and ignored),
 dependencies from git repositories and from registries other than
 crates.io, path dependencies outside `src`, `rustflags` and `[env]` from
 `.cargo/config.toml`, cross-compilation, installing `cdylib` and `staticlib`
-targets, doc tests and benches. Git and registry dependencies, path
+targets, dependencies built as Rust `dylib`s, doc tests and benches. Git and registry dependencies, path
 dependencies outside `src` and builds for another target are rejected
 during evaluation with a message naming them.
 

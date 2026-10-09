@@ -44,7 +44,11 @@ fn base32(bytes: &[u8]) -> String {
         .map(|n| {
             let (i, j) = (n * 5 / 8, n * 5 % 8);
             let low = bytes[i] >> j;
-            let high = if j > 3 { bytes.get(i + 1).map_or(0, |b| b << (8 - j)) } else { 0 };
+            let high = if j > 3 {
+                bytes.get(i + 1).map_or(0, |b| b << (8 - j))
+            } else {
+                0
+            };
             BASE32[((low | high) & 0x1f) as usize] as char
         })
         .collect()
@@ -63,12 +67,18 @@ mod tests {
             "anyhow-1.0.104.crate",
             "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470",
         );
-        assert_eq!(path, "/nix/store/7xybb3ddg063d2g44a5sc5rf6rdz77dc-anyhow-1.0.104.crate");
+        assert_eq!(
+            path,
+            "/nix/store/7xybb3ddg063d2g44a5sc5rf6rdz77dc-anyhow-1.0.104.crate"
+        );
     }
 
     #[test]
     fn sanitize_keeps_semver_and_replaces_the_rest() {
-        assert_eq!(sanitize_name("lz4-sys-1.11.1+lz4-1.10.0.crate"), "lz4-sys-1.11.1+lz4-1.10.0.crate");
+        assert_eq!(
+            sanitize_name("lz4-sys-1.11.1+lz4-1.10.0.crate"),
+            "lz4-sys-1.11.1+lz4-1.10.0.crate"
+        );
         assert_eq!(sanitize_name("a b@c/d"), "a-b-c-d");
         assert_eq!(sanitize_name(".hidden"), "_hidden");
     }

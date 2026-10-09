@@ -49,7 +49,9 @@ const OLD_RESERVED: &[&str] = &[
 fn key_value<'a>(line: &str, data: &'a str, form: &str) -> Result<(&'a str, &'a str)> {
     match data.split_once('=') {
         Some((key, value)) => Ok((key, value.trim_end())),
-        None => Err(format!("invalid build script output `{line}`: expected `{form}KEY=VALUE`").into()),
+        None => {
+            Err(format!("invalid build script output `{line}`: expected `{form}KEY=VALUE`").into())
+        }
     }
 }
 
@@ -57,11 +59,15 @@ fn key_value<'a>(line: &str, data: &'a str, form: &str) -> Result<(&'a str, &'a 
 /// cargo reads them.
 pub fn parse_output(stdout: &str) -> Result<ScriptOutput> {
     let mut out = ScriptOutput::default();
-    for line in stdout.lines() {
+    // Cargo trims each line before it looks for the prefix.
+    for line in stdout.lines().map(str::trim) {
         let (key, value) = if let Some(data) = line.strip_prefix("cargo::") {
             key_value(line, data, "cargo::")?
         } else if let Some(data) = line.strip_prefix("cargo:") {
-            if OLD_RESERVED.iter().any(|key| data.strip_prefix(key).is_some_and(|rest| rest.starts_with('='))) {
+            if OLD_RESERVED.iter().any(|key| {
+                data.strip_prefix(key)
+                    .is_some_and(|rest| rest.starts_with('='))
+            }) {
                 key_value(line, data, "cargo:")?
             } else {
                 ("metadata", data)
@@ -71,11 +77,15 @@ pub fn parse_output(stdout: &str) -> Result<ScriptOutput> {
         };
 
         let mut link_arg = |target: &str, arg: &str| {
-            out.link_args.push(LinkArg { target: target.to_string(), arg: arg.to_string() })
+            out.link_args.push(LinkArg {
+                target: target.to_string(),
+                arg: arg.to_string(),
+            })
         };
         match key {
             "rustc-flags" => {
-                let (paths, links) = parse_rustc_flags(value).map_err(|err| format!("{err} in `{line}`"))?;
+                let (paths, links) =
+                    parse_rustc_flags(value).map_err(|err| format!("{err} in `{line}`"))?;
                 out.library_paths.extend(paths);
                 out.library_links.extend(links);
             }
@@ -84,9 +94,9 @@ pub fn parse_output(stdout: &str) -> Result<ScriptOutput> {
             "rustc-link-arg-cdylib" | "rustc-cdylib-link-arg" => link_arg("cdylib", value),
             "rustc-link-arg-bins" => link_arg("bins", value),
             "rustc-link-arg-bin" => {
-                let (bin, arg) = value
-                    .split_once('=')
-                    .ok_or_else(|| format!("invalid build script output `{line}`: expected `BIN=ARG`"))?;
+                let (bin, arg) = value.split_once('=').ok_or_else(|| {
+                    format!("invalid build script output `{line}`: expected `BIN=ARG`")
+                })?;
                 link_arg(&format!("bin:{bin}"), arg);
             }
             "rustc-link-arg-tests" => link_arg("tests", value),
@@ -96,9 +106,9 @@ pub fn parse_output(stdout: &str) -> Result<ScriptOutput> {
             "rustc-cfg" => out.cfgs.push(value.to_string()),
             "rustc-check-cfg" => out.check_cfgs.push(value.to_string()),
             "rustc-env" => {
-                let (name, val) = value
-                    .split_once('=')
-                    .ok_or_else(|| format!("invalid build script output `{line}`: expected `VAR=VALUE`"))?;
+                let (name, val) = value.split_once('=').ok_or_else(|| {
+                    format!("invalid build script output `{line}`: expected `VAR=VALUE`")
+                })?;
                 out.env.push((name.to_string(), val.to_string()));
             }
             "warning" => out.warnings.push(value.to_string()),
@@ -106,12 +116,17 @@ pub fn parse_output(stdout: &str) -> Result<ScriptOutput> {
             // Nix decides when a derivation is rebuilt.
             "rerun-if-changed" | "rerun-if-env-changed" => {}
             "metadata" => {
-                let (name, val) = value
-                    .split_once('=')
-                    .ok_or_else(|| format!("invalid build script output `{line}`: expected `KEY=VALUE` metadata"))?;
-                out.metadata.push((name.to_string(), val.trim_end().to_string()));
+                let (name, val) = value.split_once('=').ok_or_else(|| {
+                    format!("invalid build script output `{line}`: expected `KEY=VALUE` metadata")
+                })?;
+                out.metadata
+                    .push((name.to_string(), val.trim_end().to_string()));
             }
-            other => return Err(format!("unknown build script instruction `{other}` in `{line}`").into()),
+            other => {
+                return Err(
+                    format!("unknown build script instruction `{other}` in `{line}`").into(),
+                )
+            }
         }
     }
     Ok(out)
@@ -125,33 +140,64 @@ fn parse_rustc_flags(value: &str) -> std::result::Result<(Vec<String>, Vec<Strin
         let (flag, attached) = match word {
             w if w.starts_with("-l") => ("-l", &w[2..]),
             w if w.starts_with("-L") => ("-L", &w[2..]),
-            other => return Err(format!("only -l and -L are allowed in rustc-flags, found `{other}`")),
+            other => {
+                return Err(format!(
+                    "only -l and -L are allowed in rustc-flags, found `{other}`"
+                ))
+            }
         };
         let arg = if attached.is_empty() {
-            words.next().ok_or_else(|| format!("`{flag}` has no value"))?
+            words
+                .next()
+                .ok_or_else(|| format!("`{flag}` has no value"))?
         } else {
             attached
         };
-        if flag == "-l" { links.push(arg.to_string()) } else { paths.push(arg.to_string()) }
+        if flag == "-l" {
+            links.push(arg.to_string())
+        } else {
+            paths.push(arg.to_string())
+        }
     }
     Ok((paths, links))
 }
 
 /// A feature or cfg name as cargo puts it in a variable name.
 pub fn envify(name: &str) -> String {
-    name.chars().map(|c| if c == '-' { '_' } else { c.to_ascii_uppercase() }).collect()
+    name.chars()
+        .map(|c| {
+            if c == '-' {
+                '_'
+            } else {
+                c.to_ascii_uppercase()
+            }
+        })
+        .collect()
 }
 
 /// The `CARGO_CFG_*` variables: what `rustc --print=cfg` printed, plus the
 /// features and the profile's debug assertions, which rustc cannot know.
-pub fn cfg_env(print_cfg: &str, features: &[String], debug_assertions: bool) -> BTreeMap<String, String> {
+pub fn cfg_env(
+    print_cfg: &str,
+    features: &[String],
+    debug_assertions: bool,
+) -> BTreeMap<String, String> {
     let mut cfgs: BTreeMap<String, Vec<String>> = BTreeMap::new();
     cfgs.insert("feature".to_string(), features.to_vec());
-    for line in print_cfg.lines().map(str::trim).filter(|line| !line.is_empty()) {
+    for line in print_cfg
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
         match line.split_once('=') {
             Some((key, value)) => {
-                let value = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(value);
-                cfgs.entry(key.to_string()).or_default().push(value.to_string());
+                let value = value
+                    .strip_prefix('"')
+                    .and_then(|v| v.strip_suffix('"'))
+                    .unwrap_or(value);
+                cfgs.entry(key.to_string())
+                    .or_default()
+                    .push(value.to_string());
             }
             // rustc reports its own default here, not the profile's setting.
             None if line == "debug_assertions" => {}
@@ -163,7 +209,9 @@ pub fn cfg_env(print_cfg: &str, features: &[String], debug_assertions: bool) -> 
     if debug_assertions {
         cfgs.insert("debug_assertions".to_string(), Vec::new());
     }
-    cfgs.into_iter().map(|(key, values)| (format!("CARGO_CFG_{}", envify(&key)), values.join(","))).collect()
+    cfgs.into_iter()
+        .map(|(key, values)| (format!("CARGO_CFG_{}", envify(&key)), values.join(",")))
+        .collect()
 }
 
 pub fn run() -> Result<()> {
@@ -185,30 +233,49 @@ pub fn run() -> Result<()> {
         return Err(format!("{} --print=cfg failed", attrs.rustc).into());
     }
 
-    let jobs = match std::env::var("NIX_BUILD_CORES").ok().and_then(|n| n.parse::<usize>().ok()) {
+    let jobs = match std::env::var("NIX_BUILD_CORES")
+        .ok()
+        .and_then(|n| n.parse::<usize>().ok())
+    {
         Some(n) if n > 0 => n,
         _ => std::thread::available_parallelism().map_or(1, usize::from),
     };
 
     let mut env = node.env.clone();
-    env.extend(cfg_env(&String::from_utf8_lossy(&print_cfg.stdout), &node.features, node.debug_assertions));
+    env.extend(cfg_env(
+        &String::from_utf8_lossy(&print_cfg.stdout),
+        &node.features,
+        node.debug_assertions,
+    ));
     for feature in &node.features {
-        env.insert(format!("CARGO_FEATURE_{}", envify(feature)), "1".to_string());
+        env.insert(
+            format!("CARGO_FEATURE_{}", envify(feature)),
+            "1".to_string(),
+        );
     }
     for dep in &node.links_deps {
         let record: RunRecord = node::read_record(&dep.path)?;
         for (key, value) in &record.metadata {
-            env.insert(format!("DEP_{}_{}", envify(&dep.links), envify(key)), value.clone());
+            env.insert(
+                format!("DEP_{}_{}", envify(&dep.links), envify(key)),
+                value.clone(),
+            );
         }
     }
     env.insert("OUT_DIR".to_string(), out_dir.clone());
     env.insert("CARGO_MANIFEST_DIR".to_string(), pkg_root.clone());
-    env.insert("CARGO_MANIFEST_PATH".to_string(), join(&pkg_root, "Cargo.toml"));
+    env.insert(
+        "CARGO_MANIFEST_PATH".to_string(),
+        join(&pkg_root, "Cargo.toml"),
+    );
     env.insert("NUM_JOBS".to_string(), jobs.to_string());
     env.insert("RUSTC".to_string(), attrs.rustc.clone());
     env.insert(
         "RUSTDOC".to_string(),
-        Path::new(&attrs.rustc).with_file_name("rustdoc").to_string_lossy().into_owned(),
+        Path::new(&attrs.rustc)
+            .with_file_name("rustdoc")
+            .to_string_lossy()
+            .into_owned(),
     );
     env.insert("CARGO".to_string(), attrs.cargo.clone());
     env.insert("CARGO_ENCODED_RUSTFLAGS".to_string(), String::new());
@@ -272,7 +339,10 @@ mod tests {
     use super::*;
 
     fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
-        items.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        items
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -305,12 +375,22 @@ mod tests {
             assert_eq!(out.cfgs, ["has_foo"]);
             assert_eq!(out.check_cfgs, ["cfg(has_foo)"]);
             assert_eq!(out.env, pairs(&[("NOTE", "a=b")]));
-            let args: Vec<String> = out.link_args.iter().map(|a| format!("{}={}", a.target, a.arg)).collect();
+            let args: Vec<String> = out
+                .link_args
+                .iter()
+                .map(|a| format!("{}={}", a.target, a.arg))
+                .collect();
             assert_eq!(
                 args,
                 [
-                    "all=-all", "bins=-bins", "bin:tool=-one=1", "cdylib=-cdylib", "cdylib=-cdylib-old",
-                    "tests=-tests", "benches=-benches", "examples=-examples"
+                    "all=-all",
+                    "bins=-bins",
+                    "bin:tool=-one=1",
+                    "cdylib=-cdylib",
+                    "cdylib=-cdylib-old",
+                    "tests=-tests",
+                    "benches=-benches",
+                    "examples=-examples"
                 ]
             );
             assert_eq!(out.warnings, ["careful"]);
@@ -320,13 +400,21 @@ mod tests {
 
     #[test]
     fn metadata_in_both_forms() {
-        let out = parse_output("cargo::metadata=answer=42\ncargo:include=/some/dir \ncargo:root=/r=x").unwrap();
-        assert_eq!(out.metadata, pairs(&[("answer", "42"), ("include", "/some/dir"), ("root", "/r=x")]));
+        let out =
+            parse_output("cargo::metadata=answer=42\ncargo:include=/some/dir \ncargo:root=/r=x")
+                .unwrap();
+        assert_eq!(
+            out.metadata,
+            pairs(&[("answer", "42"), ("include", "/some/dir"), ("root", "/r=x")])
+        );
     }
 
     #[test]
     fn error_is_a_directive_only_in_the_new_form() {
-        assert_eq!(parse_output("cargo::error=broken").unwrap().errors, ["broken"]);
+        assert_eq!(
+            parse_output("cargo::error=broken").unwrap().errors,
+            ["broken"]
+        );
         let old = parse_output("cargo:error=broken").unwrap();
         assert!(old.errors.is_empty());
         assert_eq!(old.metadata, pairs(&[("error", "broken")]));
@@ -334,8 +422,22 @@ mod tests {
 
     #[test]
     fn noise_is_ignored() {
-        let out = parse_output("compiling foo.c\n  cargo:rustc-cfg=indented\ncargo is nice\n\nTARGET = Some(x)").unwrap();
+        let out = parse_output(
+            "compiling foo.c\nsee cargo:rustc-cfg=inline\ncargo is nice\n\nTARGET = Some(x)",
+        )
+        .unwrap();
         assert_eq!(out, ScriptOutput::default());
+    }
+
+    // Cargo honours a directive that is indented.
+    #[test]
+    fn indented_directives_count() {
+        let out =
+            parse_output("  cargo:rustc-cfg=spaces\n\tcargo::rustc-env=K=V  \r\n cargo:key=value")
+                .unwrap();
+        assert_eq!(out.cfgs, ["spaces"]);
+        assert_eq!(out.env, pairs(&[("K", "V")]));
+        assert_eq!(out.metadata, pairs(&[("key", "value")]));
     }
 
     #[test]

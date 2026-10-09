@@ -323,12 +323,14 @@ and builders cannot drift and carries no version number.
 Cargo runs with a clean environment and a private cargo home, so the same
 source plans to the same graph in every shell.
 
-- **Carried over** from the caller: `HOME`, `PATH`, `TMPDIR`, the proxy
-  variables, the certificate variables (`SSL_CERT_FILE`, `NIX_SSL_CERT_FILE`,
-  `CURL_CA_BUNDLE`), and `CARGO_HTTP_*` and `CARGO_NET_*`.
+- **Carried over** from the caller: `HOME`, `USER`, `LOGNAME`, `PATH`,
+  `TMPDIR`, the proxy variables, the certificate variables (`SSL_CERT_FILE`,
+  `NIX_SSL_CERT_FILE`, `CURL_CA_BUNDLE`), and `CARGO_HTTP_*` and
+  `CARGO_NET_*`.
 - **Set by the tool:** `CARGO_HOME` (the private home), `RUSTC`,
   `RUSTC_BOOTSTRAP=1`, `CARGO_TARGET_DIR` (a temporary directory that stays
-  empty) and `CARGO_GC_AUTO_FREQUENCY=never`.
+  empty), `CARGO_GC_AUTO_FREQUENCY=never` and
+  `CARGO_TERM_PROGRESS_WHEN=never`.
 - **Dropped:** everything else, among it `RUSTFLAGS`, `CARGO_BUILD_*`,
   `CARGO_PROFILE_*` and `RUSTC_WRAPPER`.
 
@@ -365,7 +367,8 @@ at build time, `rustflags` and `[env]`, is not applied before stage 3.
 
 For each registry package that owns a unit:
 
-1. **Checksum.** Taken from the package's entry in `Cargo.lock`.
+1. **Checksum.** Taken from the package's entry in `Cargo.lock`, or from
+   the `[metadata]` table of a lockfile in the first format.
 2. **Store path.** Fixed-output, flat SHA-256, name `<name>-<version>.crate`,
    under `storeDir`. The tool computes it from the checksum; nothing is
    hashed.
@@ -398,9 +401,17 @@ package directory, narrowed by three rules:
 
 1. Directories of other packages inside it are left out.
 2. `examples/`, `tests/` and `benches/` are left out, unless the unit is
-   itself an example, a test or a bench; then its own directory stays.
-3. The root file of every other binary, example, test and bench is left out,
-   and its directory when that root is a `main.rs` in a directory of its own.
+   itself an example, a test or a bench, or has its root in one of them;
+   then that directory stays.
+3. The root file of every other binary, example, test and bench is left out.
+   Where cargo found such a target as a directory, `src/bin/<name>/main.rs`
+   and its like under `examples/`, `tests/` and `benches/`, the directory is
+   left out. A `main.rs` anywhere else hides only itself, since its
+   directory may hold other targets' modules.
+
+A build-script run is exempt from the third rule. Build scripts read source
+files that rustc is never told about, the roots of the package's
+executables among them, as `cxx_build::bridge("src/main.rs")` does.
 
 For core-rs the library sees the package without `examples`, `tests` and
 `benches`, and the example `amber-store` sees it without `tests`, `benches`
@@ -452,6 +463,12 @@ dependencies, and never includes a build script's.
 
 The same file carries the library search paths (`-L`) printed by every build
 script in the unit's closure, which cargo passes to every dependent rustc.
+They keep cargo's order: the unit's own script, then its dependencies' by
+package, and across all of them the paths inside the `OUT_DIR` of the script
+that printed them before the others, so that a library a script built wins
+over one of the same name found elsewhere. The file also carries the linker
+arguments scripts ask of cdylibs, which cargo passes to every cdylib that
+has the script's package in its closure.
 
 **Linking.** A unit links when it has a crate type of `bin`, `proc-macro`,
 `cdylib` or `dylib`. Units that do not link are a bare `derivation` whose
@@ -517,7 +534,11 @@ across machines. It is not cargo's value.
 
 **Path remapping.** Each source store path is remapped to
 `<name>-<version>`, so panic messages and debug information do not mention
-the store and an executable does not keep its sources alive.
+the store and an executable does not keep its sources alive. The `OUT_DIR`
+of the package's build script is remapped to `<name>-<version>/out` for the
+same reason: code generated there is compiled from there, and a panic in it
+would otherwise name the script's run, whose `unit.json` refers to the
+script, the compiler and everything the script was built from.
 
 **Environment.** rustc gets the variables cargo sets: `CARGO_PKG_*`,
 `CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_PATH`, `CARGO_CRATE_NAME`,
@@ -533,7 +554,8 @@ package has a build script, and what that script set with `rustc-env`.
 enabled feature, and `CARGO_CFG_*` from `rustc --print=cfg`, queried in the
 derivation as cargo queries it.
 
-It reads `cargo::` and `cargo:` lines from the script's stdout:
+It reads `cargo::` and `cargo:` lines from the script's stdout, ignoring
+whitespace around a line as cargo does:
 
 | Directive | Effect |
 |---|---|
@@ -573,8 +595,11 @@ A key is a package name.
 | `env` | `{ }` | Environment of the package's build script and of its rustc invocations. |
 | `extraSrc` | `[ ]` | Local packages only: files and directories, relative to `src`, added to the view of every unit of the package. |
 
-A package with an entry builds all its units with stdenv. Any other
-attribute is an error. A key that names no package of the build gets a
+A package with an entry builds all its units with stdenv. `env` values
+become strings as `toString` makes them, and an `extraSrc` path may be
+written with a leading `./` or a trailing `/`. `extraSrc` on a package that
+is not local is an error, because it would do nothing. Any other attribute
+is an error. A key that names no package of the build gets a
 warning, because such an entry changes nothing. It is not an error because
 the same key may match on another platform or with other features.
 
@@ -599,6 +624,9 @@ means both sides have the same units. Normalising removes these differences:
   cargo's own bookkeeping;
 - `--extern` naming an `.rmeta` under cargo, which pipelines, and the rlib
   under rostnix;
+- the order of flags, except among lints and among the `-L` and `-l` flags
+  from build scripts, where order decides which lint level or which library
+  wins;
 - `--remap-path-prefix`, which rostnix adds;
 - `--cap-lints warn`, which cargo passes for foreign packages in place of
   `allow` because `-vv` asks to see their warnings;
@@ -678,9 +706,13 @@ non-zero. Nix then reports that the program failed.
 | Pre-seeded path differs from the computed one | Names the crate and its cache file, and says the file does not match `Cargo.lock`. |
 | `nix` missing or `nix store add` fails | Warning only; the download derivation covers it. |
 | A unit of a kind or mode this version does not build | Names the unit and its mode. |
+| An example that is not an executable | Names the example and its crate type. |
+| A target whose root file is outside its package directory | Names the target and the file. |
+| Two selected executables with one name | Names both units and says to select one. |
 | A unit planned for another target, before stage 4 | Names the target and says cross-compilation is not supported yet. |
 | The selection builds no binary or example | `buildRustApplication` throws, naming `bins` and `examples`. |
 | Unknown `crateOverrides` attribute | `buildRustApplication` throws, naming it and the attributes an entry takes. |
+| `extraSrc` on a package that is not local | `buildRustApplication` throws, naming the entry. |
 | A build script fails or prints `cargo::error` | The run derivation fails with the script's output in its log. |
 
 ## Not in this version
@@ -688,7 +720,19 @@ non-zero. Nix then reports that the program failed.
 Doc tests, benches, `cargo doc`, workspaces whose root is outside `src`,
 `vendor` directories and source replacement, artifact dependencies,
 `build-std`, `-Z` features other than the unit graph, content-addressed
-derivations, sccache or any compiler wrapper, and Windows.
+derivations, sccache or any compiler wrapper, dependencies built as Rust
+`dylib`s, and Windows.
+
+Known gaps, none of which the fixtures meet:
+
+- A custom profile defined in cargo configuration rather than in
+  `Cargo.toml` is taken to descend from `release` when a build script is
+  told `PROFILE`.
+- A local path dependency that belongs to another workspace gets this
+  workspace's `[workspace.lints]` when it says `lints.workspace = true`.
+- On Linux, C objects a build script compiles with debug information may
+  name their sources in the store, which the executable then refers to.
+  Linux is untested as a whole.
 
 ## Testing rostnix
 

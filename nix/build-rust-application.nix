@@ -65,9 +65,19 @@ let
   unmatchedOverrides = map (key: "crateOverrides.${key}")
     (lib.filter (key: !lib.elem key takenKeys) (lib.attrNames crateOverrides));
 
+  # extraSrc widens what a local package sees of the source tree. A crate
+  # from a registry has its own source, so the entry would do nothing.
+  foreignExtraSrc = map (package: "crateOverrides.${package.override}.extraSrc")
+    (lib.filter
+      (package: package.override != null && !package.local
+        && (crateOverrides.${package.override}.extraSrc or [ ]) != [ ])
+      (lib.attrValues graph.packages));
+
   checked =
     assert lib.assertMsg (unknownOverrides == [ ])
       "rostnix: unknown ${lib.concatStringsSep ", " unknownOverrides}; a crateOverrides entry takes ${lib.concatStringsSep ", " overrideAttrs}";
+    assert lib.assertMsg (foreignExtraSrc == [ ])
+      "rostnix: ${lib.concatStringsSep ", " foreignExtraSrc} is set for a package that is not part of the source tree; extraSrc adds files of the source tree to a local package";
     assert lib.assertMsg (graph.bins != { })
       "rostnix: the selection builds no binary and no example, so there is nothing to install; name what to build with `bins` or `examples`";
     lib.warnIf (unmatchedOverrides != [ ])

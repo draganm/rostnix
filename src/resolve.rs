@@ -51,11 +51,22 @@ impl Request {
     }
 
     fn unit_graph_args(&self) -> Vec<String> {
-        let mut args: Vec<String> =
-            ["build", "--unit-graph", "-Z", "unstable-options", "--locked", "--profile", &self.profile]
-                .map(String::from)
-                .to_vec();
-        for (flag, values) in [("--package", &self.packages), ("--bin", &self.bins), ("--example", &self.examples)] {
+        let mut args: Vec<String> = [
+            "build",
+            "--unit-graph",
+            "-Z",
+            "unstable-options",
+            "--locked",
+            "--profile",
+            &self.profile,
+        ]
+        .map(String::from)
+        .to_vec();
+        for (flag, values) in [
+            ("--package", &self.packages),
+            ("--bin", &self.bins),
+            ("--example", &self.examples),
+        ] {
             for value in values {
                 args.extend([flag.to_string(), value.clone()]);
             }
@@ -65,8 +76,16 @@ impl Request {
     }
 
     fn metadata_args(&self, host: &str) -> Vec<String> {
-        let mut args: Vec<String> =
-            ["metadata", "--format-version", "1", "--locked", "--filter-platform", host].map(String::from).to_vec();
+        let mut args: Vec<String> = [
+            "metadata",
+            "--format-version",
+            "1",
+            "--locked",
+            "--filter-platform",
+            host,
+        ]
+        .map(String::from)
+        .to_vec();
         args.extend(self.feature_args());
         args
     }
@@ -75,22 +94,36 @@ impl Request {
 /// `"."`, `"./a/"` and the like as a path relative to the source root, with
 /// `""` for the root.
 fn normalize_dir(dir: &str) -> String {
-    dir.split('/').filter(|part| !part.is_empty() && *part != ".").collect::<Vec<_>>().join("/")
+    dir.split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Resolves the request given as JSON and returns the graph as Nix.
 pub fn run(request: &str) -> Result<String> {
-    let request: Request =
-        serde_json::from_str(request).map_err(|err| format!("the resolve request is not what this version expects: {err}"))?;
+    let request: Request = serde_json::from_str(request)
+        .map_err(|err| format!("the resolve request is not what this version expects: {err}"))?;
     let src = request.src.trim_end_matches('/');
     let cargo_root = normalize_dir(&request.cargo_root);
-    let workspace: PathBuf = if cargo_root.is_empty() { src.into() } else { Path::new(src).join(&cargo_root) };
+    let workspace: PathBuf = if cargo_root.is_empty() {
+        src.into()
+    } else {
+        Path::new(src).join(&cargo_root)
+    };
     if !workspace.join("Cargo.toml").exists() {
-        return Err(format!("there is no Cargo.toml in {}; set cargoRoot to the directory that holds it", workspace.display()).into());
+        return Err(format!(
+            "there is no Cargo.toml in {}; set cargoRoot to the directory that holds it",
+            workspace.display()
+        )
+        .into());
     }
     let lock_file = workspace.join("Cargo.lock");
     let lock = fs::read_to_string(&lock_file).map_err(|err| {
-        format!("reading {}: {err}; commit a Cargo.lock, it is where the crate hashes come from", lock_file.display())
+        format!(
+            "reading {}: {err}; commit a Cargo.lock, it is where the crate hashes come from",
+            lock_file.display()
+        )
     })?;
     let checksums = Checksums::parse(&lock)?;
 
@@ -98,13 +131,19 @@ pub fn run(request: &str) -> Result<String> {
     let host = cargo.host()?;
     let cargo_version = cargo.version(&workspace)?;
 
-    let units: UnitGraph = serde_json::from_slice(&cargo.output(&workspace, &request.unit_graph_args())?)
-        .map_err(|err| format!("cargo {cargo_version} printed a unit graph this version cannot read: {err}"))?;
+    let units: UnitGraph = serde_json::from_slice(
+        &cargo.output(&workspace, &request.unit_graph_args())?,
+    )
+    .map_err(|err| {
+        format!("cargo {cargo_version} printed a unit graph this version cannot read: {err}")
+    })?;
     if units.version != 1 {
         return Err(format!("cargo {cargo_version} prints version {} of the unit graph; this version reads version 1", units.version).into());
     }
-    let metadata: Metadata = serde_json::from_slice(&cargo.output(&workspace, &request.metadata_args(&host))?)
-        .map_err(|err| format!("cargo {cargo_version} printed metadata this version cannot read: {err}"))?;
+    let metadata: Metadata =
+        serde_json::from_slice(&cargo.output(&workspace, &request.metadata_args(&host))?).map_err(
+            |err| format!("cargo {cargo_version} printed metadata this version cannot read: {err}"),
+        )?;
 
     let graph = graph::build(&Inputs {
         units: &units,
@@ -189,12 +228,17 @@ mod tests {
              --bin tool --example demo --features x,dep/y --no-default-features"
         );
         req.all_features = true;
-        assert!(req.metadata_args("h").join(" ").ends_with("--features x,dep/y --all-features --no-default-features"));
+        assert!(req
+            .metadata_args("h")
+            .join(" ")
+            .ends_with("--features x,dep/y --all-features --no-default-features"));
     }
 
     #[test]
     fn an_unknown_request_field_is_refused() {
-        let err = run(r#"{"cargo":"/c","surprise":1}"#).unwrap_err().to_string();
+        let err = run(r#"{"cargo":"/c","surprise":1}"#)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("resolve request"), "{err}");
     }
 

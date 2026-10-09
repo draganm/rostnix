@@ -33,7 +33,10 @@ impl Lto {
             Lto::OnlyBitcode => &["linker-plugin-lto"],
             Lto::OnlyObject => &["embed-bitcode=no"],
         };
-        flags.iter().flat_map(|flag| ["-C".to_string(), flag.to_string()]).collect()
+        flags
+            .iter()
+            .flat_map(|flag| ["-C".to_string(), flag.to_string()])
+            .collect()
     }
 }
 
@@ -63,7 +66,9 @@ pub fn generate(graph: &UnitGraph) -> Vec<Lto> {
     }
     // Every unit is reachable from a root. One that were not would be
     // linked nowhere, and plain object code is the safe answer.
-    map.into_iter().map(|lto| lto.unwrap_or(Lto::OnlyObject)).collect()
+    map.into_iter()
+        .map(|lto| lto.unwrap_or(Lto::OnlyObject))
+        .collect()
 }
 
 fn crate_types(unit: &Unit) -> Vec<&str> {
@@ -186,8 +191,11 @@ mod tests {
                 )
             })
             .collect();
-        serde_json::from_str(&format!(r#"{{"version":1,"units":[{}],"roots":[0]}}"#, units.join(",")))
-            .unwrap()
+        serde_json::from_str(&format!(
+            r#"{{"version":1,"units":[{}],"roots":[0]}}"#,
+            units.join(",")
+        ))
+        .unwrap()
     }
 
     fn thin() -> Lto {
@@ -196,13 +204,20 @@ mod tests {
 
     #[test]
     fn thin_binary_asks_its_rlibs_for_bitcode_only() {
-        let g = graph(&[("bin", &["bin"], "thin", &[1]), ("lib", &["lib"], "thin", &[2]), ("lib", &["lib"], "thin", &[])]);
+        let g = graph(&[
+            ("bin", &["bin"], "thin", &[1]),
+            ("lib", &["lib"], "thin", &[2]),
+            ("lib", &["lib"], "thin", &[]),
+        ]);
         assert_eq!(generate(&g), [thin(), Lto::OnlyBitcode, Lto::OnlyBitcode]);
     }
 
     #[test]
     fn fat_lto_is_the_bare_flag() {
-        let g = graph(&[("bin", &["bin"], "true", &[1]), ("lib", &["lib"], "true", &[])]);
+        let g = graph(&[
+            ("bin", &["bin"], "true", &[1]),
+            ("lib", &["lib"], "true", &[]),
+        ]);
         assert_eq!(generate(&g), [Lto::Run(None), Lto::OnlyBitcode]);
         assert_eq!(Lto::Run(None).args(), ["-C", "lto"]);
         assert_eq!(thin().args(), ["-C", "lto=thin"]);
@@ -210,14 +225,20 @@ mod tests {
 
     #[test]
     fn no_lto_means_no_bitcode() {
-        let g = graph(&[("bin", &["bin"], "false", &[1]), ("lib", &["lib"], "false", &[])]);
+        let g = graph(&[
+            ("bin", &["bin"], "false", &[1]),
+            ("lib", &["lib"], "false", &[]),
+        ]);
         assert_eq!(generate(&g), [Lto::OnlyObject, Lto::OnlyObject]);
         assert_eq!(Lto::OnlyObject.args(), ["-C", "embed-bitcode=no"]);
     }
 
     #[test]
     fn off_stays_off() {
-        let g = graph(&[("bin", &["bin"], "off", &[1]), ("lib", &["lib"], "off", &[])]);
+        let g = graph(&[
+            ("bin", &["bin"], "off", &[1]),
+            ("lib", &["lib"], "off", &[]),
+        ]);
         assert_eq!(generate(&g), [Lto::Off, Lto::Off]);
         assert_eq!(Lto::Off.args(), ["-C", "lto=off", "-C", "embed-bitcode=no"]);
     }
@@ -235,7 +256,14 @@ mod tests {
         ]);
         assert_eq!(
             generate(&g),
-            [thin(), Lto::OnlyObject, Lto::OnlyObject, Lto::OnlyBitcode, Lto::OnlyObject, Lto::OnlyObject]
+            [
+                thin(),
+                Lto::OnlyObject,
+                Lto::OnlyObject,
+                Lto::OnlyBitcode,
+                Lto::OnlyObject,
+                Lto::OnlyObject
+            ]
         );
     }
 

@@ -71,7 +71,10 @@ impl Profile {
     /// Cargo prints `{"resolved":{"Named":"debuginfo"}}`, `{"resolved":"None"}`
     /// or the same under `deferred`.
     pub fn strip(&self) -> Option<String> {
-        let inner = self.strip.get("resolved").or_else(|| self.strip.get("deferred"))?;
+        let inner = self
+            .strip
+            .get("resolved")
+            .or_else(|| self.strip.get("deferred"))?;
         inner.get("Named")?.as_str().map(str::to_string)
     }
 }

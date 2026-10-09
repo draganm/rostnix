@@ -27,7 +27,11 @@ pub fn join(dir: &str, rel: &str) -> String {
 
 /// Whether `path` is `dir` or lies under it.
 pub fn is_under(path: &str, dir: &str) -> bool {
-    dir.is_empty() || path == dir || path.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'))
+    dir.is_empty()
+        || path == dir
+        || path
+            .strip_prefix(dir)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// The paths left out of the view a unit of `unit_target` gets of the
@@ -48,23 +52,34 @@ pub fn exclusions(
     }
 
     // Where cargo looks for examples, tests and benches, unless the unit is
-    // one of them.
+    // one of them, or has its root there by a `path` of its own.
     for dir in ["examples", "tests", "benches"] {
-        if unit_target.own_dir != Some(dir) {
-            excluded.push(join(pkg_dir, dir));
+        let dir_path = join(pkg_dir, dir);
+        if unit_target.own_dir != Some(dir) && !is_under(&unit_target.src_path, &dir_path) {
+            excluded.push(dir_path);
         }
     }
 
     // The root file of every other executable target, or its directory when
-    // the root is a main.rs in a directory of its own.
-    let src_dir = join(pkg_dir, "src");
+    // cargo found the target as one: `src/bin/<name>/main.rs` and the like.
+    // A main.rs anywhere else may share its directory with other targets'
+    // modules.
+    let target_dirs = ["src/bin", "examples", "tests", "benches"].map(|dir| join(pkg_dir, dir));
     for target in targets {
         if !target.executable || target.src_path == unit_target.src_path {
             continue;
         }
-        let (parent, file) = target.src_path.rsplit_once('/').unwrap_or(("", &target.src_path));
-        let own_directory = file == "main.rs" && parent != src_dir && parent != pkg_dir;
-        let path = if own_directory { parent } else { target.src_path.as_str() };
+        let (parent, file) = target
+            .src_path
+            .rsplit_once('/')
+            .unwrap_or(("", &target.src_path));
+        let grandparent = parent.rsplit_once('/').map_or("", |(dir, _)| dir);
+        let own_directory = file == "main.rs" && target_dirs.iter().any(|dir| dir == grandparent);
+        let path = if own_directory {
+            parent
+        } else {
+            target.src_path.as_str()
+        };
         // Never hide the unit's own root.
         if !is_under(&unit_target.src_path, path) {
             excluded.push(path.to_string());
@@ -74,7 +89,10 @@ pub fn exclusions(
     excluded.sort();
     excluded.dedup();
     let all = excluded.clone();
-    excluded.retain(|path| !all.iter().any(|other| other != path && is_under(path, other)));
+    excluded.retain(|path| {
+        !all.iter()
+            .any(|other| other != path && is_under(path, other))
+    });
     excluded
 }
 
@@ -109,7 +127,10 @@ mod tests {
     #[test]
     fn library_sees_no_examples_tests_or_benches() {
         let targets = core_rs();
-        assert_eq!(exclusions("", &[], &targets, &targets[0]), ["benches", "examples", "tests"]);
+        assert_eq!(
+            exclusions("", &[], &targets, &targets[0]),
+            ["benches", "examples", "tests"]
+        );
     }
 
     #[test]
@@ -117,14 +138,22 @@ mod tests {
         let targets = core_rs();
         assert_eq!(
             exclusions("", &[], &targets, &targets[2]),
-            ["benches", "examples/amber-bench.rs", "examples/repair-interop.rs", "tests"]
+            [
+                "benches",
+                "examples/amber-bench.rs",
+                "examples/repair-interop.rs",
+                "tests"
+            ]
         );
     }
 
     #[test]
     fn test_sees_tests_without_the_other_tests() {
         let targets = core_rs();
-        assert_eq!(exclusions("", &[], &targets, &targets[4]), ["benches", "examples", "tests/cli_e2e.rs"]);
+        assert_eq!(
+            exclusions("", &[], &targets, &targets[4]),
+            ["benches", "examples", "tests/cli_e2e.rs"]
+        );
     }
 
     #[test]
@@ -140,22 +169,97 @@ mod tests {
         let view = |i: usize| exclusions("app", &[], &targets, &targets[i]);
         assert_eq!(
             view(0),
-            [common[0], common[1], "app/src/bin/quick.rs", "app/src/bin/tool", "app/src/main.rs", "app/tests"]
+            [
+                common[0],
+                common[1],
+                "app/src/bin/quick.rs",
+                "app/src/bin/tool",
+                "app/src/main.rs",
+                "app/tests"
+            ]
         );
-        assert_eq!(view(1), [common[0], common[1], "app/src/bin/quick.rs", "app/src/bin/tool", "app/tests"]);
-        assert_eq!(view(2), [common[0], common[1], "app/src/bin/tool", "app/src/main.rs", "app/tests"]);
-        assert_eq!(view(3), [common[0], common[1], "app/src/bin/quick.rs", "app/src/main.rs", "app/tests"]);
+        assert_eq!(
+            view(1),
+            [
+                common[0],
+                common[1],
+                "app/src/bin/quick.rs",
+                "app/src/bin/tool",
+                "app/tests"
+            ]
+        );
+        assert_eq!(
+            view(2),
+            [
+                common[0],
+                common[1],
+                "app/src/bin/tool",
+                "app/src/main.rs",
+                "app/tests"
+            ]
+        );
+        assert_eq!(
+            view(3),
+            [
+                common[0],
+                common[1],
+                "app/src/bin/quick.rs",
+                "app/src/main.rs",
+                "app/tests"
+            ]
+        );
         // The build script sees what the library sees.
         assert_eq!(view(4), view(0));
+    }
+
+    // `[[bin]] path = "src/cli/main.rs"`: the library may have `mod cli;`
+    // with its other files in that directory.
+    #[test]
+    fn a_main_rs_outside_cargos_target_directories_hides_only_itself() {
+        let targets = vec![
+            target("lib", "src/lib.rs"),
+            target("bin", "src/cli/main.rs"),
+        ];
+        assert_eq!(
+            exclusions("", &[], &targets, &targets[0]),
+            ["benches", "examples", "src/cli/main.rs", "tests"]
+        );
+    }
+
+    // `[[bin]] path = "examples/tool.rs"`, or a library rooted under tests/.
+    #[test]
+    fn a_unit_rooted_in_another_kinds_directory_keeps_it() {
+        let targets = vec![
+            target("lib", "tests/support/lib.rs"),
+            target("bin", "examples/tool.rs"),
+            target("example", "examples/demo.rs"),
+        ];
+        assert_eq!(
+            exclusions("", &[], &targets, &targets[0]),
+            ["benches", "examples"]
+        );
+        assert_eq!(
+            exclusions("", &[], &targets, &targets[1]),
+            ["benches", "examples/demo.rs", "tests"]
+        );
     }
 
     #[test]
     fn nested_packages_are_left_out() {
         let targets = vec![target("lib", "crates/core/src/lib.rs")];
-        let others = ["crates/core/nested".to_string(), "crates/macros".to_string(), "app".to_string()];
+        let others = [
+            "crates/core/nested".to_string(),
+            "crates/macros".to_string(),
+            "app".to_string(),
+        ];
         assert_eq!(
             exclusions("crates/core", &others, &targets, &targets[0]),
-            ["crates/core/benches", "crates/core/examples", "crates/core/nested", "crates/core/tests"]
+            [
+                "crates/core/benches",
+                "crates/core/examples",
+                "crates/core/nested",
+                "crates/core/tests"
+            ]
         );
         // From the root package every other package is nested, and one
         // inside another is covered by the outer one.
@@ -163,7 +267,14 @@ mod tests {
         let others = [others.to_vec(), vec!["crates/core".to_string()]].concat();
         assert_eq!(
             exclusions("", &others, &root, &root[0]),
-            ["app", "benches", "crates/core", "crates/macros", "examples", "tests"]
+            [
+                "app",
+                "benches",
+                "crates/core",
+                "crates/macros",
+                "examples",
+                "tests"
+            ]
         );
     }
 

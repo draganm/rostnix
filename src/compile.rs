@@ -19,7 +19,13 @@ pub struct Invocation {
     /// Where rustc writes: `$out/lib` or `$out/bin`.
     pub out_dir: String,
     pub transitive: Vec<String>,
+    /// Library search paths of the build scripts in the unit's closure:
+    /// those inside the `OUT_DIR` of the script that printed them, and the
+    /// others.
     pub native: Vec<String>,
+    pub native_external: Vec<String>,
+    /// Linker arguments the build scripts in the closure ask of any cdylib.
+    pub cdylib_link_args: Vec<String>,
 }
 
 pub fn run() -> Result<()> {
@@ -29,10 +35,24 @@ pub fn run() -> Result<()> {
 
     let mut deps = Vec::new();
     for dep in &node.deps {
-        deps.push((dep.name.clone(), node::read_record::<CompileRecord>(&dep.path)?));
+        deps.push((
+            dep.name.clone(),
+            node::read_record::<CompileRecord>(&dep.path)?,
+        ));
     }
-    let script = node.build_script.as_deref().map(node::read_record::<RunRecord>).transpose()?;
-    let inv = plan(&attrs.rustc, &attrs.cargo, node, out, &deps, script.as_ref());
+    let script = node
+        .build_script
+        .as_deref()
+        .map(node::read_record::<RunRecord>)
+        .transpose()?;
+    let inv = plan(
+        &attrs.rustc,
+        &attrs.cargo,
+        node,
+        out,
+        &deps,
+        script.as_ref(),
+    );
 
     fs::create_dir_all(&inv.out_dir)?;
     let status = Command::new(&inv.argv[0])
@@ -60,6 +80,8 @@ pub fn run() -> Result<()> {
             artifact,
             transitive: inv.transitive,
             native: inv.native,
+            native_external: inv.native_external,
+            cdylib_link_args: inv.cdylib_link_args,
             argv: inv.argv,
             env: inv.env,
             override_env: node.override_env.clone(),
@@ -73,19 +95,36 @@ fn is_executable(node: &CompileNode) -> bool {
 }
 
 fn has_crate_type(node: &CompileNode, crate_type: &str) -> bool {
-    node.rustc_args.windows(2).any(|pair| pair[0] == "--crate-type" && pair[1] == crate_type)
+    node.rustc_args
+        .windows(2)
+        .any(|pair| pair[0] == "--crate-type" && pair[1] == crate_type)
+}
+
+fn is_cdylib(node: &CompileNode) -> bool {
+    node.kind == "lib" && has_crate_type(node, "cdylib")
+}
+
+/// The directory of a `-L` value, which may start with a kind such as
+/// `native=`.
+fn search_dir(value: &str) -> &str {
+    match value.split_once('=') {
+        Some(("native" | "crate" | "dependency" | "framework" | "all", dir)) => dir,
+        _ => value,
+    }
 }
 
 /// Whether a linker argument a build script asked for applies to this unit.
 fn link_arg_applies(target: &str, node: &CompileNode) -> bool {
     match target {
         "all" => true,
-        "cdylib" => node.kind == "lib" && has_crate_type(node, "cdylib"),
+        "cdylib" => is_cdylib(node),
         "bins" => node.kind == "bin",
         "examples" => node.kind == "example",
         // Tests and benches are not built yet.
         "tests" | "benches" => false,
-        other => other.strip_prefix("bin:").is_some_and(|name| node.kind == "bin" && node.target_name == name),
+        other => other
+            .strip_prefix("bin:")
+            .is_some_and(|name| node.kind == "bin" && node.target_name == name),
     }
 }
 
@@ -115,7 +154,10 @@ pub fn plan(
     // its package directory.
     let (src_arg, cwd) = if node.local && is_under(&node.manifest_dir, &node.work_dir) {
         let from_src = join(&node.manifest_dir, &node.src_path);
-        let rel = from_src.strip_prefix(&node.work_dir).unwrap_or(&from_src).trim_start_matches('/');
+        let rel = from_src
+            .strip_prefix(&node.work_dir)
+            .unwrap_or(&from_src)
+            .trim_start_matches('/');
         (rel.to_string(), join(&node.src, &node.work_dir))
     } else {
         (join(&pkg_root, &node.src_path), pkg_root.clone())
@@ -123,10 +165,44 @@ pub fn plan(
 
     // rustc must find every transitive dependency, not only the direct ones.
     let mut search: Vec<String> = Vec::new();
-    let mut native: Vec<String> = script.map(|s| s.library_paths.clone()).unwrap_or_default();
     for (_, record) in deps {
         push_unique(&mut search, record.transitive.iter().cloned());
+    }
+
+    // Library search paths in cargo's order: the unit's own build script,
+    // then its dependencies' by package; and across all of them the paths
+    // inside a script's own OUT_DIR before the others, so that a library a
+    // script built wins over one of the same name found elsewhere.
+    let (mut native, mut native_external) = (Vec::new(), Vec::new());
+    let mut cdylib_link_args: Vec<String> = Vec::new();
+    if let Some(script) = script {
+        for path in &script.library_paths {
+            let inside = Path::new(search_dir(path)).starts_with(&script.out_dir);
+            (if inside {
+                &mut native
+            } else {
+                &mut native_external
+            })
+            .push(path.clone());
+        }
+        cdylib_link_args.extend(
+            script
+                .link_args
+                .iter()
+                .filter(|a| a.target == "cdylib")
+                .map(|a| a.arg.clone()),
+        );
+    }
+    let own_cdylib_link_args = cdylib_link_args.len();
+    let mut by_package: Vec<&CompileRecord> = deps.iter().map(|(_, record)| record).collect();
+    by_package.sort_by(|a, b| (&a.pkg.name, &a.pkg.version).cmp(&(&b.pkg.name, &b.pkg.version)));
+    for record in by_package {
         push_unique(&mut native, record.native.iter().cloned());
+        push_unique(&mut native_external, record.native_external.iter().cloned());
+        push_unique(
+            &mut cdylib_link_args,
+            record.cdylib_link_args.iter().cloned(),
+        );
     }
 
     let mut argv: Vec<String> = vec![
@@ -137,16 +213,23 @@ pub fn plan(
         src_arg,
     ];
     argv.extend(node.rustc_args.iter().cloned());
-    argv.extend(["--emit=link".to_string(), "--out-dir".to_string(), out_dir.clone()]);
+    argv.extend([
+        "--emit=link".to_string(),
+        "--out-dir".to_string(),
+        out_dir.clone(),
+    ]);
     for dir in &search {
         argv.extend(["-L".to_string(), format!("dependency={dir}")]);
     }
     for (name, record) in deps {
-        argv.extend(["--extern".to_string(), format!("{name}={}", record.artifact)]);
+        argv.extend([
+            "--extern".to_string(),
+            format!("{name}={}", record.artifact),
+        ]);
     }
     argv.extend(node.tail_args.iter().cloned());
 
-    for path in &native {
+    for path in native.iter().chain(&native_external) {
         argv.extend(["-L".to_string(), path.clone()]);
     }
     if let Some(script) = script {
@@ -160,6 +243,15 @@ pub fn plan(
                 argv.extend(["-C".to_string(), format!("link-arg={}", link_arg.arg)]);
             }
         }
+    }
+    // What a build script asks of cdylibs also reaches a cdylib that only
+    // depends on the script's package. Cargo keeps that on purpose.
+    if is_cdylib(node) {
+        for arg in &cdylib_link_args[own_cdylib_link_args..] {
+            argv.extend(["-C".to_string(), format!("link-arg={arg}")]);
+        }
+    }
+    if let Some(script) = script {
         for cfg in &script.cfgs {
             argv.extend(["--cfg".to_string(), cfg.clone()]);
         }
@@ -169,12 +261,28 @@ pub fn plan(
     }
     // Keeps the store out of panic messages and debug information, and with
     // it the sources out of the closure of what is built.
-    argv.extend(["--remap-path-prefix".to_string(), format!("{}={}", node.src, node.remap_to)]);
+    argv.extend([
+        "--remap-path-prefix".to_string(),
+        format!("{}={}", node.src, node.remap_to),
+    ]);
+    if let Some(script) = script {
+        // Code a build script generated is compiled from OUT_DIR, and a
+        // panic in it would otherwise name the script's run, which refers
+        // to the script, the compiler and everything the script was built
+        // from.
+        argv.extend([
+            "--remap-path-prefix".to_string(),
+            format!("{}={}/out", script.out_dir, node.remap_to),
+        ]);
+    }
 
     let mut env = node.env.clone();
     env.insert("CARGO".to_string(), cargo.to_string());
     env.insert("CARGO_MANIFEST_DIR".to_string(), pkg_root.clone());
-    env.insert("CARGO_MANIFEST_PATH".to_string(), join(&pkg_root, "Cargo.toml"));
+    env.insert(
+        "CARGO_MANIFEST_PATH".to_string(),
+        join(&pkg_root, "Cargo.toml"),
+    );
     if let Some(script) = script {
         env.insert("OUT_DIR".to_string(), script.out_dir.clone());
         env.extend(script.env.iter().cloned());
@@ -183,17 +291,31 @@ pub fn plan(
     // What dependents need. A proc macro is loaded by rustc on its own, and
     // nothing links an executable.
     let lib_dir = out_dir.clone();
-    let (transitive, native) = match node.kind.as_str() {
+    let transitive = match node.kind.as_str() {
         "lib" => {
             let mut all = vec![lib_dir];
             push_unique(&mut all, search);
-            (all, native)
+            all
         }
-        "proc-macro" => (vec![lib_dir], Vec::new()),
-        _ => (Vec::new(), Vec::new()),
+        "proc-macro" => vec![lib_dir],
+        _ => Vec::new(),
     };
+    if node.kind != "lib" {
+        native.clear();
+        native_external.clear();
+        cdylib_link_args.clear();
+    }
 
-    Invocation { argv, env, cwd, out_dir, transitive, native }
+    Invocation {
+        argv,
+        env,
+        cwd,
+        out_dir,
+        transitive,
+        native,
+        native_external,
+        cdylib_link_args,
+    }
 }
 
 /// Finds what rustc wrote, and gives an executable its target name.
@@ -254,11 +376,16 @@ mod tests {
     fn record(kind: &str, name: &str, transitive: &[&str], native: &[&str]) -> CompileRecord {
         CompileRecord {
             kind: kind.to_string(),
-            pkg: PkgRef { name: name.to_string(), version: "1.0.0".to_string() },
+            pkg: PkgRef {
+                name: name.to_string(),
+                version: "1.0.0".to_string(),
+            },
             crate_name: name.to_string(),
             artifact: format!("/nix/store/{name}/lib/lib{name}-x.rlib"),
             transitive: transitive.iter().map(|s| s.to_string()).collect(),
             native: native.iter().map(|s| s.to_string()).collect(),
+            native_external: vec![],
+            cdylib_link_args: vec![],
             argv: vec![],
             env: BTreeMap::new(),
             override_env: BTreeMap::new(),
@@ -269,9 +396,28 @@ mod tests {
     #[test]
     fn registry_library_with_dependencies() {
         let deps = vec![
-            ("a".to_string(), record("lib", "a", &["/nix/store/a/lib", "/nix/store/shared/lib"], &["native=/n/a"])),
-            ("renamed".to_string(), record("lib", "b", &["/nix/store/b/lib", "/nix/store/shared/lib"], &[])),
-            ("mac".to_string(), record("proc-macro", "mac", &["/nix/store/mac/lib"], &[])),
+            (
+                "a".to_string(),
+                record(
+                    "lib",
+                    "a",
+                    &["/nix/store/a/lib", "/nix/store/shared/lib"],
+                    &["native=/n/a"],
+                ),
+            ),
+            (
+                "renamed".to_string(),
+                record(
+                    "lib",
+                    "b",
+                    &["/nix/store/b/lib", "/nix/store/shared/lib"],
+                    &[],
+                ),
+            ),
+            (
+                "mac".to_string(),
+                record("proc-macro", "mac", &["/nix/store/mac/lib"], &[]),
+            ),
         ];
         let inv = plan("/rustc", "/cargo", &node("lib", false), "/out", &deps, None);
         assert_eq!(
@@ -293,7 +439,13 @@ mod tests {
         // macro in case its macros are re-exported.
         assert_eq!(
             inv.transitive,
-            ["/out/lib", "/nix/store/a/lib", "/nix/store/shared/lib", "/nix/store/b/lib", "/nix/store/mac/lib"]
+            [
+                "/out/lib",
+                "/nix/store/a/lib",
+                "/nix/store/shared/lib",
+                "/nix/store/b/lib",
+                "/nix/store/mac/lib"
+            ]
         );
         assert_eq!(inv.native, ["native=/n/a"]);
     }
@@ -330,12 +482,30 @@ mod tests {
             library_paths: vec!["native=/nix/store/run/out".to_string()],
             library_links: vec!["static=foo".to_string()],
             link_args: vec![
-                LinkArg { target: "all".to_string(), arg: "-Wl,-all".to_string() },
-                LinkArg { target: "bins".to_string(), arg: "-Wl,-bins".to_string() },
-                LinkArg { target: "bin:the-crate".to_string(), arg: "-Wl,-mine".to_string() },
-                LinkArg { target: "bin:other".to_string(), arg: "-Wl,-other".to_string() },
-                LinkArg { target: "examples".to_string(), arg: "-Wl,-examples".to_string() },
-                LinkArg { target: "cdylib".to_string(), arg: "-Wl,-cdylib".to_string() },
+                LinkArg {
+                    target: "all".to_string(),
+                    arg: "-Wl,-all".to_string(),
+                },
+                LinkArg {
+                    target: "bins".to_string(),
+                    arg: "-Wl,-bins".to_string(),
+                },
+                LinkArg {
+                    target: "bin:the-crate".to_string(),
+                    arg: "-Wl,-mine".to_string(),
+                },
+                LinkArg {
+                    target: "bin:other".to_string(),
+                    arg: "-Wl,-other".to_string(),
+                },
+                LinkArg {
+                    target: "examples".to_string(),
+                    arg: "-Wl,-examples".to_string(),
+                },
+                LinkArg {
+                    target: "cdylib".to_string(),
+                    arg: "-Wl,-cdylib".to_string(),
+                },
             ],
             cfgs: vec!["has_foo".to_string()],
             check_cfgs: vec!["cfg(has_foo)".to_string()],
@@ -346,14 +516,25 @@ mod tests {
 
     #[test]
     fn library_takes_what_its_build_script_printed() {
-        let deps = vec![("a".to_string(), record("lib", "a", &["/nix/store/a/lib"], &["native=/n/a"]))];
-        let inv = plan("/rustc", "/cargo", &node("lib", false), "/out", &deps, Some(&script()));
+        let deps = vec![(
+            "a".to_string(),
+            record("lib", "a", &["/nix/store/a/lib"], &["native=/n/a"]),
+        )];
+        let inv = plan(
+            "/rustc",
+            "/cargo",
+            &node("lib", false),
+            "/out",
+            &deps,
+            Some(&script()),
+        );
         let tail = inv.argv.join(" ");
         let tail = tail.split("--cap-lints allow ").nth(1).unwrap();
         assert_eq!(
             tail,
             "-L native=/nix/store/run/out -L native=/n/a -l static=foo -C link-arg=-Wl,-all \
-             --cfg has_foo --check-cfg cfg(has_foo) --remap-path-prefix /nix/store/src=pkg-1.0.0"
+             --cfg has_foo --check-cfg cfg(has_foo) --remap-path-prefix /nix/store/src=pkg-1.0.0 \
+             --remap-path-prefix /nix/store/run/out=pkg-1.0.0/out"
         );
         assert_eq!(inv.env["OUT_DIR"], "/nix/store/run/out");
         assert_eq!(inv.env["FROM_SCRIPT"], "1");
@@ -370,12 +551,128 @@ mod tests {
         assert!(!args.contains("-l static=foo"), "{args}");
         assert!(args.contains("-L native=/nix/store/run/out"), "{args}");
         assert!(
-            args.contains("-C link-arg=-Wl,-all -C link-arg=-Wl,-bins -C link-arg=-Wl,-mine --cfg has_foo"),
+            args.contains(
+                "-C link-arg=-Wl,-all -C link-arg=-Wl,-bins -C link-arg=-Wl,-mine --cfg has_foo"
+            ),
             "{args}"
         );
         assert_eq!(inv.out_dir, "/out/bin");
         // Nothing links an executable.
         assert!(inv.transitive.is_empty() && inv.native.is_empty());
+    }
+
+    // Cargo puts what a script built ahead of what it found elsewhere, for
+    // the unit's own script and for its dependencies' alike, and takes the
+    // dependencies by package.
+    #[test]
+    fn search_paths_inside_out_dir_come_first() {
+        let mut own = script();
+        own.library_paths = vec![
+            "/usr/lib/found".to_string(),
+            "native=/nix/store/run/out".to_string(),
+            "/nix/store/run/out/sub".to_string(),
+            "framework=/Frameworks".to_string(),
+        ];
+        let mut zed = record("lib", "zed", &["/nix/store/zed/lib"], &["native=/z/out"]);
+        zed.native_external = vec!["/z/found".to_string()];
+        let mut abc = record("lib", "abc", &["/nix/store/abc/lib"], &["native=/a/out"]);
+        abc.native_external = vec!["/a/found".to_string(), "/z/found".to_string()];
+        let deps = vec![("zed".to_string(), zed), ("abc".to_string(), abc)];
+        let inv = plan(
+            "/rustc",
+            "/cargo",
+            &node("lib", false),
+            "/out",
+            &deps,
+            Some(&own),
+        );
+        let searched: Vec<&str> = inv
+            .argv
+            .windows(2)
+            .filter(|pair| pair[0] == "-L" && !pair[1].starts_with("dependency="))
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(
+            searched,
+            [
+                "native=/nix/store/run/out",
+                "/nix/store/run/out/sub",
+                "native=/a/out",
+                "native=/z/out",
+                "/usr/lib/found",
+                "framework=/Frameworks",
+                "/a/found",
+                "/z/found"
+            ]
+        );
+        // Dependents get the two classes apart, so they can keep the order.
+        assert_eq!(
+            inv.native,
+            [
+                "native=/nix/store/run/out",
+                "/nix/store/run/out/sub",
+                "native=/a/out",
+                "native=/z/out"
+            ]
+        );
+        assert_eq!(
+            inv.native_external,
+            [
+                "/usr/lib/found",
+                "framework=/Frameworks",
+                "/a/found",
+                "/z/found"
+            ]
+        );
+    }
+
+    #[test]
+    fn cdylib_arguments_reach_cdylibs_that_depend_on_the_package() {
+        let mut dep = record("lib", "a", &["/nix/store/a/lib"], &[]);
+        dep.cdylib_link_args = vec!["-Wl,-from-a".to_string()];
+        let deps = vec![("a".to_string(), dep)];
+
+        // A plain library passes them on and does not use them.
+        let inv = plan(
+            "/rustc",
+            "/cargo",
+            &node("lib", false),
+            "/out",
+            &deps,
+            Some(&script()),
+        );
+        assert!(!inv.argv.join(" ").contains("-cdylib"), "{:?}", inv.argv);
+        assert!(!inv.argv.join(" ").contains("-from-a"));
+        assert_eq!(inv.cdylib_link_args, ["-Wl,-cdylib", "-Wl,-from-a"]);
+
+        // A cdylib takes its own script's once and its dependencies' too.
+        let mut cdylib = node("lib", false);
+        cdylib.rustc_args = vec![
+            "--crate-type".into(),
+            "cdylib".into(),
+            "--crate-type".into(),
+            "rlib".into(),
+        ];
+        let inv = plan("/rustc", "/cargo", &cdylib, "/out", &deps, Some(&script()));
+        let args = inv.argv.join(" ");
+        assert!(
+            args.contains(
+                "-C link-arg=-Wl,-all -C link-arg=-Wl,-cdylib -C link-arg=-Wl,-from-a --cfg"
+            ),
+            "{args}"
+        );
+
+        // Nothing links an executable, so it hands nothing on.
+        let inv = plan(
+            "/rustc",
+            "/cargo",
+            &node("bin", true),
+            "/out",
+            &deps,
+            Some(&script()),
+        );
+        assert!(inv.cdylib_link_args.is_empty());
+        assert!(!inv.argv.join(" ").contains("-from-a"));
     }
 
     // The planned environment is cargo's. An override is laid over it when

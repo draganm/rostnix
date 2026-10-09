@@ -8,7 +8,9 @@ fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
     fs::write(
         out_dir.join("generated.rs"),
-        "pub const GENERATED: &str = \"from-build-script\";\n",
+        // The indexing can panic, so the compiled library names this file.
+        "pub const GENERATED: &str = \"from-build-script\";\n\
+         pub fn pick(i: usize) -> u8 {\n    [10u8, 20, 30][i]\n}\n",
     )
     .expect("failed to write generated.rs");
 

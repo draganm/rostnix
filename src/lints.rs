@@ -32,13 +32,18 @@ pub fn rustflags(manifest: &Table, workspace: Option<&Table>) -> Result<Vec<Stri
         if tool == "cargo" {
             continue;
         }
-        let Some(tool_lints) = tool_lints.as_table() else { continue };
+        let Some(tool_lints) = tool_lints.as_table() else {
+            continue;
+        };
         for (name, config) in tool_lints {
             let (level, priority) = match config {
                 Value::String(level) => (level.as_str(), 0),
                 Value::Table(table) => (
                     table.get("level").and_then(Value::as_str).unwrap_or(""),
-                    table.get("priority").and_then(Value::as_integer).unwrap_or(0),
+                    table
+                        .get("priority")
+                        .and_then(Value::as_integer)
+                        .unwrap_or(0),
                 ),
                 _ => ("", 0),
             };
@@ -47,9 +52,17 @@ pub fn rustflags(manifest: &Table, workspace: Option<&Table>) -> Result<Vec<Stri
                 "deny" => "--deny",
                 "warn" => "--warn",
                 "allow" => "--allow",
-                other => return Err(format!("lint {tool}::{name} has the unknown level '{other}'").into()),
+                other => {
+                    return Err(
+                        format!("lint {tool}::{name} has the unknown level '{other}'").into(),
+                    )
+                }
             };
-            let option = if tool == "rust" { format!("{flag}={name}") } else { format!("{flag}={tool}::{name}") };
+            let option = if tool == "rust" {
+                format!("{flag}={name}")
+            } else {
+                format!("{flag}={tool}::{name}")
+            };
             flags.push((priority, Reverse(name.clone()), option));
         }
     }
@@ -83,7 +96,9 @@ mod tests {
 
     #[test]
     fn no_table_no_flags() {
-        assert!(rustflags(&table("[package]\nname = \"a\""), None).unwrap().is_empty());
+        assert!(rustflags(&table("[package]\nname = \"a\""), None)
+            .unwrap()
+            .is_empty());
     }
 
     // libc 0.2.190's table, and the order cargo 1.86 passed its flags in.
@@ -171,6 +186,9 @@ mod tests {
     fn rejects_an_unknown_level() {
         let manifest = table("[lints.rust]\nunsafe_code = \"loud\"");
         let err = rustflags(&manifest, None).unwrap_err().to_string();
-        assert!(err.contains("rust::unsafe_code") && err.contains("loud"), "{err}");
+        assert!(
+            err.contains("rust::unsafe_code") && err.contains("loud"),
+            "{err}"
+        );
     }
 }

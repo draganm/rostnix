@@ -33,6 +33,8 @@ struct Invocation {
     flags: Vec<String>,
     /// Lint flags in order: later ones override earlier ones.
     lints: Vec<String>,
+    /// Library search paths and libraries in order: the first match wins.
+    link_order: Vec<String>,
     env: BTreeMap<String, String>,
 }
 
@@ -50,8 +52,23 @@ const IGNORED_ENV: &[&str] = &[
 
 /// Flags that take their value as the next argument.
 const TWO_PART: &[&str] = &[
-    "-C", "--cfg", "--check-cfg", "--extern", "-L", "-l", "--crate-type", "--crate-name", "--out-dir",
-    "--cap-lints", "--target", "-Z", "--remap-path-prefix", "-A", "-W", "-D", "-F",
+    "-C",
+    "--cfg",
+    "--check-cfg",
+    "--extern",
+    "-L",
+    "-l",
+    "--crate-type",
+    "--crate-name",
+    "--out-dir",
+    "--cap-lints",
+    "--target",
+    "-Z",
+    "--remap-path-prefix",
+    "-A",
+    "-W",
+    "-D",
+    "-F",
 ];
 
 fn main() -> ExitCode {
@@ -70,13 +87,21 @@ fn main() -> ExitCode {
     let cargo = normalise(&cargo);
     let rostnix = normalise(&rostnix);
     let only_cargo: Vec<&Invocation> = cargo.iter().filter(|inv| !rostnix.contains(inv)).collect();
-    let only_rostnix: Vec<&Invocation> = rostnix.iter().filter(|inv| !cargo.contains(inv)).collect();
+    let only_rostnix: Vec<&Invocation> =
+        rostnix.iter().filter(|inv| !cargo.contains(inv)).collect();
     if only_cargo.is_empty() && only_rostnix.is_empty() && cargo.len() == rostnix.len() {
-        println!("{} invocations, the same under cargo and rostnix", cargo.len());
+        println!(
+            "{} invocations, the same under cargo and rostnix",
+            cargo.len()
+        );
         return ExitCode::SUCCESS;
     }
 
-    println!("cargo ran {} invocations, rostnix {}", cargo.len(), rostnix.len());
+    println!(
+        "cargo ran {} invocations, rostnix {}",
+        cargo.len(),
+        rostnix.len()
+    );
     let mut unpaired: Vec<&Invocation> = only_rostnix.clone();
     for theirs in &only_cargo {
         // The likeliest counterpart: same program, package and crate, and
@@ -84,22 +109,40 @@ fn main() -> ExitCode {
         let best = unpaired
             .iter()
             .enumerate()
-            .filter(|(_, ours)| ours.program == theirs.program && ours.package == theirs.package && ours.crate_name == theirs.crate_name)
-            .max_by_key(|(_, ours)| ours.flags.iter().filter(|f| theirs.flags.contains(f)).count())
+            .filter(|(_, ours)| {
+                ours.program == theirs.program
+                    && ours.package == theirs.package
+                    && ours.crate_name == theirs.crate_name
+            })
+            .max_by_key(|(_, ours)| {
+                ours.flags
+                    .iter()
+                    .filter(|f| theirs.flags.contains(f))
+                    .count()
+            })
             .map(|(i, _)| i);
         match best {
             Some(i) => report_difference(theirs, unpaired.remove(i)),
-            None => println!("\nonly cargo runs {} for {} ({})", theirs.program, theirs.package, theirs.crate_name),
+            None => println!(
+                "\nonly cargo runs {} for {} ({})",
+                theirs.program, theirs.package, theirs.crate_name
+            ),
         }
     }
     for ours in unpaired {
-        println!("\nonly rostnix runs {} for {} ({})", ours.program, ours.package, ours.crate_name);
+        println!(
+            "\nonly rostnix runs {} for {} ({})",
+            ours.program, ours.package, ours.crate_name
+        );
     }
     ExitCode::FAILURE
 }
 
 fn report_difference(cargo: &Invocation, rostnix: &Invocation) {
-    println!("\n{} for {} ({}) differs:", cargo.program, cargo.package, cargo.crate_name);
+    println!(
+        "\n{} for {} ({}) differs:",
+        cargo.program, cargo.package, cargo.crate_name
+    );
     for flag in cargo.flags.iter().filter(|f| !rostnix.flags.contains(f)) {
         println!("  only cargo:   {flag}");
     }
@@ -109,6 +152,16 @@ fn report_difference(cargo: &Invocation, rostnix: &Invocation) {
     if cargo.lints != rostnix.lints {
         println!("  cargo lints:   {}", cargo.lints.join(" "));
         println!("  rostnix lints: {}", rostnix.lints.join(" "));
+    }
+    if cargo.link_order != rostnix.link_order {
+        println!(
+            "  cargo searches and links:   {}",
+            cargo.link_order.join(" ")
+        );
+        println!(
+            "  rostnix searches and links: {}",
+            rostnix.link_order.join(" ")
+        );
     }
     let keys: BTreeSet<&String> = cargo.env.keys().chain(rostnix.env.keys()).collect();
     for key in keys {
@@ -140,8 +193,14 @@ fn parse_cargo_log(log: &str) -> Vec<Raw> {
             env.insert(key, value);
             words.next();
         }
-        let Some(program) = words.next() else { continue };
-        raws.push(Raw { env, program, args: words.collect() });
+        let Some(program) = words.next() else {
+            continue;
+        };
+        raws.push(Raw {
+            env,
+            program,
+            args: words.collect(),
+        });
     }
     raws
 }
@@ -151,7 +210,8 @@ fn assignment(word: &str) -> Option<(String, String)> {
     let (key, value) = word.split_once('=')?;
     let mut chars = key.chars();
     let first = chars.next()?;
-    let is_name = (first.is_ascii_alphabetic() || first == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let is_name = (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
     is_name.then(|| (key.to_string(), value.to_string()))
 }
 
@@ -205,21 +265,44 @@ fn shell_words(text: &str) -> (Vec<String>, usize) {
 
 fn read_records(dir: &str) -> Vec<Raw> {
     let mut raws = Vec::new();
-    let mut files: Vec<_> = fs::read_dir(dir).expect("reading the records directory").map(|e| e.unwrap().path()).collect();
+    let mut files: Vec<_> = fs::read_dir(dir)
+        .expect("reading the records directory")
+        .map(|e| e.unwrap().path())
+        .collect();
     files.sort();
     for file in files {
-        let record: Value = serde_json::from_str(&fs::read_to_string(&file).expect("reading a record")).expect("parsing a record");
+        let record: Value =
+            serde_json::from_str(&fs::read_to_string(&file).expect("reading a record"))
+                .expect("parsing a record");
         let strings = |value: &Value| -> Vec<String> {
-            value.as_array().map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect()).unwrap_or_default()
+            value
+                .as_array()
+                .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
+                .unwrap_or_default()
         };
         let map = |value: &Value| -> BTreeMap<String, String> {
-            value.as_object().map(|o| o.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string())).collect()).unwrap_or_default()
+            value
+                .as_object()
+                .map(|o| {
+                    o.iter()
+                        .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
+                        .collect()
+                })
+                .unwrap_or_default()
         };
         let argv = strings(&record["argv"]);
         // A build-script run keeps its environment under another name,
         // because `env` is what the script asked rustc to be given.
-        let env = if record["kind"] == "run-build-script" { map(&record["envRecorded"]) } else { map(&record["env"]) };
-        raws.push(Raw { env, program: argv[0].clone(), args: argv[1..].to_vec() });
+        let env = if record["kind"] == "run-build-script" {
+            map(&record["envRecorded"])
+        } else {
+            map(&record["env"])
+        };
+        raws.push(Raw {
+            env,
+            program: argv[0].clone(),
+            args: argv[1..].to_vec(),
+        });
     }
     raws
 }
@@ -268,6 +351,7 @@ fn normalise(raws: &[Raw]) -> Vec<Invocation> {
             let is_rustc = basename(&raw.program) == "rustc";
             let mut flags = Vec::new();
             let mut lints = Vec::new();
+            let mut link_order = Vec::new();
             let mut crate_name = String::new();
             let mut args = raw.args.iter();
             while let Some(arg) = args.next() {
@@ -275,21 +359,39 @@ fn normalise(raws: &[Raw]) -> Vec<Invocation> {
                     flags.push(symbolic(arg));
                     continue;
                 }
-                let value = if TWO_PART.contains(&arg.as_str()) { args.next().cloned().unwrap_or_default() } else { String::new() };
+                let value = if TWO_PART.contains(&arg.as_str()) {
+                    args.next().cloned().unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 match arg.as_str() {
                     "--crate-name" => crate_name = value,
                     // Where things are, and cargo's own bookkeeping.
                     "--out-dir" | "--remap-path-prefix" => {}
-                    "-C" if ["metadata=", "extra-filename=", "incremental="].iter().any(|p| value.starts_with(p)) => {}
+                    "-C" if ["metadata=", "extra-filename=", "incremental="]
+                        .iter()
+                        .any(|p| value.starts_with(p)) => {}
                     "-L" if value.starts_with("dependency=") => {}
+                    "-L" | "-l" => link_order.push(format!("{arg} {}", symbolic(&value))),
                     // Cargo names an .rmeta where it pipelines; which crate is
                     // meant is what matters.
-                    "--extern" => flags.push(format!("--extern {}", value.split('=').next().unwrap_or(""))),
+                    "--extern" => flags.push(format!(
+                        "--extern {}",
+                        value.split('=').next().unwrap_or("")
+                    )),
                     // `-vv` makes cargo show warnings of foreign crates.
                     "--cap-lints" => flags.push("--cap-lints allow".to_string()),
                     "-A" | "-W" | "-D" | "-F" => lints.push(format!("{arg} {value}")),
-                    a if a.starts_with("--emit") || a.starts_with("--error-format") || a.starts_with("--json") || a.starts_with("--diagnostic-width") => {}
-                    a if ["--allow", "--warn", "--deny", "--forbid", "--force-warn"].iter().any(|p| a.starts_with(p)) => lints.push(a.to_string()),
+                    a if a.starts_with("--emit")
+                        || a.starts_with("--error-format")
+                        || a.starts_with("--json")
+                        || a.starts_with("--diagnostic-width") => {}
+                    a if ["--allow", "--warn", "--deny", "--forbid", "--force-warn"]
+                        .iter()
+                        .any(|p| a.starts_with(p)) =>
+                    {
+                        lints.push(a.to_string())
+                    }
                     a if TWO_PART.contains(&a) => flags.push(format!("{a} {}", symbolic(&value))),
                     a if a.starts_with('-') => flags.push(a.to_string()),
                     source => flags.push(format!("source {}", symbolic(source))),
@@ -311,11 +413,16 @@ fn normalise(raws: &[Raw]) -> Vec<Invocation> {
                 .collect();
 
             Invocation {
-                program: if is_rustc { "rustc".to_string() } else { "build-script".to_string() },
+                program: if is_rustc {
+                    "rustc".to_string()
+                } else {
+                    "build-script".to_string()
+                },
                 package,
                 crate_name,
                 flags,
                 lints,
+                link_order,
                 env,
             }
         })

@@ -38,7 +38,10 @@ fn attrs(map: &BTreeMap<String, String>) -> String {
     if map.is_empty() {
         return "{ }".to_string();
     }
-    let pairs: Vec<String> = map.iter().map(|(key, value)| format!("{} = {};", quote(key), quote(value))).collect();
+    let pairs: Vec<String> = map
+        .iter()
+        .map(|(key, value)| format!("{} = {};", quote(key), quote(value)))
+        .collect();
     format!("{{ {} }}", pairs.join(" "))
 }
 
@@ -81,6 +84,10 @@ pub fn to_nix(graph: &Graph) -> String {
             quote(&source.url)
         ));
     }
+    // A project with no registry dependency still has the set.
+    if graph.sources.is_empty() {
+        line("  sources = { };".to_string());
+    }
 
     for (key, pkg) in &graph.packages {
         line(format!("  packages.{} = {{", quote(key)));
@@ -104,6 +111,11 @@ pub fn to_nix(graph: &Graph) -> String {
 
     for (name, key) in &graph.bins {
         line(format!("  bins.{} = {};", quote(name), unit_ref(key)));
+    }
+    // A selection with no executable has an empty set, which is what the
+    // Nix side reports on.
+    if graph.bins.is_empty() {
+        line("  bins = { };".to_string());
     }
     let roots: Vec<String> = graph.roots.iter().map(|key| unit_ref(key)).collect();
     line(format!("  roots = [ {} ];", roots.join(" ")));
@@ -133,7 +145,12 @@ fn compile(line: &mut impl FnMut(String), key: &str, unit: &CompileUnit) {
         .map(|(name, key)| format!("{{ name = {}; unit = {}; }}", quote(name), unit_ref(key)))
         .collect();
     line(format!("    deps = [ {} ];", deps.join(" ")));
-    line(format!("    buildScript = {};", unit.build_script.as_deref().map_or("null".to_string(), unit_ref)));
+    line(format!(
+        "    buildScript = {};",
+        unit.build_script
+            .as_deref()
+            .map_or("null".to_string(), unit_ref)
+    ));
     line(format!("    overrides = {};", list(&unit.overrides)));
     line("  };".to_string());
 }
@@ -173,7 +190,11 @@ mod tests {
     // back out of Nix unchanged.
     #[test]
     fn quote_round_trips_through_nix() {
-        if std::process::Command::new("nix-instantiate").arg("--version").output().is_err() {
+        if std::process::Command::new("nix-instantiate")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             eprintln!("nix-instantiate is not available; skipping");
             return;
         }
@@ -190,14 +211,22 @@ mod tests {
                 .args(["--eval", "--json", "--expr", &quote(text)])
                 .output()
                 .unwrap();
-            assert!(output.status.success(), "{text:?}: {}", String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "{text:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             let back: String = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(back, text);
         }
     }
 
     fn sample() -> Graph {
-        let mut graph = Graph { cargo_version: "1.95.0".into(), host: "aarch64-apple-darwin".into(), ..Graph::default() };
+        let mut graph = Graph {
+            cargo_version: "1.95.0".into(),
+            host: "aarch64-apple-darwin".into(),
+            ..Graph::default()
+        };
         graph.sources.insert(
             "dep-1.0.0+x".into(),
             Source {
@@ -218,7 +247,10 @@ mod tests {
                 work_dir: "".into(),
                 links: Some("dep".into()),
                 override_key: None,
-                env: BTreeMap::from([("CARGO_PKG_DESCRIPTION".to_string(), "costs $5 \"or\" ${less}".to_string())]),
+                env: BTreeMap::from([(
+                    "CARGO_PKG_DESCRIPTION".to_string(),
+                    "costs $5 \"or\" ${less}".to_string(),
+                )]),
             },
         );
         graph.units.insert(
@@ -235,9 +267,17 @@ mod tests {
                 metadata: "aaaaaaaaaaaaaaaa".into(),
                 linked: true,
                 pass_l: false,
-                rustc_args: vec!["--crate-type".into(), "bin".into(), "--cfg".into(), "feature=\"std\"".into()],
+                rustc_args: vec![
+                    "--crate-type".into(),
+                    "bin".into(),
+                    "--cfg".into(),
+                    "feature=\"std\"".into(),
+                ],
                 tail_args: vec!["--cap-lints".into(), "allow".into()],
-                env: BTreeMap::from([("CARGO_CRATE_NAME".to_string(), "build_script_build".to_string())]),
+                env: BTreeMap::from([(
+                    "CARGO_CRATE_NAME".to_string(),
+                    "build_script_build".to_string(),
+                )]),
                 deps: vec![],
                 build_script: None,
                 overrides: vec![],
@@ -261,7 +301,11 @@ mod tests {
             UnitNode::Compile(CompileUnit {
                 name: "rustbin-app".into(),
                 package: "dep-1.0.0+x".into(),
-                src: SrcRef::Local { name: "rustsrc-app-0.1.0".into(), dir: "".into(), exclude: vec!["tests".into()] },
+                src: SrcRef::Local {
+                    name: "rustsrc-app-0.1.0".into(),
+                    dir: "".into(),
+                    exclude: vec!["tests".into()],
+                },
                 kind: "bin",
                 crate_name: "app".into(),
                 target_name: "app".into(),
@@ -278,7 +322,9 @@ mod tests {
                 overrides: vec!["dep".into()],
             }),
         );
-        graph.bins.insert("app".into(), "app-0.1.0-bin-app-cccccccc".into());
+        graph
+            .bins
+            .insert("app".into(), "app-0.1.0-bin-app-cccccccc".into());
         graph.roots.push("app-0.1.0-bin-app-cccccccc".into());
         graph
     }
@@ -354,11 +400,54 @@ mod tests {
         assert_eq!(to_nix(&sample()), expected);
     }
 
+    // A library-only selection has no executables, and a project without
+    // registry dependencies no sources. Both sets must still be there to be
+    // asked about.
+    #[test]
+    fn empty_sets_are_emitted() {
+        let mut graph = sample();
+        graph.bins.clear();
+        graph.sources.clear();
+        let nix = to_nix(&graph);
+        assert!(nix.contains("\n  bins = { };\n"), "{nix}");
+        assert!(nix.contains("\n  sources = { };\n"), "{nix}");
+        assert!(!to_nix(&sample()).contains("= { };\n  roots"));
+
+        if std::process::Command::new("nix-instantiate")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let expr = format!(
+            "let g = ({nix}) {{ fetchCrate = a: a; localSource = a: a; compile = a: a; runBuildScript = a: a; }}; \
+             in [ (g.bins == {{ }}) (g.sources == {{ }}) ]"
+        );
+        let output = std::process::Command::new("nix-instantiate")
+            .args(["--eval", "--strict", "--json", "--expr", &expr])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "[true,true]"
+        );
+    }
+
     // The emitted text must be Nix that evaluates, with every reference
     // between nodes resolving.
     #[test]
     fn emitted_graph_evaluates() {
-        if std::process::Command::new("nix-instantiate").arg("--version").output().is_err() {
+        if std::process::Command::new("nix-instantiate")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             eprintln!("nix-instantiate is not available; skipping");
             return;
         }
@@ -371,8 +460,15 @@ mod tests {
             .args(["--eval", "--strict", "--json", "--expr", &expr])
             .output()
             .unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(value, serde_json::json!(["costs $5 \"or\" ${less}", 1, "."]));
+        assert_eq!(
+            value,
+            serde_json::json!(["costs $5 \"or\" ${less}", 1, "."])
+        );
     }
 }

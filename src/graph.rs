@@ -62,7 +62,11 @@ pub enum SrcRef {
     /// A key of `Graph::sources`.
     Registry(String),
     /// A view of the local source: `dir` without `exclude`.
-    Local { name: String, dir: String, exclude: Vec<String> },
+    Local {
+        name: String,
+        dir: String,
+        exclude: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -149,7 +153,10 @@ impl Kind {
             Kind::Bin
         } else if has("example") {
             Kind::Example
-        } else if ["lib", "rlib", "dylib", "cdylib", "staticlib"].iter().any(|k| has(k)) {
+        } else if ["lib", "rlib", "dylib", "cdylib", "staticlib"]
+            .iter()
+            .any(|k| has(k))
+        {
             Kind::Lib
         } else {
             return None;
@@ -194,23 +201,47 @@ struct PkgInfo<'a> {
 pub fn build(inp: &Inputs) -> Result<Graph> {
     let graph = inp.units;
     let src_root = inp.src.trim_end_matches('/');
-    let by_id: HashMap<&str, &Package> = inp.metadata.packages.iter().map(|p| (p.id.as_str(), p)).collect();
+    let by_id: HashMap<&str, &Package> = inp
+        .metadata
+        .packages
+        .iter()
+        .map(|p| (p.id.as_str(), p))
+        .collect();
 
     // What this version does not build is refused by name.
     let mut kinds = Vec::with_capacity(graph.units.len());
     for unit in &graph.units {
-        let pkg = by_id
-            .get(unit.pkg_id.as_str())
-            .ok_or_else(|| format!("cargo metadata does not know the package {} of the unit graph", unit.pkg_id))?;
+        let pkg = by_id.get(unit.pkg_id.as_str()).ok_or_else(|| {
+            format!(
+                "cargo metadata does not know the package {} of the unit graph",
+                unit.pkg_id
+            )
+        })?;
         let what = format!("{} of {} {}", unit.target.name, pkg.name, pkg.version);
         if let Some(platform) = &unit.platform {
             return Err(format!("{what} is planned for the target {platform}; cross-compilation is not supported yet").into());
         }
         if unit.mode != "build" && unit.mode != "run-custom-build" {
-            return Err(format!("{what} has the mode '{}', which this version does not build", unit.mode).into());
+            return Err(format!(
+                "{what} has the mode '{}', which this version does not build",
+                unit.mode
+            )
+            .into());
         }
-        let kind = Kind::of(unit)
-            .ok_or_else(|| format!("{what} is a target of kind {:?}, which this version does not build", unit.target.kind))?;
+        let is_example = unit.target.kind.iter().any(|k| k == "example");
+        if is_example && !unit.target.crate_types.iter().any(|ct| ct == "bin") {
+            return Err(format!(
+                "{what} is an example of crate type {}; only executable examples are built yet",
+                unit.target.crate_types.join(", ")
+            )
+            .into());
+        }
+        let kind = Kind::of(unit).ok_or_else(|| {
+            format!(
+                "{what} is a target of kind {:?}, which this version does not build",
+                unit.target.kind
+            )
+        })?;
         kinds.push(kind);
     }
 
@@ -225,7 +256,9 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
     }
     let mut key_count: HashMap<String, usize> = HashMap::new();
     for pkg in &used {
-        *key_count.entry(format!("{}-{}", pkg.name, pkg.version)).or_default() += 1;
+        *key_count
+            .entry(format!("{}-{}", pkg.name, pkg.version))
+            .or_default() += 1;
     }
 
     let has_local = used.iter().any(|p| p.source.is_none());
@@ -250,7 +283,11 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
     let mut infos: HashMap<&str, PkgInfo> = HashMap::new();
     for pkg in used {
         let base = format!("{}-{}", pkg.name, pkg.version);
-        let key = if key_count[&base] > 1 { format!("{base}-{}", &hash(&[&pkg.id])[..8]) } else { base };
+        let key = if key_count[&base] > 1 {
+            format!("{base}-{}", &hash(&[&pkg.id])[..8])
+        } else {
+            base
+        };
         let local = pkg.source.is_none();
         let rel_dir = if local {
             relative_to(pkg.manifest_dir(), src_root).ok_or_else(|| {
@@ -270,16 +307,25 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
                 )
                 .into());
             }
-            let sha256 = inp.checksums.get(&pkg.name, &pkg.version, source).ok_or_else(|| {
-                format!("Cargo.lock has no checksum for {} {}", pkg.name, pkg.version)
-            })?;
+            let sha256 = inp
+                .checksums
+                .get(&pkg.name, &pkg.version, source)
+                .ok_or_else(|| {
+                    format!(
+                        "Cargo.lock has no checksum for {} {}",
+                        pkg.name, pkg.version
+                    )
+                })?;
             out.sources.insert(
                 key.clone(),
                 Source {
                     pname: pkg.name.clone(),
                     version: pkg.version.clone(),
                     sha256: sha256.to_string(),
-                    url: format!("https://static.crates.io/crates/{0}/{0}-{1}.crate", pkg.name, pkg.version),
+                    url: format!(
+                        "https://static.crates.io/crates/{0}/{0}-{1}.crate",
+                        pkg.name, pkg.version
+                    ),
                     cargo_src_dir: pkg.manifest_dir().to_string(),
                 },
             );
@@ -297,9 +343,16 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
                 version: pkg.version.clone(),
                 local,
                 manifest_dir: rel_dir.clone(),
-                work_dir: if local { inp.cargo_root.to_string() } else { String::new() },
+                work_dir: if local {
+                    inp.cargo_root.to_string()
+                } else {
+                    String::new()
+                },
                 links: pkg.links.clone(),
-                override_key: inp.override_keys.contains(&pkg.name).then(|| pkg.name.clone()),
+                override_key: inp
+                    .override_keys
+                    .contains(&pkg.name)
+                    .then(|| pkg.name.clone()),
                 env: pkg.env(),
             },
         );
@@ -318,7 +371,11 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
     let info = |unit: &Unit| &infos[unit.pkg_id.as_str()];
 
     let ltos = lto::generate(graph);
-    let primary: BTreeSet<&str> = graph.roots.iter().map(|&r| graph.units[r].pkg_id.as_str()).collect();
+    let primary: BTreeSet<&str> = graph
+        .roots
+        .iter()
+        .map(|&r| graph.units[r].pkg_id.as_str())
+        .collect();
 
     // Metadata hashes, dependencies first.
     let mut hashes: Vec<Option<String>> = vec![None; graph.units.len()];
@@ -336,7 +393,12 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
                 Kind::Bin | Kind::Example => format!("-{}", unit.target.name),
                 _ => String::new(),
             };
-            format!("{}-{}{target}-{}", info(unit).key, kinds[i].word(), &hashes[i][..8])
+            format!(
+                "{}-{}{target}-{}",
+                info(unit).key,
+                kinds[i].word(),
+                &hashes[i][..8]
+            )
         })
         .collect();
 
@@ -350,8 +412,12 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
             _ => format!("{}-{}", kind.name_prefix(), pkg_info.key),
         });
         let src = if pkg_info.local {
-            let view_of = if kind == Kind::Run { script_of(graph, unit).unwrap_or(unit) } else { unit };
-            local_src(pkg_info, &local_dirs, src_root, view_of)
+            let view_of = if kind == Kind::Run {
+                script_of(graph, unit).unwrap_or(unit)
+            } else {
+                unit
+            };
+            local_src(pkg_info, &local_dirs, src_root, view_of, kind == Kind::Run)
         } else {
             SrcRef::Registry(pkg_info.key.clone())
         };
@@ -361,19 +427,37 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
                 .dependencies
                 .iter()
                 .find(|d| kinds[d.index] == Kind::BuildScript)
-                .ok_or_else(|| format!("the build-script run of {} {} has no build script", pkg.name, pkg.version))?;
+                .ok_or_else(|| {
+                    format!(
+                        "the build-script run of {} {} has no build script",
+                        pkg.name, pkg.version
+                    )
+                })?;
             let mut links_deps = Vec::new();
-            for dep in unit.dependencies.iter().filter(|d| kinds[d.index] == Kind::Run) {
+            for dep in unit
+                .dependencies
+                .iter()
+                .filter(|d| kinds[d.index] == Kind::Run)
+            {
                 let dep_pkg = info(&graph.units[dep.index]).pkg;
                 let links = dep_pkg.links.clone().ok_or_else(|| {
-                    format!("{} depends on the build script of {}, which sets no `links`", pkg.name, dep_pkg.name)
+                    format!(
+                        "{} depends on the build script of {}, which sets no `links`",
+                        pkg.name, dep_pkg.name
+                    )
                 })?;
                 links_deps.push((links, keys[dep.index].clone()));
             }
             let mut env = BTreeMap::from([
                 ("OPT_LEVEL".to_string(), unit.profile.opt_level.clone()),
-                ("DEBUG".to_string(), unit.profile.debuginfo().is_some().to_string()),
-                ("PROFILE".to_string(), profile_root(&unit.profile.name, &workspace_manifest).to_string()),
+                (
+                    "DEBUG".to_string(),
+                    unit.profile.debuginfo().is_some().to_string(),
+                ),
+                (
+                    "PROFILE".to_string(),
+                    profile_root(&unit.profile.name, &workspace_manifest).to_string(),
+                ),
                 ("TARGET".to_string(), inp.host.to_string()),
                 ("HOST".to_string(), inp.host.to_string()),
             ]);
@@ -421,7 +505,11 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
             env.insert("CARGO_PRIMARY_PACKAGE".to_string(), "1".to_string());
         }
 
-        let linked = unit.target.crate_types.iter().any(|ct| matches!(ct.as_str(), "bin" | "proc-macro" | "cdylib" | "dylib"));
+        let linked = unit
+            .target
+            .crate_types
+            .iter()
+            .any(|ct| matches!(ct.as_str(), "bin" | "proc-macro" | "cdylib" | "dylib"));
         let overrides = if linked {
             link_closure(graph, &infos, &kinds, &mut closures, i)
                 .iter()
@@ -470,7 +558,17 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
     for &root in &graph.roots {
         out.roots.push(keys[root].clone());
         if matches!(kinds[root], Kind::Bin | Kind::Example) {
-            out.bins.insert(graph.units[root].target.name.clone(), keys[root].clone());
+            let name = &graph.units[root].target.name;
+            match out.bins.insert(name.clone(), keys[root].clone()) {
+                Some(other) if other != keys[root] => {
+                    return Err(format!(
+                        "the selection builds two executables named {name} ({other} and {}), which would be installed under one name; select one of them with `packages`, `bins` or `examples`",
+                        keys[root]
+                    )
+                    .into());
+                }
+                _ => {}
+            }
         }
     }
     Ok(out)
@@ -493,7 +591,12 @@ fn hash(parts: &[&str]) -> String {
         hasher.update(part.as_bytes());
         hasher.update([0]);
     }
-    hasher.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()
+    hasher
+        .finalize()
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// The metadata hash of a unit: what it is and what it is built from, with
@@ -544,7 +647,13 @@ fn unit_hash(
     let mut deps: Vec<String> = unit
         .dependencies
         .iter()
-        .map(|dep| format!("{}={}", dep.extern_crate_name, unit_hash(graph, infos, ltos, hashes, dep.index)))
+        .map(|dep| {
+            format!(
+                "{}={}",
+                dep.extern_crate_name,
+                unit_hash(graph, infos, ltos, hashes, dep.index)
+            )
+        })
         .collect();
     deps.sort();
     parts.extend(deps);
@@ -557,12 +666,15 @@ fn unit_hash(
 
 /// The build-script unit a run executes.
 fn script_of<'a>(graph: &'a UnitGraph, run: &Unit) -> Option<&'a Unit> {
-    run.dependencies.iter().map(|d| &graph.units[d.index]).find(|u| u.target.is_custom_build() && u.mode == "build")
+    run.dependencies
+        .iter()
+        .map(|d| &graph.units[d.index])
+        .find(|u| u.target.is_custom_build() && u.mode == "build")
 }
 
-/// The names of the packages whose code a unit links: its own and those of
-/// the libraries it depends on. A proc macro or a build script is linked by
-/// itself, so the walk does not enter them.
+/// The names of the packages whose code a unit links: its own, unless it is
+/// a build script, and those of the libraries it depends on. A proc macro or
+/// a build script is linked by itself, so the walk does not enter them.
 fn link_closure(
     graph: &UnitGraph,
     infos: &HashMap<&str, PkgInfo>,
@@ -574,10 +686,19 @@ fn link_closure(
         return done.clone();
     }
     let unit = &graph.units[index];
-    let mut names = BTreeSet::from([infos[unit.pkg_id.as_str()].pkg.name.clone()]);
+    // A build script is built before its package's native library exists;
+    // it links what it depends on and nothing of its own package.
+    let mut names = BTreeSet::new();
+    if kinds[index] != Kind::BuildScript {
+        names.insert(infos[unit.pkg_id.as_str()].pkg.name.clone());
+    }
     for dep in &unit.dependencies {
         if kinds[dep.index] == Kind::Lib {
-            names.extend(link_closure(graph, infos, kinds, closures, dep.index).iter().cloned());
+            names.extend(
+                link_closure(graph, infos, kinds, closures, dep.index)
+                    .iter()
+                    .cloned(),
+            );
         }
     }
     let names = Rc::new(names);
@@ -602,13 +723,28 @@ fn target_info(target_kind: &[String], executable: bool, src_path: String) -> Ta
     }
 }
 
-/// The view a unit gets of its local package.
-fn local_src(info: &PkgInfo, local_dirs: &[String], src_root: &str, unit: &Unit) -> SrcRef {
+/// The view a unit gets of its local package. A build script reads files
+/// rustc never names, the roots of the package's executables among them, so
+/// its run is shown those too.
+fn local_src(
+    info: &PkgInfo,
+    local_dirs: &[String],
+    src_root: &str,
+    unit: &Unit,
+    sees_every_root: bool,
+) -> SrcRef {
     let targets: Vec<TargetInfo> = info
         .pkg
         .targets
         .iter()
-        .filter_map(|t: &MetaTarget| Some(target_info(&t.kind, t.is_executable(), relative_to(&t.src_path, src_root)?)))
+        .filter(|_| !sees_every_root)
+        .filter_map(|t: &MetaTarget| {
+            Some(target_info(
+                &t.kind,
+                t.is_executable(),
+                relative_to(&t.src_path, src_root)?,
+            ))
+        })
         .collect();
     let unit_target = target_info(
         &unit.target.kind,
@@ -661,8 +797,10 @@ mod tests {
         override_keys: &[String],
         change: impl FnOnce(&mut UnitGraph, &mut Metadata, &mut String),
     ) -> Result<Graph> {
-        let mut units: UnitGraph = serde_json::from_str(include_str!("../testdata/core-rs/unit-graph.json")).unwrap();
-        let mut metadata: Metadata = serde_json::from_str(include_str!("../testdata/core-rs/metadata.json")).unwrap();
+        let mut units: UnitGraph =
+            serde_json::from_str(include_str!("../testdata/core-rs/unit-graph.json")).unwrap();
+        let mut metadata: Metadata =
+            serde_json::from_str(include_str!("../testdata/core-rs/metadata.json")).unwrap();
         // Every registry package gets a checksum made of its name.
         let mut lock = String::new();
         for pkg in metadata.packages.iter().filter(|p| p.source.is_some()) {
@@ -691,14 +829,26 @@ mod tests {
     }
 
     fn package_mut<'a>(metadata: &'a mut Metadata, name: &str) -> &'a mut Package {
-        metadata.packages.iter_mut().find(|p| p.name == name).unwrap()
+        metadata
+            .packages
+            .iter_mut()
+            .find(|p| p.name == name)
+            .unwrap()
     }
 
     #[test]
     fn packages_from_git_or_another_registry_are_refused_by_name() {
-        for source in ["git+https://github.com/KokaKiwi/rust-hex#abcdef", "registry+https://example.com/index"] {
-            let err = rejection(|_, metadata, _| package_mut(metadata, "hex").source = Some(source.to_string()));
-            assert!(err.contains("hex 0.4.3") && err.contains(source) && err.contains("crates.io"), "{err}");
+        for source in [
+            "git+https://github.com/KokaKiwi/rust-hex#abcdef",
+            "registry+https://example.com/index",
+        ] {
+            let err = rejection(|_, metadata, _| {
+                package_mut(metadata, "hex").source = Some(source.to_string())
+            });
+            assert!(
+                err.contains("hex 0.4.3") && err.contains(source) && err.contains("crates.io"),
+                "{err}"
+            );
         }
     }
 
@@ -709,13 +859,23 @@ mod tests {
             hex.source = None;
             hex.manifest_path = "/elsewhere/hex/Cargo.toml".to_string();
         });
-        assert!(err.contains("hex 0.4.3") && err.contains("/elsewhere/hex") && err.contains("outside the source tree /src"), "{err}");
+        assert!(
+            err.contains("hex 0.4.3")
+                && err.contains("/elsewhere/hex")
+                && err.contains("outside the source tree /src"),
+            "{err}"
+        );
     }
 
     #[test]
     fn a_unit_for_another_target_is_refused() {
-        let err = rejection(|units, _, _| units.units[0].platform = Some("x86_64-unknown-linux-gnu".to_string()));
-        assert!(err.contains("x86_64-unknown-linux-gnu") && err.contains("cross-compilation"), "{err}");
+        let err = rejection(|units, _, _| {
+            units.units[0].platform = Some("x86_64-unknown-linux-gnu".to_string())
+        });
+        assert!(
+            err.contains("x86_64-unknown-linux-gnu") && err.contains("cross-compilation"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -724,12 +884,115 @@ mod tests {
             let root = units.roots[0];
             units.units[root].mode = "test".to_string();
         });
-        assert!(err.contains("amber-store of amber-store-core 0.10.0") && err.contains("'test'"), "{err}");
+        assert!(
+            err.contains("amber-store of amber-store-core 0.10.0") && err.contains("'test'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_example_that_is_a_library_is_refused() {
+        let err = rejection(|units, _, _| {
+            let root = units.roots[0];
+            units.units[root].target.crate_types = vec!["cdylib".to_string()];
+        });
+        assert!(
+            err.contains("amber-store of amber-store-core 0.10.0")
+                && err.contains("crate type cdylib"),
+            "{err}"
+        );
+    }
+
+    // A binary and an example of one name, or binaries of one name in two
+    // packages, cannot both be installed.
+    #[test]
+    fn two_executables_of_one_name_are_refused() {
+        let err = rejection(|units, _, _| {
+            let mut twin = units.units[units.roots[0]].clone();
+            twin.features = vec!["other".to_string()];
+            units.units.push(twin);
+            units.roots.push(units.units.len() - 1);
+        });
+        assert!(
+            err.contains("two executables named amber-store")
+                && err.contains("`packages`, `bins` or `examples`"),
+            "{err}"
+        );
+    }
+
+    // A build script reads what it likes of its package: its run sees the
+    // roots of the package's executables, which a library does not.
+    #[test]
+    fn a_build_script_run_sees_every_root_in_src() {
+        let graph = core_rs_with(&[], |units, metadata, _| {
+            // Give the local package a build script and a binary.
+            let lib = units
+                .units
+                .iter()
+                .position(|u| u.pkg_id.contains("amber-store-core") && u.target.kind == ["lib"])
+                .unwrap();
+            let mut script = units.units[lib].clone();
+            script.target.kind = vec!["custom-build".to_string()];
+            script.target.crate_types = vec!["bin".to_string()];
+            script.target.name = "build-script-build".to_string();
+            script.target.src_path = "/src/build.rs".to_string();
+            script.dependencies.clear();
+            let mut run = script.clone();
+            run.mode = "run-custom-build".to_string();
+            units.units.push(script);
+            run.dependencies = vec![crate::unitgraph::UnitDep {
+                index: units.units.len() - 1,
+                extern_crate_name: "build_script_build".to_string(),
+            }];
+            units.units.push(run);
+            let run_index = units.units.len() - 1;
+            units.units[lib]
+                .dependencies
+                .push(crate::unitgraph::UnitDep {
+                    index: run_index,
+                    extern_crate_name: "build_script_build".to_string(),
+                });
+            let pkg = package_mut(metadata, "amber-store-core");
+            pkg.targets.push(MetaTarget {
+                kind: vec!["bin".to_string()],
+                name: "tool".to_string(),
+                src_path: "/src/src/main.rs".to_string(),
+            });
+        })
+        .unwrap();
+        let view = |prefix: &str| {
+            let (_, unit) = graph
+                .units
+                .iter()
+                .find(|(key, _)| key.starts_with(prefix))
+                .unwrap();
+            let src = match unit {
+                UnitNode::Compile(unit) => &unit.src,
+                UnitNode::Run(unit) => &unit.src,
+            };
+            let SrcRef::Local { exclude, .. } = src else {
+                panic!()
+            };
+            exclude.clone()
+        };
+        assert_eq!(
+            view("amber-store-core-0.10.0-lib-"),
+            ["benches", "examples", "src/main.rs", "tests"]
+        );
+        assert_eq!(
+            view("amber-store-core-0.10.0-build-script-"),
+            ["benches", "examples", "src/main.rs", "tests"]
+        );
+        assert_eq!(
+            view("amber-store-core-0.10.0-run-build-script-"),
+            ["benches", "examples", "tests"]
+        );
     }
 
     #[test]
     fn a_registry_package_without_checksum_is_refused() {
-        let err = rejection(|_, _, lock| *lock = lock.replace("name = \"hex\"", "name = \"other\""));
+        let err =
+            rejection(|_, _, lock| *lock = lock.replace("name = \"hex\"", "name = \"other\""));
         assert_eq!(err, "Cargo.lock has no checksum for hex 0.4.3");
     }
 
@@ -752,10 +1015,17 @@ mod tests {
         assert_eq!(graph.roots.len(), 1);
         assert_eq!(graph.bins.keys().collect::<Vec<_>>(), ["amber-store"]);
         assert_eq!(graph.bins["amber-store"], graph.roots[0]);
-        assert!(graph.roots[0].starts_with("amber-store-core-0.10.0-example-amber-store-"), "{}", graph.roots[0]);
+        assert!(
+            graph.roots[0].starts_with("amber-store-core-0.10.0-example-amber-store-"),
+            "{}",
+            graph.roots[0]
+        );
         // Only registry packages have a source to fetch.
         assert!(!graph.sources.contains_key("amber-store-core-0.10.0"));
-        assert_eq!(graph.sources["zstd-sys-2.0.16+zstd.1.5.7"].sha256, "sum-zstd-sys");
+        assert_eq!(
+            graph.sources["zstd-sys-2.0.16+zstd.1.5.7"].sha256,
+            "sum-zstd-sys"
+        );
         assert_eq!(
             graph.sources["lz4-sys-1.11.1+lz4-1.10.0"].url,
             "https://static.crates.io/crates/lz4-sys/lz4-sys-1.11.1+lz4-1.10.0.crate"
@@ -766,11 +1036,16 @@ mod tests {
     #[test]
     fn a_package_planned_twice_gives_two_units() {
         let graph = core_rs(&[]);
-        let libs: Vec<_> = compile(&graph, "libc-").into_iter().filter(|u| u.kind == "lib").collect();
+        let libs: Vec<_> = compile(&graph, "libc-")
+            .into_iter()
+            .filter(|u| u.kind == "lib")
+            .collect();
         assert_eq!(libs.len(), 2);
         assert_ne!(libs[0].metadata, libs[1].metadata);
         assert_eq!(libs[0].name, libs[1].name);
-        assert!(libs.iter().all(|u| !u.linked && u.name.starts_with("rustlib-libc-")));
+        assert!(libs
+            .iter()
+            .all(|u| !u.linked && u.name.starts_with("rustlib-libc-")));
     }
 
     #[test]
@@ -779,19 +1054,29 @@ mod tests {
         assert_eq!(a.roots, b.roots);
         for unit in compile(&a, "") {
             assert_eq!(unit.metadata.len(), 16);
-            assert!(unit.rustc_args.contains(&format!("metadata={}", unit.metadata)));
+            assert!(unit
+                .rustc_args
+                .contains(&format!("metadata={}", unit.metadata)));
         }
     }
 
     #[test]
     fn build_scripts_are_compiled_run_and_consumed() {
         let graph = core_rs(&[]);
-        let run_key = graph.units.keys().find(|k| k.starts_with("zstd-safe-7.2.4-run-build-script-")).unwrap();
-        let UnitNode::Run(run) = &graph.units[run_key] else { panic!() };
+        let run_key = graph
+            .units
+            .keys()
+            .find(|k| k.starts_with("zstd-safe-7.2.4-run-build-script-"))
+            .unwrap();
+        let UnitNode::Run(run) = &graph.units[run_key] else {
+            panic!()
+        };
         assert!(run.script.starts_with("zstd-safe-7.2.4-build-script-"));
         assert_eq!(run.links_deps.len(), 1);
         assert_eq!(run.links_deps[0].0, "zstd");
-        assert!(run.links_deps[0].1.starts_with("zstd-sys-2.0.16+zstd.1.5.7-run-build-script-"));
+        assert!(run.links_deps[0]
+            .1
+            .starts_with("zstd-sys-2.0.16+zstd.1.5.7-run-build-script-"));
         assert_eq!(run.env["PROFILE"], "release");
         assert_eq!(run.env["OPT_LEVEL"], "3");
         assert_eq!(run.env["DEBUG"], "false");
@@ -800,13 +1085,18 @@ mod tests {
         let lib = compile(&graph, "zstd-safe-7.2.4-lib-")[0];
         assert_eq!(lib.build_script.as_deref(), Some(run_key.as_str()));
         assert!(lib.pass_l);
-        assert!(lib.deps.iter().all(|(_, key)| !key.contains("-run-build-script-")));
+        assert!(lib
+            .deps
+            .iter()
+            .all(|(_, key)| !key.contains("-run-build-script-")));
 
         let script = compile(&graph, "zstd-sys-2.0.16+zstd.1.5.7-build-script-")[0];
         assert!(script.linked && !script.pass_l);
         assert_eq!(script.crate_name, "build_script_build");
         assert_eq!(script.src_path, "build.rs");
-        let UnitNode::Run(sys_run) = &graph.units[&run.links_deps[0].1] else { panic!() };
+        let UnitNode::Run(sys_run) = &graph.units[&run.links_deps[0].1] else {
+            panic!()
+        };
         assert_eq!(sys_run.env["CARGO_MANIFEST_LINKS"], "zstd");
     }
 
@@ -819,9 +1109,14 @@ mod tests {
             SrcRef::Local {
                 name: "rustsrc-amber-store-core-0.10.0".to_string(),
                 dir: String::new(),
-                exclude: ["benches", "examples/amber-bench.rs", "examples/repair-interop.rs", "tests"]
-                    .map(String::from)
-                    .to_vec(),
+                exclude: [
+                    "benches",
+                    "examples/amber-bench.rs",
+                    "examples/repair-interop.rs",
+                    "tests"
+                ]
+                .map(String::from)
+                .to_vec(),
             }
         );
         assert_eq!(example.src_path, "examples/amber-store.rs");
@@ -830,7 +1125,9 @@ mod tests {
         assert!(example.tail_args.is_empty());
 
         let lib = compile(&graph, "amber-store-core-0.10.0-lib-")[0];
-        let SrcRef::Local { exclude, .. } = &lib.src else { panic!() };
+        let SrcRef::Local { exclude, .. } = &lib.src else {
+            panic!()
+        };
         assert_eq!(exclude, &["benches", "examples", "tests"]);
 
         let redb = compile(&graph, "redb-")[0];
@@ -842,7 +1139,11 @@ mod tests {
     // redb's library is also a cdylib, so rustc links it.
     #[test]
     fn linking_units_know_the_overrides_in_their_closure() {
-        let keys = ["libsqlite3-sys".to_string(), "syn".to_string(), "absent".to_string()];
+        let keys = [
+            "libsqlite3-sys".to_string(),
+            "syn".to_string(),
+            "absent".to_string(),
+        ];
         let graph = core_rs(&keys);
         let example = compile(&graph, "amber-store-core-0.10.0-example-")[0];
         // syn is only inside proc macros, which link themselves.
@@ -850,10 +1151,22 @@ mod tests {
         let derive = compile(&graph, "serde_derive-")[0];
         assert_eq!(derive.kind, "proc-macro");
         assert_eq!(derive.overrides, ["syn"]);
-        let redb = compile(&graph, "redb-").into_iter().find(|u| u.kind == "lib").unwrap();
+        let redb = compile(&graph, "redb-")
+            .into_iter()
+            .find(|u| u.kind == "lib")
+            .unwrap();
         assert!(redb.linked);
         assert!(redb.overrides.is_empty());
-        assert_eq!(graph.packages["libsqlite3-sys-0.38.2"].override_key.as_deref(), Some("libsqlite3-sys"));
+        // A package's build script links nothing of the package itself.
+        let script = compile(&graph, "libsqlite3-sys-0.38.2-build-script-")[0];
+        assert!(script.linked);
+        assert!(script.overrides.is_empty());
+        assert_eq!(
+            graph.packages["libsqlite3-sys-0.38.2"]
+                .override_key
+                .as_deref(),
+            Some("libsqlite3-sys")
+        );
         assert_eq!(graph.packages["redb-2.6.3"].override_key, None);
     }
 
@@ -874,7 +1187,10 @@ mod tests {
 
     #[test]
     fn relative_paths() {
-        assert_eq!(relative_to("/src/a/b.rs", "/src").as_deref(), Some("a/b.rs"));
+        assert_eq!(
+            relative_to("/src/a/b.rs", "/src").as_deref(),
+            Some("a/b.rs")
+        );
         assert_eq!(relative_to("/src", "/src").as_deref(), Some(""));
         assert_eq!(relative_to("/srcs/a", "/src"), None);
         assert_eq!(relative_to("/other", "/src"), None);

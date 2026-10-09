@@ -32,7 +32,11 @@ const CARRIED_PREFIXES: &[&str] = &["CARGO_HTTP_", "CARGO_NET_"];
 
 /// What the private cargo home shares with the caller's: the download
 /// cache, and the locks cargo takes on it.
-const SHARED: &[(&str, bool)] = &[("registry", true), (".package-cache", false), (".package-cache-mutate", false)];
+const SHARED: &[(&str, bool)] = &[
+    ("registry", true),
+    (".package-cache", false),
+    (".package-cache-mutate", false),
+];
 
 /// A cargo set up to plan a build. Its temporary directories are removed
 /// when it is dropped.
@@ -48,15 +52,26 @@ impl Cargo {
             Some(home) if !home.is_empty() => PathBuf::from(home),
             _ => match std::env::var_os("HOME") {
                 Some(home) => PathBuf::from(home).join(".cargo"),
-                None => return Err("neither CARGO_HOME nor HOME is set, so there is no cargo cache to use".into()),
+                None => {
+                    return Err(
+                        "neither CARGO_HOME nor HOME is set, so there is no cargo cache to use"
+                            .into(),
+                    )
+                }
             },
         };
         let scratch = std::env::temp_dir().join(format!(
             "rostnix-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
         ));
-        let this = Cargo { cargo: cargo.into(), rustc: rustc.into(), scratch };
+        let this = Cargo {
+            cargo: cargo.into(),
+            rustc: rustc.into(),
+            scratch,
+        };
         fs::create_dir_all(this.home())?;
         fs::create_dir_all(this.target_dir())?;
 
@@ -92,7 +107,9 @@ impl Cargo {
         cmd.current_dir(dir).env_clear();
         for (key, value) in std::env::vars_os() {
             let name = key.to_string_lossy();
-            if CARRIED.contains(&name.as_ref()) || CARRIED_PREFIXES.iter().any(|p| name.starts_with(p)) {
+            if CARRIED.contains(&name.as_ref())
+                || CARRIED_PREFIXES.iter().any(|p| name.starts_with(p))
+            {
                 cmd.env(&key, value);
             }
         }

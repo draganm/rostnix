@@ -135,10 +135,49 @@ check_no_executable_error() {
   if msg="$(fixture_with workspace '{ packages = [ "ws-core" ]; }' 'app.drvPath' 2>&1)"; then
     fail "a selection with no binary and no example was accepted"
   fi
+  # The message itself, not the source line a trace would quote.
   case "$msg" in
-    *'`bins` or `examples`'*) echo "ok: a selection with nothing to install is explained" ;;
+    *'error: rostnix: the selection builds no binary and no example'*)
+      echo "ok: a selection with nothing to install is explained" ;;
     *) fail "unhelpful error for a selection with nothing to install: $msg" ;;
   esac
+}
+
+# extraSrc is about the source tree; on a crate from the registry it would
+# silently do nothing.
+check_override_foreign_extra_src() {
+  local msg
+  if msg="$(fixture_with buildscript '{
+      crateOverrides = { libz-sys.extraSrc = [ "shared" ]; consumer.extraSrc = [ "shared" ]; };
+    }' 'app.drvPath' 2>&1)"; then
+    fail "crateOverrides: extraSrc on a registry package was accepted"
+  fi
+  case "$msg" in
+    *'error: rostnix: crateOverrides.libz-sys.extraSrc is set for a package that is not part of the source tree'*)
+      echo "ok: crateOverrides: extraSrc on a registry package is rejected" ;;
+    *) fail "crateOverrides: unhelpful error for extraSrc on a registry package: $msg" ;;
+  esac
+}
+
+# Paths and values as people write them: a leading ./, a trailing /, and a
+# number or a boolean in env.
+check_override_spellings() {
+  local got
+  got="$(fixture_with buildscript '{
+      crateOverrides = {
+        consumer.extraSrc = [ "./shared/" ];
+        bs-native.env = { ROSTNIX_FIXTURE_NOTE = 7; FLAG = true; };
+      };
+    }' '
+      let
+        units = builtins.attrValues app.units;
+        named = name: builtins.head (builtins.filter (u: u.name == name) units);
+        plain = app.override or null;
+      in "${builtins.toJSON (named "rustbsrun-bs-native-0.1.0").node.overrideEnv} ${toString (builtins.pathExists "${(named "rustbin-consumer").node.src}/shared/message.txt")}"
+    ')" || fail "crateOverrides: spellings do not evaluate"
+  [ "$got" = '{"FLAG":"1","ROSTNIX_FIXTURE_NOTE":"7"} 1' ] ||
+    fail "crateOverrides: env and extraSrc came out as [$got]"
+  echo "ok: crateOverrides: env values become strings and extraSrc paths are cleaned"
 }
 
 # A misspelt attribute must not be ignored.
@@ -193,7 +232,8 @@ check_override_inputs() {
         inputs = name: toString (map (i: i.pname) (builtins.head (named name)).buildInputs);
       in "bin: ${inputs "rustbin-consumer"}; native run: ${inputs "rustbsrun-bs-native-0.1.0"}; consumer run: ${inputs "rustbsrun-consumer-0.1.0"}; zlib run: ${inputs "rustbsrun-libz-sys-1.1.29"}; script: ${inputs "rustbs-bs-native-0.1.0"}"
     ')" || fail "crateOverrides: buildInputs do not evaluate"
-  want="bin: lz4 zlib; native run: lz4; consumer run: lz4; zlib run: zlib; script: "
+  # consumer's script depends on both bs-native's and libz-sys's.
+  want="bin: lz4 zlib; native run: lz4; consumer run: lz4 zlib; zlib run: zlib; script: "
   [ "$got" = "$want" ] || fail "crateOverrides: units got the inputs [$got], want [$want]"
   echo "ok: crateOverrides: buildInputs reach the units that link the package and the build scripts that depend on its"
 }
@@ -277,6 +317,8 @@ check_no_intermediate_refs buildscript
 check_override_typo
 check_override_unmatched
 check_override_inputs
+check_override_foreign_extra_src
+check_override_spellings
 
 # One project under four profiles.
 for profile in release thin nolto dev; do

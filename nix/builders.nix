@@ -14,6 +14,13 @@ let
   overrideOf = package:
     if package.override == null then { } else crateOverrides.${package.override};
 
+  # An override's environment with every value a string, as nixpkgs takes
+  # `env`: 1 and true are "1".
+  envOf = override: lib.mapAttrs (_: toString) (override.env or { });
+
+  # "./proto/" and "proto" name the same directory.
+  cleanPath = path: lib.removeSuffix "/" (lib.removePrefix "./" path);
+
   # "a/b/c" gives [ "a" "a/b" ]: every directory on the way to a path.
   parents = path:
     let parts = lib.splitString "/" path;
@@ -45,7 +52,7 @@ let
   # source that the package's override may widen.
   sourceOf = src: override:
     if src ? localSource
-    then mkLocalSource (src.localSource // { extra = override.extraSrc or [ ]; })
+    then mkLocalSource (src.localSource // { extra = map cleanPath (override.extraSrc or [ ]); })
     else src;
 in
 {
@@ -82,7 +89,7 @@ in
           env = package.env // node.env;
           deps = map (dep: { inherit (dep) name; path = "${dep.unit}"; }) node.deps;
           buildScript = if node.buildScript == null then null else "${node.buildScript}";
-          overrideEnv = override.env or { };
+          overrideEnv = envOf override;
         };
       };
     in
@@ -133,7 +140,7 @@ in
         script = "${node.script}";
         env = package.env // node.env;
         linksDeps = map (dep: { inherit (dep) links; path = "${dep.unit}"; }) node.linksDeps;
-        overrideEnv = override.env or { };
+        overrideEnv = envOf override;
       };
       nativeBuildInputs = override.nativeBuildInputs or [ ];
       buildInputs = libraries;

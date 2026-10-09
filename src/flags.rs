@@ -79,9 +79,16 @@ pub fn base_args(flags: &UnitFlags) -> Vec<String> {
     for feature in &unit.features {
         push(&["--cfg", &format!("feature=\"{feature}\"")]);
     }
-    let declared: Vec<String> = flags.declared_features.iter().map(|f| format!("\"{f}\"")).collect();
+    let declared: Vec<String> = flags
+        .declared_features
+        .iter()
+        .map(|f| format!("\"{f}\""))
+        .collect();
     push(&["--check-cfg", "cfg(docsrs,test)"]);
-    push(&["--check-cfg", &format!("cfg(feature, values({}))", declared.join(", "))]);
+    push(&[
+        "--check-cfg",
+        &format!("cfg(feature, values({}))", declared.join(", ")),
+    ]);
 
     push(&["-C", &format!("metadata={}", flags.metadata)]);
     push(&["-C", &format!("extra-filename=-{}", flags.metadata)]);
@@ -152,9 +159,20 @@ mod tests {
 
     #[test]
     fn build_script() {
-        let unit = unit("custom-build", "bin", "build-script-build", HOST, &["default", "std"]);
+        let unit = unit(
+            "custom-build",
+            "bin",
+            "build-script-build",
+            HOST,
+            &["default", "std"],
+        );
         assert_eq!(
-            args(&unit, Lto::OnlyObject, &["backtrace", "default", "std"], &[]),
+            args(
+                &unit,
+                Lto::OnlyObject,
+                &["backtrace", "default", "std"],
+                &[]
+            ),
             "--crate-type bin -C embed-bitcode=no -C debug-assertions=off \
              --cfg feature=\"default\" --cfg feature=\"std\" --check-cfg cfg(docsrs,test) \
              --check-cfg cfg(feature, values(\"backtrace\", \"default\", \"std\")) \
@@ -165,7 +183,13 @@ mod tests {
 
     #[test]
     fn proc_macro() {
-        let unit = unit("proc-macro", "proc-macro", "serde_derive", HOST, &["default"]);
+        let unit = unit(
+            "proc-macro",
+            "proc-macro",
+            "serde_derive",
+            HOST,
+            &["default"],
+        );
         assert_eq!(
             args(&unit, Lto::OnlyObject, &["default", "deserialize_in_place"], &[]),
             "--crate-type proc-macro -C prefer-dynamic -C embed-bitcode=no -C debug-assertions=off \
@@ -173,14 +197,22 @@ mod tests {
              --check-cfg cfg(feature, values(\"default\", \"deserialize_in_place\")) \
              -C metadata=M -C extra-filename=-M -C strip=debuginfo"
         );
-        assert_eq!(tail_args(&unit, false), ["--extern", "proc_macro", "--cap-lints", "allow"]);
+        assert_eq!(
+            tail_args(&unit, false),
+            ["--extern", "proc_macro", "--cap-lints", "allow"]
+        );
     }
 
     #[test]
     fn library_under_thin_lto_with_lints() {
         let unit = unit("lib", "lib", "libc", RELEASE, &["default", "std"]);
         assert_eq!(
-            args(&unit, Lto::OnlyBitcode, &["default", "std"], &["--allow=unused_qualifications"]),
+            args(
+                &unit,
+                Lto::OnlyBitcode,
+                &["default", "std"],
+                &["--allow=unused_qualifications"]
+            ),
             "--crate-type lib -C opt-level=3 -C panic=abort -C linker-plugin-lto \
              --allow=unused_qualifications --cfg feature=\"default\" --cfg feature=\"std\" \
              --check-cfg cfg(docsrs,test) --check-cfg cfg(feature, values(\"default\", \"std\")) \

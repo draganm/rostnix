@@ -44,7 +44,9 @@ pub struct MetaTarget {
 impl Package {
     /// The directory of the package's `Cargo.toml`.
     pub fn manifest_dir(&self) -> &str {
-        self.manifest_path.rsplit_once('/').map_or("", |(dir, _)| dir)
+        self.manifest_path
+            .rsplit_once('/')
+            .map_or("", |(dir, _)| dir)
     }
 
     /// Whether the package has a library or proc-macro target.
@@ -74,8 +76,14 @@ impl Package {
             ("CARGO_PKG_HOMEPAGE".to_string(), opt(&self.homepage)),
             ("CARGO_PKG_REPOSITORY".to_string(), opt(&self.repository)),
             ("CARGO_PKG_LICENSE".to_string(), opt(&self.license)),
-            ("CARGO_PKG_LICENSE_FILE".to_string(), opt(&self.license_file)),
-            ("CARGO_PKG_RUST_VERSION".to_string(), opt(&self.rust_version)),
+            (
+                "CARGO_PKG_LICENSE_FILE".to_string(),
+                opt(&self.license_file),
+            ),
+            (
+                "CARGO_PKG_RUST_VERSION".to_string(),
+                opt(&self.rust_version),
+            ),
             ("CARGO_PKG_README".to_string(), opt(&self.readme)),
         ])
     }
@@ -115,7 +123,13 @@ mod tests {
         assert_eq!(root.source, None);
         assert_eq!(root.manifest_dir(), "/src");
         assert!(root.has_lib());
-        assert_eq!(root.targets.iter().filter(|t| t.kind == ["example"]).count(), 3);
+        assert_eq!(
+            root.targets
+                .iter()
+                .filter(|t| t.kind == ["example"])
+                .count(),
+            3
+        );
         assert_eq!(package(&meta, "zstd-sys").links.as_deref(), Some("zstd"));
     }
 
