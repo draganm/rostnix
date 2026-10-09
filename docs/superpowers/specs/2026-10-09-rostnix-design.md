@@ -478,6 +478,13 @@ Copies each executable out of its unit into `$out/bin`. A unit's output
 refers to its dependencies through `unit.json`; the copy does not, so the
 application's closure holds only what the executables themselves refer to.
 
+macOS needs one more step when the profile keeps debug information. There
+it stays in the object files, and the executable points at them, which
+would keep every unit alive, and through `unit.json` the sources and the
+toolchain. Such an executable gets a `.dSYM` bundle beside it, made with
+`dsymutil`, and has the pointers stripped. ripgrep, whose release profile
+sets `debug = 1`, showed the need.
+
 ## rustc flags
 
 `resolve` computes every flag that does not depend on a store path and puts

@@ -91,7 +91,8 @@ The selection means what it means to `cargo build`. With neither `bins` nor
 packages. With either, it builds only what they name.
 
 Every binary and example the selection builds lands in `$out/bin` under its
-target name. A selection that builds neither, which is what a library-only
+target name. On macOS, one built with debug information has a `.dSYM`
+bundle beside it. A selection that builds neither, which is what a library-only
 project gives by default, is an error that says so. A project whose
 executable is an example names it:
 

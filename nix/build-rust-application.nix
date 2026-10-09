@@ -1,6 +1,6 @@
 # buildRustApplication asks cargo for its plan during evaluation, through
 # builtins.exec, and turns it into derivations.
-{ lib, runCommand, rustc, cargo, tool, mkBuilders }:
+{ lib, runCommand, runCommandCC, isDarwin, rustc, cargo, tool, mkBuilders }:
 
 { pname
 , version ? null
@@ -75,8 +75,28 @@ let
       graph;
 
   binNames = lib.attrNames checked.bins;
+
+  # Copies one executable out of its unit. macOS leaves debug information
+  # in the object files and has the executable point at them, which would
+  # keep every unit, and through the units the sources and the compiler,
+  # alive for as long as the result is. Such an executable gets its debug
+  # information collected in a .dSYM bundle beside it, where debuggers and
+  # backtraces look for it, and loses the pointers.
+  install = name:
+    let file = "$out/bin/${lib.escapeShellArg name}";
+    in ''
+      cp ${checked.bins.${name}}/bin/${lib.escapeShellArg name} $out/bin/
+    '' + lib.optionalString isDarwin ''
+      # A count, not `grep -q`: stdenv sets pipefail, and nm cut short by
+      # grep leaving early would read as "no such entries".
+      if [ "$(nm -a ${file} 2>/dev/null | grep -c ' OSO ' || true)" != 0 ]; then
+        chmod u+w ${file}
+        dsymutil ${file} -o ${file}.dSYM
+        $STRIP -S ${file}
+      fi
+    '';
 in
-runCommand (if version == null then pname else "${pname}-${version}")
+(if isDarwin then runCommandCC else runCommand) (if version == null then pname else "${pname}-${version}")
 {
   # With one executable, `nix run` needs no flags.
   meta = lib.optionalAttrs (lib.length binNames == 1) { mainProgram = lib.head binNames; } // meta;
@@ -97,7 +117,5 @@ runCommand (if version == null then pname else "${pname}-${version}")
 }
   ''
     mkdir -p $out/bin
-    ${lib.concatMapStrings
-      (name: "cp ${checked.bins.${name}}/bin/${lib.escapeShellArg name} $out/bin/\n")
-      binNames}
+    ${lib.concatMapStrings install binNames}
   ''

@@ -84,7 +84,7 @@ pub fn run(request: &str) -> Result<String> {
         serde_json::from_str(request).map_err(|err| format!("the resolve request is not what this version expects: {err}"))?;
     let src = request.src.trim_end_matches('/');
     let cargo_root = normalize_dir(&request.cargo_root);
-    let workspace: PathBuf = Path::new(src).join(&cargo_root);
+    let workspace: PathBuf = if cargo_root.is_empty() { src.into() } else { Path::new(src).join(&cargo_root) };
     if !workspace.join("Cargo.toml").exists() {
         return Err(format!("there is no Cargo.toml in {}; set cargoRoot to the directory that holds it", workspace.display()).into());
     }

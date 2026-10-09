@@ -280,6 +280,16 @@ for profile in release thin nolto dev; do
   check_run "profiles-$profile" profiles "profiles ok 12345"
   check_conformance "profiles-$profile" default --profile "$profile"
 done
+# dev keeps debug information. On macOS that lives in the units' object
+# files, which the result must not keep alive: it gets a .dSYM instead.
+check_no_intermediate_refs profiles-dev
+if [ "$(uname)" = Darwin ]; then
+  [ -d "$(build fixtures.profiles-dev)/bin/profiles.dSYM" ] ||
+    fail "profiles-dev: no .dSYM bundle beside the executable"
+  [ ! -e "$(build fixtures.profiles-release)/bin/profiles.dSYM" ] ||
+    fail "profiles-release: a .dSYM bundle for an executable without debug information"
+  echo "ok: profiles-dev: debug information is in a .dSYM bundle"
+fi
 
 # Patient zero.
 core_rs="$(build fixtures.core-rs)"

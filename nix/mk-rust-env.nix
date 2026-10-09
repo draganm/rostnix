@@ -26,6 +26,10 @@ let
   buildRustApplication = import ./build-rust-application.nix {
     inherit lib tool rustc cargo;
     inherit (buildPkgs) runCommand;
+    # Installing an executable for macOS needs the tools that handle its
+    # debug information.
+    inherit (pkgs) runCommandCC;
+    inherit (pkgs.stdenv.hostPlatform) isDarwin;
     mkBuilders = builders;
   };
 in
