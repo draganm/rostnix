@@ -167,7 +167,8 @@ packages. With either, it builds only what they name.
 Every binary and example the selection builds lands in `$out/bin` under its
 target name. A selection that builds neither is an error that names `bins`
 and `examples`. `passthru` exposes `graph`, `units`
-and `bins`, each unit a derivation, so one unit can be built alone.
+and `bins`, each unit a derivation, so one unit can be built alone, and
+`unitRecords`, a directory of every unit's `unit.json`.
 
 ## Components
 
@@ -322,12 +323,14 @@ and builders cannot drift and carries no version number.
 Cargo runs with a clean environment and a private cargo home, so the same
 source plans to the same graph in every shell.
 
-- **Carried over** from the caller: `HOME`, `PATH`, `TMPDIR`, the proxy
-  variables, the certificate variables (`SSL_CERT_FILE`, `NIX_SSL_CERT_FILE`,
-  `CURL_CA_BUNDLE`), and `CARGO_HTTP_*` and `CARGO_NET_*`.
+- **Carried over** from the caller: `HOME`, `USER`, `LOGNAME`, `PATH`,
+  `TMPDIR`, the proxy variables, the certificate variables (`SSL_CERT_FILE`,
+  `NIX_SSL_CERT_FILE`, `CURL_CA_BUNDLE`), and `CARGO_HTTP_*` and
+  `CARGO_NET_*`.
 - **Set by the tool:** `CARGO_HOME` (the private home), `RUSTC`,
   `RUSTC_BOOTSTRAP=1`, `CARGO_TARGET_DIR` (a temporary directory that stays
-  empty) and `CARGO_GC_AUTO_FREQUENCY=never`.
+  empty), `CARGO_GC_AUTO_FREQUENCY=never` and
+  `CARGO_TERM_PROGRESS_WHEN=never`.
 - **Dropped:** everything else, among it `RUSTFLAGS`, `CARGO_BUILD_*`,
   `CARGO_PROFILE_*` and `RUSTC_WRAPPER`.
 
@@ -364,7 +367,8 @@ at build time, `rustflags` and `[env]`, is not applied before stage 3.
 
 For each registry package that owns a unit:
 
-1. **Checksum.** Taken from the package's entry in `Cargo.lock`.
+1. **Checksum.** Taken from the package's entry in `Cargo.lock`, or from
+   the `[metadata]` table of a lockfile in the first format.
 2. **Store path.** Fixed-output, flat SHA-256, name `<name>-<version>.crate`,
    under `storeDir`. The tool computes it from the checksum; nothing is
    hashed.
@@ -397,9 +401,17 @@ package directory, narrowed by three rules:
 
 1. Directories of other packages inside it are left out.
 2. `examples/`, `tests/` and `benches/` are left out, unless the unit is
-   itself an example, a test or a bench; then its own directory stays.
-3. The root file of every other binary, example, test and bench is left out,
-   and its directory when that root is a `main.rs` in a directory of its own.
+   itself an example, a test or a bench, or has its root in one of them;
+   then that directory stays.
+3. The root file of every other binary, example, test and bench is left out.
+   Where cargo found such a target as a directory, `src/bin/<name>/main.rs`
+   and its like under `examples/`, `tests/` and `benches/`, the directory is
+   left out. A `main.rs` anywhere else hides only itself, since its
+   directory may hold other targets' modules.
+
+A build-script run is exempt from the third rule. Build scripts read source
+files that rustc is never told about, the roots of the package's
+executables among them, as `cxx_build::bridge("src/main.rs")` does.
 
 For core-rs the library sees the package without `examples`, `tests` and
 `benches`, and the example `amber-store` sees it without `tests`, `benches`
@@ -438,7 +450,7 @@ Runs rustc once. Outputs:
 - `$out/lib/`: the rlib of a library, and the dynamic library of a proc
   macro or `cdylib`;
 - `$out/bin/<name>` for a binary, an example or a build script;
-- `$out/unit.json`: the artifacts, what dependents need (below), and the
+- `$out/unit.json`: the artifact, what dependents need (below), and the
   arguments and environment rustc ran with.
 
 **Dependencies.** rustc needs the rlib of every transitive dependency, not
@@ -451,6 +463,12 @@ dependencies, and never includes a build script's.
 
 The same file carries the library search paths (`-L`) printed by every build
 script in the unit's closure, which cargo passes to every dependent rustc.
+They keep cargo's order: the unit's own script, then its dependencies' by
+package, and across all of them the paths inside the `OUT_DIR` of the script
+that printed them before the others, so that a library a script built wins
+over one of the same name found elsewhere. The file also carries the linker
+arguments scripts ask of cdylibs, which cargo passes to every cdylib that
+has the script's package in its closure.
 
 **Linking.** A unit links when it has a crate type of `bin`, `proc-macro`,
 `cdylib` or `dylib`. Units that do not link are a bare `derivation` whose
@@ -476,6 +494,13 @@ See [Build scripts](#build-scripts).
 Copies each executable out of its unit into `$out/bin`. A unit's output
 refers to its dependencies through `unit.json`; the copy does not, so the
 application's closure holds only what the executables themselves refer to.
+
+macOS needs one more step when the profile keeps debug information. There
+it stays in the object files, and the executable points at them, which
+would keep every unit alive, and through `unit.json` the sources and the
+toolchain. Such an executable gets a `.dSYM` bundle beside it, made with
+`dsymutil`, and has the pointers stripped. ripgrep, whose release profile
+sets `debug = 1`, showed the need.
 
 ## rustc flags
 
@@ -509,7 +534,11 @@ across machines. It is not cargo's value.
 
 **Path remapping.** Each source store path is remapped to
 `<name>-<version>`, so panic messages and debug information do not mention
-the store and an executable does not keep its sources alive.
+the store and an executable does not keep its sources alive. The `OUT_DIR`
+of the package's build script is remapped to `<name>-<version>/out` for the
+same reason: code generated there is compiled from there, and a panic in it
+would otherwise name the script's run, whose `unit.json` refers to the
+script, the compiler and everything the script was built from.
 
 **Environment.** rustc gets the variables cargo sets: `CARGO_PKG_*`,
 `CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_PATH`, `CARGO_CRATE_NAME`,
@@ -525,7 +554,8 @@ package has a build script, and what that script set with `rustc-env`.
 enabled feature, and `CARGO_CFG_*` from `rustc --print=cfg`, queried in the
 derivation as cargo queries it.
 
-It reads `cargo::` and `cargo:` lines from the script's stdout:
+It reads `cargo::` and `cargo:` lines from the script's stdout, ignoring
+whitespace around a line as cargo does:
 
 | Directive | Effect |
 |---|---|
@@ -533,7 +563,7 @@ It reads `cargo::` and `cargo:` lines from the script's stdout:
 | `rustc-cfg`, `rustc-check-cfg`, `rustc-env` | Flags and environment of the package's own units. |
 | `rustc-link-arg` and its `-bin`, `-bins`, `-cdylib`, `-examples`, `-tests`, `-benches` forms | `-C link-arg` on the kinds of unit each form names. |
 | `metadata`, and any other `KEY=VALUE` in the one-colon form | `DEP_<LINKS>_<KEY>` for the build scripts of packages that depend on this one, when this package sets `links`. |
-| `warning` | Printed to the build log. |
+| `warning` | Printed to the build log for a local package. A foreign package's warnings stay in `$out/output`, as cargo shows them only with `-vv`. |
 | `error` | The derivation fails. |
 | `rerun-if-changed`, `rerun-if-env-changed` | Ignored: Nix decides when to rerun. |
 
@@ -560,13 +590,16 @@ A key is a package name.
 
 | Attribute | Default | Meaning |
 |---|---|---|
-| `buildInputs` | `[ ]` | Libraries. The package's build-script run gets them, and so does every unit that links and has the package in its closure. |
+| `buildInputs` | `[ ]` | Libraries. The package's build-script run gets them; so does every build-script run that depends on it through `links`, directly or not; and so does every unit that links and has the package in its closure. |
 | `nativeBuildInputs` | `[ ]` | Tools the package's build script and rustc invocations run, such as `pkg-config`. |
 | `env` | `{ }` | Environment of the package's build script and of its rustc invocations. |
 | `extraSrc` | `[ ]` | Local packages only: files and directories, relative to `src`, added to the view of every unit of the package. |
 
-A package with an entry builds all its units with stdenv. Any other
-attribute is an error. A key that names no package of the build gets a
+A package with an entry builds all its units with stdenv. `env` values
+become strings as `toString` makes them, and an `extraSrc` path may be
+written with a leading `./` or a trailing `/`. `extraSrc` on a package that
+is not local is an error, because it would do nothing. Any other attribute
+is an error. A key that names no package of the build gets a
 warning, because such an entry changes nothing. It is not an error because
 the same key may match on another platform or with other features.
 
@@ -591,7 +624,14 @@ means both sides have the same units. Normalising removes these differences:
   cargo's own bookkeeping;
 - `--extern` naming an `.rmeta` under cargo, which pipelines, and the rlib
   under rostnix;
+- the order of flags, except among lints and among the `-L` and `-l` flags
+  from build scripts, where order decides which lint level or which library
+  wins;
 - `--remap-path-prefix`, which rostnix adds;
+- `--cap-lints warn`, which cargo passes for foreign packages in place of
+  `allow` because `-vv` asks to see their warnings;
+- what a `crateOverrides` entry adds to the environment, which `unit.json`
+  records apart from what cargo would set;
 - `NUM_JOBS`, `CARGO_MAKEFLAGS` and the library path variables, which
   describe the machine.
 
@@ -666,9 +706,13 @@ non-zero. Nix then reports that the program failed.
 | Pre-seeded path differs from the computed one | Names the crate and its cache file, and says the file does not match `Cargo.lock`. |
 | `nix` missing or `nix store add` fails | Warning only; the download derivation covers it. |
 | A unit of a kind or mode this version does not build | Names the unit and its mode. |
+| An example that is not an executable | Names the example and its crate type. |
+| A target whose root file is outside its package directory | Names the target and the file. |
+| Two selected executables with one name | Names both units and says to select one. |
 | A unit planned for another target, before stage 4 | Names the target and says cross-compilation is not supported yet. |
 | The selection builds no binary or example | `buildRustApplication` throws, naming `bins` and `examples`. |
 | Unknown `crateOverrides` attribute | `buildRustApplication` throws, naming it and the attributes an entry takes. |
+| `extraSrc` on a package that is not local | `buildRustApplication` throws, naming the entry. |
 | A build script fails or prints `cargo::error` | The run derivation fails with the script's output in its log. |
 
 ## Not in this version
@@ -676,7 +720,19 @@ non-zero. Nix then reports that the program failed.
 Doc tests, benches, `cargo doc`, workspaces whose root is outside `src`,
 `vendor` directories and source replacement, artifact dependencies,
 `build-std`, `-Z` features other than the unit graph, content-addressed
-derivations, sccache or any compiler wrapper, and Windows.
+derivations, sccache or any compiler wrapper, dependencies built as Rust
+`dylib`s, and Windows.
+
+Known gaps, none of which the fixtures meet:
+
+- A custom profile defined in cargo configuration rather than in
+  `Cargo.toml` is taken to descend from `release` when a build script is
+  told `PROFILE`.
+- A local path dependency that belongs to another workspace gets this
+  workspace's `[workspace.lints]` when it says `lints.workspace = true`.
+- On Linux, C objects a build script compiles with debug information may
+  name their sources in the store, which the executable then refers to.
+  Linux is untested as a whole.
 
 ## Testing rostnix
 
@@ -702,9 +758,9 @@ sandbox because they need `exec` and the network.
 | Fixture | Covers |
 |---|---|
 | `hello` | One package with a library and a binary, crates.io dependencies with build scripts and a proc macro, the default selection. |
-| `workspace` | Three members, one of them a proc macro and one nested in another's directory; `packages`, `bins` and `features`; a renamed dependency. |
+| `workspace` | Four members, one of them a proc macro and one nested in another's directory; `packages`, `bins` and `features`; a renamed dependency; lints inherited from the workspace. |
 | `buildscript` | A local build script that generates code into `OUT_DIR`, compiles C, sets `links` and metadata read by a dependent's build script; `rustc-cfg` and `rustc-env`; a `crateOverrides` entry that supplies zlib through `pkg-config`; `extraSrc`. |
-| `profiles` | Fat, thin and no LTO, `panic = "abort"`, `opt-level = "s"`, `codegen-units`, a per-package override and a custom profile. |
+| `profiles` | One project built under four profiles: fat LTO with `panic = "abort"`, `opt-level = "s"`, `codegen-units` and a per-package override; thin LTO; no LTO; and `dev`. |
 | core-rs | Patient zero at its pinned commit, fetched with `builtins.fetchTree`: the `amber-store` example. |
 | rostnix | rostnix builds itself with `buildRustApplication`. |
 
@@ -747,9 +803,10 @@ src/node.rs          reading a derivation's node from its attributes
 src/compile.rs       the compile subcommand
 src/buildscript.rs   the run-build-script subcommand, directive parsing
 nix/                 mk-rust-env.nix, tool.nix, builders.nix, build-rust-application.nix
+examples/conformance.rs   comparing units with a cargo build -vv log
+testdata/            recorded cargo output for the unit tests
 tests/fixtures/      integration fixtures
-tests/patient-zero.nix
-tests/conformance/   comparing units with cargo build -vv
+tests/fixtures.nix   the fixtures, core-rs and rostnix itself as builds
 tests/run.sh         integration driver
 ```
 

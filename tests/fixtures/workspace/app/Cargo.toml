@@ -1,0 +1,16 @@
+[package]
+name = "ws-app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+core_renamed = { package = "ws-core", path = "../crates/core" }
+ws-nested = { path = "../crates/core/nested" }
+ws-macros = { path = "../crates/macros" }
+itoa = "1"
+
+[features]
+shout = ["core_renamed/loud"]
+
+[lints]
+workspace = true
