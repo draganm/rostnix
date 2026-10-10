@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::config;
@@ -79,12 +79,14 @@ pub fn run() -> Result<()> {
     }
 
     let artifact = artifact(node, &inv.out_dir)?;
+    name_for_install(node, out, &inv.out_dir)?;
     node::write_record(
         out,
         &CompileRecord {
             kind: node.kind.clone(),
             pkg: node.pkg.clone(),
             crate_name: node.crate_name.clone(),
+            target_name: node.target_name.clone(),
             artifact,
             transitive: inv.transitive,
             native: inv.native,
@@ -253,6 +255,14 @@ pub fn plan_at(
         "--out-dir".to_string(),
         out_dir.clone(),
     ]);
+    // What is built for another platform than the machine's own: cargo
+    // names the platform, and the linker it was told of for it.
+    if let Some(target) = &node.target {
+        argv.extend(["--target".to_string(), target.clone()]);
+    }
+    if let Some(linker) = &node.linker {
+        argv.extend(["-C".to_string(), format!("linker={linker}")]);
+    }
     for dir in &search {
         argv.extend(["-L".to_string(), format!("dependency={dir}")]);
     }
@@ -361,30 +371,117 @@ pub fn plan_at(
     }
 }
 
-/// Finds what rustc wrote, and gives an executable its target name.
+/// What follows `<stem>.` in the name of a file that rustc wrote as the
+/// crate's result: one word, as in `.wasm` or `.rlib`. Beside its result
+/// rustc leaves files with more to their names, the object files a debugger
+/// reads on macOS, and files that say what it read.
+fn ending_of<'a>(name: &'a str, stem: &str) -> Option<&'a str> {
+    let ending = name.strip_prefix(stem)?.strip_prefix('.')?;
+    let one_word = !ending.contains('.') || matches!(ending, "dll.a" | "dll.lib");
+    (one_word && !matches!(ending, "d" | "o")).then_some(ending)
+}
+
+/// The same for a library, which most platforms name with `lib` in front.
+fn library_ending_of<'a>(name: &'a str, stem: &str) -> Option<&'a str> {
+    name.strip_prefix("lib")
+        .and_then(|rest| ending_of(rest, stem))
+        .or_else(|| ending_of(name, stem))
+}
+
+/// The executable rustc wrote into `dir` for the crate `stem`: a file of
+/// that name, or of that name and what the platform ends an executable's
+/// with, `.wasm` or `.exe`.
+pub fn executable_in(dir: &Path, stem: &str) -> Option<PathBuf> {
+    let plain = dir.join(stem);
+    if plain.is_file() {
+        return Some(plain);
+    }
+    let mut found: Vec<PathBuf> = fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| Some(entry.ok()?.path()))
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| ending_of(name.to_str()?, stem))
+                    .is_some()
+        })
+        .collect();
+    found.sort();
+    found.into_iter().next()
+}
+
+/// The names of the files in `out_dir`.
+fn file_names(out_dir: &str) -> Result<Vec<String>> {
+    let mut names: Vec<String> = fs::read_dir(out_dir)?
+        .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// Finds what rustc wrote, and gives an executable its target name, with
+/// whatever the platform ends an executable's name with.
 fn artifact(node: &CompileNode, out_dir: &str) -> Result<String> {
     let stem = format!("{}-{}", node.crate_name, node.metadata);
     if is_executable(node) {
-        let built = Path::new(out_dir).join(&stem);
-        let named = Path::new(out_dir).join(&node.target_name);
-        fs::rename(&built, &named)
-            .map_err(|err| format!("rustc did not write {}: {err}", built.display()))?;
+        let built = executable_in(Path::new(out_dir), &stem)
+            .ok_or_else(|| format!("rustc wrote no executable {stem} into {out_dir}"))?;
+        let ending = built
+            .file_name()
+            .and_then(|name| name.to_str()?.strip_prefix(&stem))
+            .unwrap_or_default();
+        let named = Path::new(out_dir).join(format!("{}{ending}", node.target_name));
+        fs::rename(&built, &named).map_err(|err| format!("renaming {}: {err}", built.display()))?;
         return Ok(named.to_string_lossy().into_owned());
     }
 
-    let mut files: Vec<String> = fs::read_dir(out_dir)?
-        .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
-        .filter(|name| name.starts_with(&format!("lib{stem}.")))
+    // A library is named by its rlib. A proc macro has only its dynamic
+    // library, and so has a cdylib that is nothing else, which on some
+    // platforms carries no `lib` before its name.
+    let files: Vec<String> = file_names(out_dir)?
+        .into_iter()
+        .filter(|name| library_ending_of(name, &stem).is_some())
         .collect();
-    files.sort();
-    // A library is named by its rlib; a proc macro has only its dynamic
-    // library.
     let chosen = files
         .iter()
         .find(|name| name.ends_with(".rlib"))
         .or_else(|| files.first())
         .ok_or_else(|| format!("rustc wrote no lib{stem}.* into {out_dir}"))?;
     Ok(format!("{out_dir}/{chosen}"))
+}
+
+/// The name cargo gives a library file in its target directory: the one
+/// rustc wrote, without the unit's hash.
+pub fn installed_name(file: &str, metadata: &str) -> String {
+    file.replacen(&format!("-{metadata}"), "", 1)
+}
+
+/// A library that is built for use from outside Rust, a `cdylib` or a
+/// `staticlib`, is something to install. Its files get the names cargo's
+/// target directory has for them, in `install` beside `lib`, as links: the
+/// names with the hash are the ones other units know.
+fn name_for_install(node: &CompileNode, out: &str, out_dir: &str) -> Result<()> {
+    let for_others = has_crate_type(node, "cdylib") || has_crate_type(node, "staticlib");
+    if node.kind != "lib" || !for_others {
+        return Ok(());
+    }
+    let stem = format!("{}-{}", node.crate_name, node.metadata);
+    let install = Path::new(out).join("install");
+    fs::create_dir_all(&install)?;
+    for name in file_names(out_dir)? {
+        // What Rust links against stays where Rust looks for it.
+        let for_others = library_ending_of(&name, &stem)
+            .is_some_and(|ending| !matches!(ending, "rlib" | "rmeta"));
+        if !for_others {
+            continue;
+        }
+        std::os::unix::fs::symlink(
+            Path::new("../lib").join(&name),
+            install.join(installed_name(&name, &node.metadata)),
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -425,6 +522,7 @@ mod tests {
                 version: "1.0.0".to_string(),
             },
             crate_name: name.to_string(),
+            target_name: name.to_string(),
             artifact: format!("/nix/store/{name}/lib/lib{name}-x.rlib"),
             transitive: transitive.iter().map(|s| s.to_string()).collect(),
             native: native.iter().map(|s| s.to_string()).collect(),
@@ -788,6 +886,121 @@ mod tests {
         );
         assert_eq!(inv.native, ["native=/nix/store/run/out"]);
         assert!(inv.cdylib_link_args.is_empty());
+    }
+
+    // A unit for another platform names it, and the linker for it, where
+    // cargo does: after the output directory.
+    #[test]
+    fn a_unit_for_another_platform_names_it_and_its_linker() {
+        let mut n = node("lib", false);
+        n.target = Some("wasm32-wasip1".to_string());
+        n.linker = Some("/nix/store/binutils/bin/wasm-ld".to_string());
+        let inv = plan("/rustc", "/cargo", &n, "/out", &[], None);
+        assert!(
+            inv.argv.join(" ").contains(
+                "--out-dir /out/lib --target wasm32-wasip1 -C linker=/nix/store/binutils/bin/wasm-ld"
+            ),
+            "{:?}",
+            inv.argv
+        );
+        // What is built for the machine itself names neither.
+        let inv = plan("/rustc", "/cargo", &node("lib", false), "/out", &[], None);
+        assert!(!inv.argv.contains(&"--target".to_string()));
+        assert!(!inv.argv.iter().any(|arg| arg.starts_with("linker=")));
+    }
+
+    /// A directory for one test, removed by the caller.
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rostnix-compile-{name}-{}", std::process::id()));
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        fs::create_dir_all(dir.join("lib")).unwrap();
+        dir
+    }
+
+    // An executable for WebAssembly is `<name>.wasm`. It keeps that when it
+    // gets its target's name.
+    #[test]
+    fn an_executable_keeps_what_its_platform_ends_its_name_with() {
+        let dir = scratch("wasm");
+        let bin = dir.join("bin");
+        fs::write(bin.join("the_crate-0123456789abcdef.wasm"), "").unwrap();
+        fs::write(bin.join("the_crate-0123456789abcdef.d"), "").unwrap();
+        // An object file kept for a debugger sorts before the executable.
+        fs::write(
+            bin.join("the_crate-0123456789abcdef.18b1eb8d3f3485fb-cgu.0.rcgu.o"),
+            "",
+        )
+        .unwrap();
+        let mut n = node("bin", true);
+        n.target_name = "the-crate".to_string();
+        let artifact = artifact(&n, &bin.to_string_lossy()).unwrap();
+        assert!(artifact.ends_with("/bin/the-crate.wasm"), "{artifact}");
+        assert!(bin.join("the-crate.wasm").is_file());
+
+        // And one without an ending stays without.
+        fs::write(bin.join("the_crate-0123456789abcdef"), "").unwrap();
+        let artifact = artifact_of(&n, &bin);
+        assert!(artifact.ends_with("/bin/the-crate"), "{artifact}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn artifact_of(node: &CompileNode, dir: &Path) -> String {
+        artifact(node, &dir.to_string_lossy()).unwrap()
+    }
+
+    // What a cdylib and a staticlib leave is named as cargo's target
+    // directory names it, beside the names other units know.
+    #[test]
+    fn a_library_for_others_is_named_for_install() {
+        let dir = scratch("install");
+        let lib = dir.join("lib");
+        for name in [
+            "libthe_crate-0123456789abcdef.rlib",
+            "libthe_crate-0123456789abcdef.a",
+            "libthe_crate-0123456789abcdef.dylib",
+            "the_crate-0123456789abcdef.wasm",
+            "libother-0123456789abcdef.a",
+            // What rustc leaves beside a library is no library.
+            "the_crate-0123456789abcdef.the_crate.18b1eb8d3f3485fb-cgu.0.rcgu.o",
+            "the_crate-0123456789abcdef.d",
+        ] {
+            fs::write(lib.join(name), "").unwrap();
+        }
+        let mut n = node("lib", true);
+        n.rustc_args = [
+            "--crate-type",
+            "cdylib",
+            "--crate-type",
+            "staticlib",
+            "--crate-type",
+            "rlib",
+        ]
+        .map(String::from)
+        .to_vec();
+        name_for_install(&n, &dir.to_string_lossy(), &lib.to_string_lossy()).unwrap();
+        assert_eq!(
+            file_names(&dir.join("install").to_string_lossy()).unwrap(),
+            ["libthe_crate.a", "libthe_crate.dylib", "the_crate.wasm"]
+        );
+        assert_eq!(
+            fs::read_link(dir.join("install/libthe_crate.a")).unwrap(),
+            Path::new("../lib/libthe_crate-0123456789abcdef.a")
+        );
+        // Rust still finds the library by its rlib.
+        assert!(artifact_of(&n, &lib).ends_with("libthe_crate-0123456789abcdef.rlib"));
+
+        // A library for Rust alone has nothing to install.
+        let plain = scratch("plain");
+        name_for_install(
+            &node("lib", true),
+            &plain.to_string_lossy(),
+            &plain.join("lib").to_string_lossy(),
+        )
+        .unwrap();
+        assert!(!plain.join("install").exists());
+        fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&plain).unwrap();
     }
 
     // The configuration's flags follow everything cargo itself decides,

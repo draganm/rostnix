@@ -1,11 +1,17 @@
 # The builder functions the generated graph calls. Each defines how one
 # kind of node becomes a derivation. The wiring between nodes is in the
 # graph `rostnix resolve` prints.
-{ lib, fetchurl, runCommand, stdenv, tool, rustc, cargo, system }:
+#
+# stdenv is that of the platform the program runs on and buildStdenv that
+# of the machine that builds. They are one unless pkgs is a cross set, and
+# then `linker` is what rustc links for the other platform with.
+{ lib, fetchurl, runCommand, stdenv, buildStdenv ? stdenv, isCross ? false, linker ? null
+, tool, rustc, cargo, system }:
 
-# Per-application settings, and what the project's cargo configuration
-# says: the flags every rustc gets and the variables of its [env] table.
-{ srcStr, crateOverrides ? { }, checkFlags ? [ ], rustflags ? [ ], configEnv ? [ ] }:
+# Per-application settings, and what the graph says of the whole build: the
+# triple cargo planned for with --target, if any, and from the project's
+# cargo configuration the flags rustc gets and the variables of [env].
+{ srcStr, crateOverrides ? { }, checkFlags ? [ ], rustflags ? [ ], configEnv ? [ ], target ? null }:
 let
   builder = "${tool}/bin/rostnix";
   rustcBin = "${rustc}/bin/rustc";
@@ -78,10 +84,34 @@ let
   withheldEnvOf = package:
     lib.optionals (!package.local) (map (variable: variable.name) relativeEnv);
 
+  # In a graph that has a target, a unit that names none is for the machine
+  # that builds: a build script, a proc macro, or something those are made
+  # of. In a graph without, there is one platform and every unit is for it.
+  forBuildMachine = node: target != null && node.target == null;
+  stdenvOf = node: if forBuildMachine node then buildStdenv else stdenv;
+
+  # rustc's own choice of linker is right for the machine it runs on.
+  linkerOf = node: if isCross && node.target != null then linker else null;
+
+  # With --target, cargo gives the configuration's flags to what is built
+  # for the target and to nothing else.
+  rustflagsOf = node: if forBuildMachine node then [ ] else rustflags;
+
+  # What an override names is for the platform the program runs on: its
+  # libraries, and tools that answer for it, as pkg-config does. A unit of
+  # the build machine needs the same for that machine, which a cross
+  # package set keeps beside it.
+  inputsOf = node: inputs:
+    if isCross && forBuildMachine node
+    then map (input: input.__spliced.buildBuild or input) inputs
+    else inputs;
+
   # What the tool is told about a unit that rustc compiles.
   compileNode = node: override:
     let inherit (node) package;
     in {
+      inherit (node) target;
+      linker = linkerOf node;
       inherit (node) kind targetKind crateName targetName edition srcPath metadata rustcArgs tailArgs passL;
       inherit (package) manifestDir workDir local;
       pkg = { inherit (package) name version; };
@@ -91,14 +121,14 @@ let
       deps = map (dep: { inherit (dep) name; path = "${dep.unit}"; }) node.deps;
       buildScript = if node.buildScript == null then null else "${node.buildScript}";
       overrideEnv = envOf override;
-      inherit rustflags;
+      rustflags = rustflagsOf node;
       configEnv = configEnvOf package;
       withheldEnv = withheldEnvOf package;
     };
 
   # The libraries of every overridden package a unit links.
-  linkedLibraries = node: lib.unique
-    (lib.concatMap (key: crateOverrides.${key}.buildInputs or [ ]) node.overrides);
+  linkedLibraries = node: inputsOf node (lib.unique
+    (lib.concatMap (key: crateOverrides.${key}.buildInputs or [ ]) node.overrides));
 in
 {
   # A registry crate: its .crate file, then the tree unpacked from it.
@@ -167,11 +197,11 @@ in
           __structuredAttrs = true;
         } // attrs)
     else
-      stdenv.mkDerivation ({
+      (stdenvOf node).mkDerivation ({
         inherit (node) name;
         __structuredAttrs = true;
         strictDeps = true;
-        nativeBuildInputs = override.nativeBuildInputs or [ ];
+        nativeBuildInputs = inputsOf node (override.nativeBuildInputs or [ ]);
         buildInputs = linkedLibraries node;
         buildCommand = "${builder} compile";
       } // attrs);
@@ -186,7 +216,7 @@ in
       inherit (node) package;
       override = overrideOf package;
     in
-    stdenv.mkDerivation {
+    (stdenvOf node).mkDerivation {
       inherit (node) name;
       __structuredAttrs = true;
       strictDeps = true;
@@ -197,7 +227,7 @@ in
         executables = map (unit: "${unit}") node.executables;
         args = checkFlags;
       };
-      nativeBuildInputs = override.nativeBuildInputs or [ ];
+      nativeBuildInputs = inputsOf node (override.nativeBuildInputs or [ ]);
       buildInputs = linkedLibraries node;
       buildCommand = "${builder} test";
       passthru = {
@@ -213,35 +243,57 @@ in
   # package's native library, so it gets the libraries of that package's
   # override too, and of whatever that one depends on in turn. Outside Nix
   # those are simply installed where every compiler finds them.
+  #
+  # A script that is run for another platform still runs on the machine
+  # that builds. It finds that platform's C compiler as CC, where the cross
+  # stdenv puts it, and is told the machine's own as HOST_CC, by the name
+  # the cc crate looks for; and pkg-config is told that answering for
+  # another platform is meant.
   runBuildScript = node:
     let
       inherit (node) package;
       override = overrideOf package;
-      libraries = lib.unique ((override.buildInputs or [ ])
-        ++ lib.concatMap (dep: dep.unit.libraries) node.linksDeps);
+      libraries = inputsOf node (lib.unique ((override.buildInputs or [ ])
+        ++ lib.concatMap (dep: dep.unit.libraries) node.linksDeps));
+      forOtherPlatform = isCross && node.target != null;
+      src = "${sourceOf node.src override}";
     in
-    stdenv.mkDerivation {
+    (stdenvOf node).mkDerivation ({
       inherit (node) name;
       __structuredAttrs = true;
       strictDeps = true;
       rustc = rustcBin;
       cargo = cargoBin;
       node = {
-        inherit (node) features debugAssertions;
+        inherit (node) features debugAssertions target;
+        linker = linkerOf node;
         inherit (package) manifestDir local;
         pkg = { inherit (package) name version; };
-        src = "${sourceOf node.src override}";
+        inherit src;
         script = "${node.script}";
         env = package.env // node.env;
         linksDeps = map (dep: { inherit (dep) links; path = "${dep.unit}"; }) node.linksDeps;
         overrideEnv = envOf override;
-        inherit rustflags;
+        rustflags = rustflagsOf node;
         configEnv = configEnvOf package;
         withheldEnv = withheldEnvOf package;
       };
-      nativeBuildInputs = override.nativeBuildInputs or [ ];
+      nativeBuildInputs = inputsOf node (override.nativeBuildInputs or [ ]);
       buildInputs = libraries;
       buildCommand = "${builder} run-build-script";
       passthru = { inherit libraries; };
-    };
+      env = {
+        # C that the script compiles names its source, in debug information
+        # and wherever it says __FILE__, and through the library that the
+        # script makes of it the name would reach what is installed. The C
+        # compiler is given the names rustc is given for the package's Rust.
+        NIX_CFLAGS_COMPILE = "-ffile-prefix-map=${src}=${package.name}-${package.version}";
+      } // lib.optionalAttrs forOtherPlatform {
+        HOST_CC = "${buildStdenv.cc}/bin/${buildStdenv.cc.targetPrefix}cc";
+        HOST_CXX = "${buildStdenv.cc}/bin/${buildStdenv.cc.targetPrefix}c++";
+        PKG_CONFIG_ALLOW_CROSS = "1";
+      };
+    } // lib.optionalAttrs forOtherPlatform {
+      depsBuildBuild = [ buildStdenv.cc ];
+    });
 }

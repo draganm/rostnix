@@ -1,6 +1,11 @@
 # buildRustApplication asks cargo for its plan during evaluation, through
 # builtins.exec, and turns it into derivations.
-{ lib, runCommand, runCommandCC, isDarwin, rustc, cargo, tool, mkBuilders }:
+#
+# evalTool, evalCargo and evalRustc run on the machine that evaluates.
+# `target` and `host` are the platform to build for and the machine that
+# builds, as rustc names them, and isCross says whether they are two.
+{ lib, runCommand, runCommandCC, isDarwin, targetPrefix, rustc, cargo, mkBuilders
+, evalTool, evalCargo, evalRustc, target, host, isCross, canExecute, executableExtension }:
 
 { pname
 , version ? null
@@ -14,8 +19,9 @@
 , noDefaultFeatures ? false
 , profile ? "release"
 , crateOverrides ? { }
-  # Whether to build the tests of the selected packages and run them.
-, doCheck ? true
+  # Whether to build the tests of the selected packages and run them. What
+  # is built for a platform the build machine cannot run is not tested.
+, doCheck ? canExecute
   # Arguments for every test executable.
 , checkFlags ? [ ]
   # Names of test targets that are not run.
@@ -40,28 +46,31 @@ let
   # Nix builds the tool, cargo and rustc before running this, if they are
   # missing.
   graphFn = exec [
-    "${tool}/bin/rostnix"
+    "${evalTool}/bin/rostnix"
     "resolve"
     (builtins.toJSON {
-      cargo = "${cargo}/bin/cargo";
-      rustc = "${rustc}/bin/rustc";
+      cargo = "${evalCargo}/bin/cargo";
+      rustc = "${evalRustc}/bin/rustc";
       src = srcStr;
       inherit (builtins) storeDir;
+      inherit target host;
+      cross = isCross;
       inherit cargoRoot packages bins examples features allFeatures noDefaultFeatures profile doCheck rustflags;
       overrideKeys = lib.attrNames crateOverrides;
     })
   ];
 
-  # The builders are told what the graph says of the cargo configuration.
-  # That part of the graph does not depend on them, so this is no circle.
+  # The builders are told what the graph says of the whole build: the
+  # target it was planned for and what the cargo configuration sets. That
+  # part of the graph does not depend on them, so this is no circle.
   graph = graphFn (mkBuilders {
     inherit srcStr crateOverrides checkFlags;
-    inherit (graph) rustflags configEnv;
+    inherit (graph) rustflags configEnv target;
   });
 
   # A misspelt attribute would otherwise be ignored, and the build would
   # fail later for want of what it was meant to supply.
-  overrideAttrs = [ "buildInputs" "nativeBuildInputs" "env" "extraSrc" ];
+  overrideAttrs = [ "buildInputs" "nativeBuildInputs" "env" "extraSrc" "optional" ];
   unknownOverrides = lib.concatLists (lib.mapAttrsToList
     (key: entry: map (attr: "crateOverrides.${key}.${attr}")
       (lib.attrNames (removeAttrs entry overrideAttrs)))
@@ -69,11 +78,13 @@ let
 
   # An entry that no package takes changes nothing, so it is most likely a
   # mistake. It is a warning and not an error because the same key may
-  # match on another platform or with other features.
+  # match on another platform or with other features. An entry marked
+  # `optional` is one of a collection, of which a build takes what it has.
   takenKeys = lib.filter (key: key != null)
     (map (package: package.override) (lib.attrValues graph.packages));
   unmatchedOverrides = map (key: "crateOverrides.${key}")
-    (lib.filter (key: !lib.elem key takenKeys) (lib.attrNames crateOverrides));
+    (lib.filter (key: !lib.elem key takenKeys && !(crateOverrides.${key}.optional or false))
+      (lib.attrNames crateOverrides));
 
   # extraSrc widens what a local package sees of the source tree. A crate
   # from a registry has its own source, so the entry would do nothing.
@@ -94,15 +105,17 @@ let
       "rostnix: unknown ${lib.concatStringsSep ", " unknownOverrides}; a crateOverrides entry takes ${lib.concatStringsSep ", " overrideAttrs}";
     assert lib.assertMsg (foreignExtraSrc == [ ])
       "rostnix: ${lib.concatStringsSep ", " foreignExtraSrc} is set for a package that is not part of the source tree; extraSrc adds files of the source tree to a local package";
-    assert lib.assertMsg (graph.bins != { })
-      "rostnix: the selection builds no binary and no example, so there is nothing to install; name what to build with `bins` or `examples`";
+    assert lib.assertMsg (graph.bins != { } || graph.libs != { })
+      "rostnix: the selection builds no binary, no example and no library for use from outside Rust (a cdylib or a staticlib), so there is nothing to install; name what to build with `bins` or `examples`";
     lib.warnIf (unmatchedOverrides != [ ])
       "rostnix: ${lib.concatStringsSep ", " unmatchedOverrides} ${if lib.length unmatchedOverrides == 1 then "names" else "name"} no package of this build and ${if lib.length unmatchedOverrides == 1 then "has" else "have"} no effect; a key is a package name"
       (lib.warnIf (unmatchedSkips != [ ])
         "rostnix: skipTests names ${lib.concatStringsSep ", " unmatchedSkips}, which ${if lib.length unmatchedSkips == 1 then "is no test target" else "are no test targets"} of this build; the test targets are ${lib.concatStringsSep ", " (lib.unique testTargets)}"
         graph);
 
-  binNames = lib.attrNames checked.bins;
+  # An executable is called after its target, with the ending its platform
+  # gives executables: none on Unix, .wasm for WebAssembly.
+  binNames = map (name: name + executableExtension) (lib.attrNames checked.bins);
 
   # The tests the application waits for: every one that is not skipped.
   testRuns = lib.filterAttrs (_: test: !lib.elem test.targetName skipTests) checked.tests;
@@ -117,25 +130,65 @@ let
   '';
   recordsOf = keys: lib.genAttrs keys (key: "${checked.units.${key}}/unit.json");
 
-  # Copies one executable out of its unit. macOS leaves debug information
-  # in the object files and has the executable point at them, which would
-  # keep every unit, and through the units the sources and the compiler,
-  # alive for as long as the result is. Such an executable gets its debug
-  # information collected in a .dSYM bundle beside it, where debuggers and
-  # backtraces look for it, and loses the pointers.
-  install = name:
-    let file = "$out/bin/${lib.escapeShellArg name}";
-    in ''
-      cp ${checked.bins.${name}}/bin/${lib.escapeShellArg name} $out/bin/
-    '' + lib.optionalString isDarwin ''
+  # macOS leaves debug information in the object files and has what was
+  # linked from them point at them, which would keep every unit, and
+  # through the units the sources and the compiler, alive for as long as
+  # the result is. Such a file gets its debug information collected in a
+  # .dSYM bundle beside it, where debuggers and backtraces look for it, and
+  # loses the pointers.
+  collectDebugInfo = lib.optionalString isDarwin ''
+    # A tool for the platform's files: under the platform's name where
+    # nixpkgs has it so, which is when the build machine is another.
+    platformTool() {
+      if command -v "${targetPrefix}$1" >/dev/null; then
+        echo "${targetPrefix}$1"
+      else
+        echo "$1"
+      fi
+    }
+    # Without nm nothing would seem to point anywhere.
+    command -v "$NM" >/dev/null || { echo "rostnix: no nm to look for debug information with" >&2; exit 1; }
+    collectDebugInfo() {
       # A count, not `grep -q`: stdenv sets pipefail, and nm cut short by
       # grep leaving early would read as "no such entries".
-      if [ "$(nm -a ${file} 2>/dev/null | grep -c ' OSO ' || true)" != 0 ]; then
-        chmod u+w ${file}
-        dsymutil ${file} -o ${file}.dSYM
-        $STRIP -S ${file}
+      if [ "$("$NM" -a "$1" 2>/dev/null | grep -c ' OSO ' || true)" != 0 ]; then
+        chmod u+w "$1"
+        "$(platformTool dsymutil)" "$1" -o "$1.dSYM"
+        $STRIP -S "$1"
       fi
+    }
+  '';
+
+  # Copies one executable out of its unit.
+  install = name:
+    let file = lib.escapeShellArg (name + executableExtension);
+    in ''
+      mkdir -p $out/bin
+      cp ${checked.bins.${name}}/bin/${file} $out/bin/
+    '' + lib.optionalString isDarwin ''
+      collectDebugInfo $out/bin/${file}
     '';
+
+  # Copies the libraries of one unit, under the names a linker looks for.
+  # A dynamic library for macOS records where it is, and what is linked
+  # against it looks for it there: that is where it was linked, in its
+  # unit, until it is told its place in the result.
+  installLibraries = name: ''
+    mkdir -p $out/lib
+    for file in ${checked.libs.${name}}/install/*; do
+      # rustc leaves out a kind of library the platform does not have.
+      [ -e "$file" ] || continue
+      cp -L "$file" $out/lib/
+  '' + lib.optionalString isDarwin ''
+      case $file in *.dylib)
+        library=$out/lib/''${file##*/}
+        chmod u+w "$library"
+        "$(platformTool install_name_tool)" -id "$library" "$library"
+        collectDebugInfo "$library"
+      esac
+  '' + ''
+    done
+  '';
 in
 (if isDarwin then runCommandCC else runCommand) (if version == null then pname else "${pname}-${version}")
 {
@@ -151,7 +204,7 @@ in
     # The source tree cargo planned from.
     src = srcStr;
     graph = checked;
-    inherit (checked) units bins;
+    inherit (checked) units bins libs;
     # The tests that are run, each under its unit's key.
     tests = testRuns;
     # What `cargo build` would run, and what `cargo test` would: the units
@@ -164,6 +217,7 @@ in
   };
 }
   ''
-    mkdir -p $out/bin
-    ${lib.concatMapStrings install binNames}
+    ${collectDebugInfo}
+    ${lib.concatMapStrings install (lib.attrNames checked.bins)}
+    ${lib.concatMapStrings installLibraries (lib.attrNames checked.libs)}
   ''

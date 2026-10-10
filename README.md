@@ -67,9 +67,12 @@ Without flakes, `import rostnix { inherit pkgs; }` returns the same set as
 
 | Argument | Default | Meaning |
 |---|---|---|
-| `pkgs` | required | The nixpkgs that builds the tool and performs the build. |
+| `pkgs` | required | The nixpkgs that builds the tool and performs the build. A cross package set builds for its platform; see [Building for another platform](#building-for-another-platform). |
 | `rustc` | `pkgs.buildPackages.rustc` | The compiler inside derivations. Cargo also queries it while planning. |
 | `cargo` | `pkgs.buildPackages.cargo` | The cargo that plans during evaluation. |
+| `linker` | `null` | What rustc links with for a platform other than the build machine's. `null` means the one that fits the platform. |
+| `evalPkgs` | `null` | The package set of the machine that evaluates, when it is another kind of machine than the one that builds. |
+| `evalRustc`, `evalCargo` | those of `evalPkgs` | The rustc and cargo that plan when `evalPkgs` is given. |
 
 rostnix's flag rules follow cargo 1.95, the cargo of nixpkgs 26.05. Other
 toolchains can be passed but are not tested.
@@ -90,7 +93,7 @@ toolchains can be passed but are not tested.
 | `noDefaultFeatures` | `false` | As `--no-default-features`. |
 | `profile` | `"release"` | As `--profile`. |
 | `crateOverrides` | `{ }` | Libraries and tools for crates that need them; see [crateOverrides](#crateoverrides). |
-| `doCheck` | `true` | Build and run the tests of the selected packages; see [Tests](#tests). |
+| `doCheck` | `true` where the build machine runs the platform's programs | Build and run the tests of the selected packages; see [Tests](#tests). |
 | `checkFlags` | `[ ]` | Arguments for every test executable, such as `[ "--skip" "needs_network" ]`. |
 | `skipTests` | `[ ]` | Names of test targets that are neither built nor run. |
 | `rustflags` | `null` | The flags every rustc gets. `null` means those of the project's [cargo configuration](#cargo-configuration); a list takes their place. |
@@ -100,10 +103,13 @@ The selection means what it means to `cargo build`. With neither `bins` nor
 packages. With either, it builds only what they name.
 
 Every binary and example the selection builds lands in `$out/bin` under its
-target name. On macOS, one built with debug information has a `.dSYM`
-bundle beside it. A selection that builds neither, which is what a library-only
-project gives by default, is an error that says so. A project whose
-executable is an example names it:
+target name. A library the selection builds for use from outside Rust, with
+the crate type `cdylib` or `staticlib`, lands in `$out/lib` under the name
+a linker looks for, such as `libfoo.so` and `libfoo.a`. On macOS, an
+executable or dynamic library built with debug information has a `.dSYM`
+bundle beside it. A selection that builds none of these, which is what a
+project with only a Rust library gives, is an error that says so. A
+project whose executable is an example names it:
 
 ```nix
 rustEnv.buildRustApplication {
@@ -113,8 +119,8 @@ rustEnv.buildRustApplication {
 }
 ```
 
-The result's `passthru` has `units`, `bins` and `tests`, each a set of
-derivations, so one step can be built alone:
+The result's `passthru` has `units`, `bins`, `libs` and `tests`, each a set
+of derivations, so one step can be built alone:
 
 ```bash
 opt=(--option allow-unsafe-native-code-during-evaluation true)
@@ -293,7 +299,62 @@ rustEnv.buildRustApplication {
 
 Any other attribute in an entry is an error, as is `extraSrc` for a crate
 that is not part of the source tree. A key that names no package of the
-build gets a warning, because such an entry changes nothing.
+build gets a warning, because such an entry changes nothing; `optional =
+true` in an entry turns that warning off.
+
+nixpkgs already knows what many crates need, in the `defaultCrateOverrides`
+of its own `buildRustCrate`. `rustEnv.nixpkgsCrateOverrides` is that
+knowledge as entries, to which you add your own:
+
+```nix
+crateOverrides = rustEnv.nixpkgsCrateOverrides // {
+  my-crate.extraSrc = [ "proto" ];
+};
+```
+
+Of each nixpkgs entry it takes `buildInputs`, `nativeBuildInputs` and the
+environment variables, and leaves out the rest: patches, hooks and flags.
+`rustEnv.fromNixpkgsCrateOverrides` does the same for a set of your own
+that is written for `buildRustCrate`.
+
+### Building for another platform
+
+Pass a cross package set, and the build is for its platform:
+
+```nix
+rustEnv = rostnix.lib.mkRustEnv { pkgs = pkgs.pkgsCross.wasi32; };
+```
+
+Cargo plans with `--target`. Build scripts, proc macros and what they
+depend on are built for the machine that builds, and everything else for
+the platform, with its linker. A build script that compiles C compiles it
+for the platform: it runs with that platform's C compiler as `CC` and the
+build machine's as `HOST_CC`. In `crateOverrides`, write libraries and
+tools as you would in a nixpkgs package, from the cross package set; a
+proc macro or a build-machine dependency that takes the entry gets the
+same packages for the build machine. An entry's `env` is given as written
+to both, so a path in it names the platform's library for both.
+
+Executables are installed under the names rustc gives them, `app.wasm` for
+WebAssembly. Tests are built and run by default only where the build
+machine can run them; elsewhere `doCheck` is off.
+
+rustc links with the platform's C compiler, and for WebAssembly with
+`wasm-ld`, which unlike a C compiler from nixpkgs is not told where the
+libraries of `buildInputs` are: there a build script must name them, as
+one that asks `pkg-config` does. `linker` of `mkRustEnv` names another. nixpkgs must have a rustc
+that can build for the platform, which for most cross package sets means
+building rustc first.
+
+When the machine that evaluates is another kind than the one that builds,
+a Mac that hands the build to a Linux builder, say, tell `mkRustEnv` both:
+
+```nix
+rustEnv = rostnix.lib.mkRustEnv {
+  pkgs = nixpkgs.legacyPackages.x86_64-linux;        # builds
+  evalPkgs = nixpkgs.legacyPackages.aarch64-darwin;  # evaluates
+};
+```
 
 ### What a step sees of a local package
 
@@ -350,17 +411,23 @@ it.
 
 ## Not yet supported
 
-Path dependencies outside `src`, cross-compilation, installing `cdylib` and
-`staticlib` targets, dependencies built as Rust `dylib`s, doc tests and
-benches, vendored sources, and Git LFS. Path dependencies outside `src` and
-builds for another target are rejected during evaluation with a message
-naming them.
+Path dependencies outside `src`, dependencies built as Rust `dylib`s, doc
+tests and benches, vendored sources, Git LFS, a package that names its own
+target, and running tests through a `runner`. Path dependencies outside
+`src` are rejected during evaluation with a message naming them.
 
 Build scripts run with their package directory read-only: one that writes
 outside `OUT_DIR` fails.
 
+With `evalPkgs`, cargo decides the dependencies of build scripts and proc
+macros for the machine that evaluates. A build dependency that only one of
+the two kinds of machine has is planned wrongly.
+
 The integration tests have been run on aarch64-darwin only; Linux is
-untested.
+untested. Building for another platform has been tested for WebAssembly
+(`pkgsCross.wasi32`), and `evalPkgs` by building for x86_64-darwin from
+aarch64-darwin. A cross build that links with a C compiler, such as Linux
+for another processor, has not been run.
 
 ## Development
 
@@ -374,7 +441,9 @@ The integration tests build small fixtures, rostnix itself, and
 commit, and run the test suite of each. For each they compare every rustc
 invocation, build-script run and test run with what `cargo build -vv` and
 `cargo test -vv` do for the same source, and check that an edit rebuilds
-only the steps it should. They fetch two repositories from GitHub and
+only the steps it should. Two fixtures are also built for WebAssembly and
+run under wasmtime, and on an Apple Silicon Mac with Rosetta one is planned
+there and built as x86_64. They fetch two repositories from GitHub and
 serve a small registry on port 18473 of this machine.
 
 The design is in `docs/superpowers/specs/2026-10-09-rostnix-design.md`.

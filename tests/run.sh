@@ -34,6 +34,31 @@ check_run() {
   echo "ok: $1: $2 runs"
 }
 
+# wasmtime <arguments...>: runs what is built for WebAssembly.
+wasmtime() {
+  "$(nix build --no-link --print-out-paths "$flake#wasmtime" | head -n 1)/bin/wasmtime" "$@"
+}
+
+# check_run_wasm <fixture> <program> <expected stdout>
+check_run_wasm() {
+  local out got
+  out="$(build "fixtures.$1")"
+  got="$(wasmtime run "$out/bin/$2")"
+  [ "$got" = "$3" ] || fail "$1: $2 printed '$got', want '$3'"
+  echo "ok: $1: $2 runs as WebAssembly"
+}
+
+# check_libs <fixture> <libraries, space separated>
+# The application installs the libraries for use from outside Rust under
+# the names a linker looks for, and nothing that only Rust can use.
+check_libs() {
+  local out got
+  out="$(build "fixtures.$1")"
+  got="$(ls "$out/lib" | tr '\n' ' ' | sed 's/ $//')"
+  [ "$got" = "$2" ] || fail "$1: installs the libraries [$got], want [$2]"
+  echo "ok: $1: installs the libraries [$2]"
+}
+
 # check_bins <fixture> <binaries, space separated>
 # The application installs exactly the binaries and examples selected.
 check_bins() {
@@ -175,7 +200,7 @@ check_no_executable_error() {
   fi
   # The message itself, not the source line a trace would quote.
   case "$msg" in
-    *'error: rostnix: the selection builds no binary and no example'*)
+    *'error: rostnix: the selection builds no binary, no example and no library for use from outside Rust'*)
       echo "ok: a selection with nothing to install is explained" ;;
     *) fail "unhelpful error for a selection with nothing to install: $msg" ;;
   esac
@@ -274,6 +299,185 @@ check_override_inputs() {
   want="bin: lz4 zlib; native run: lz4; consumer run: lz4 zlib; zlib run: zlib; script: "
   [ "$got" = "$want" ] || fail "crateOverrides: units got the inputs [$got], want [$want]"
   echo "ok: crateOverrides: buildInputs reach the units that link the package and the build scripts that depend on its"
+}
+
+# A program in C links against the installed library, the dynamic one and
+# the static one, and runs. The dynamic library is found where it was
+# installed, not where it was built.
+check_c_program() {
+  local out dir got system_libs=""
+  out="$(build fixtures.libs)"
+  dir="$work/c-program"
+  mkdir -p "$dir"
+  # What Rust's standard library needs of the system, where the C compiler
+  # does not link it anyway.
+  [ "$(uname)" = Darwin ] || system_libs="-lpthread -ldl -lm"
+  nix develop "$flake#fixtureShell" --command sh -c '
+    cc "$1/c/main.c" -L"$2/lib" -lrostnix_math -o "$3/dynamic" &&
+    cc "$1/c/main.c" "$2/lib/librostnix_math.a" $4 -o "$3/static"
+  ' sh "$root/tests/fixtures/libs" "$out" "$dir" "$system_libs" ||
+    fail "libs: a C program does not link against the installed libraries"
+  for kind in dynamic static; do
+    got="$("$dir/$kind")"
+    [ "$got" = "c: 5" ] || fail "libs: the C program linked against the $kind library printed '$got'"
+  done
+  if [ "$(uname)" = Darwin ]; then
+    otool -L "$dir/dynamic" | grep -q "$out/lib/librostnix_math.dylib" ||
+      fail "libs: the C program looks for the dynamic library at $(otool -L "$dir/dynamic")"
+  fi
+  rm -rf "$dir"
+  echo "ok: libs: a C program links against the dynamic and the static library and runs"
+}
+
+# In a build for another platform, what runs while building is built for
+# the machine that builds: with its C compiler, and with no word to rustc
+# about a target or a linker. The rest gets the platform's of each.
+check_cross_units() {
+  local got
+  got="$(nix eval "${exec_opt[@]}" --raw "$flake#fixtures.$1.units" --apply '
+    units:
+    let
+      all = builtins.attrValues units;
+      count = pred: toString (builtins.length (builtins.filter pred all));
+      forTarget = u: u.node.target != null;
+      wasm = u: !(u ? stdenv) || u.stdenv.hostPlatform.isWasm;
+      here = u: !(u ? stdenv) || !u.stdenv.hostPlatform.isWasm;
+      wrong = u:
+        if forTarget u
+        then !(wasm u) || u.node.target != "wasm32-wasip1" || builtins.match ".*-wasm-ld" u.node.linker == null
+        else !(here u) || u.node.linker != null;
+    in "${count forTarget} of ${count (u: true)} for the target, ${count wrong} wrong"
+  ')" || fail "$1: units do not evaluate"
+  [ "$got" = "$2" ] || fail "$1: the units are [$got], want [$2]"
+  echo "ok: $1: each unit is built for its machine ($2)"
+}
+
+# A library or a tool that an override names is for the platform the
+# program runs on. A proc macro runs on the machine that builds, and gets
+# that machine's.
+check_cross_override_inputs() {
+  local got want
+  got="$(nix eval --impure --raw "${exec_opt[@]}" --expr "
+    let
+      flake = builtins.getFlake \"$flake\";
+      pkgs = flake.inputs.nixpkgs.legacyPackages.\${builtins.currentSystem}.pkgsCross.wasi32;
+      inputs = { buildInputs = [ pkgs.zlib ]; nativeBuildInputs = [ pkgs.pkg-config ]; };
+      app = (flake.lib.mkRustEnv { inherit pkgs; }).buildRustApplication {
+        pname = \"cross-overrides\";
+        src = $root/tests/fixtures/hello;
+        crateOverrides = { serde_derive = inputs; hello = inputs; };
+      };
+      named = name: builtins.head (builtins.filter (u: u.name == name) (builtins.attrValues app.units));
+      machine = input: if pkgs.lib.hasInfix \"wasm32\" input.name then \"wasm\" else \"here\";
+      # nixpkgs has a platform without dynamic libraries pass its
+      # libraries on to whatever uses the result.
+      inputsOf = name: toString (map machine (pkgs.lib.concatMap (list: (named name).\${list})
+        [ \"buildInputs\" \"propagatedBuildInputs\" \"nativeBuildInputs\" ]));
+    in \"macro: \${inputsOf \"rustmacro-serde_derive-1.0.229\"}; program: \${inputsOf \"rustbin-hello-wasm32-unknown-wasi\"}\"
+  ")" || fail "crateOverrides: inputs of a build for another platform do not evaluate"
+  want="macro: here here; program: wasm wasm"
+  [ "$got" = "$want" ] || fail "crateOverrides: units of a build for another platform got [$got], want [$want]"
+  echo "ok: crateOverrides: a unit of the build machine gets that machine's libraries and tools"
+}
+
+# What is built for a platform the build machine cannot run is not tested
+# unless it is asked for.
+check_cross_tests_off() {
+  local got
+  got="$(nix eval "${exec_opt[@]}" --raw "$flake#fixtures.$1" --apply '
+    app: "${toString (builtins.length app.testRuns)} ${toString (builtins.length (builtins.attrNames app.graph.tests))}"')" ||
+    fail "$1: the tests do not evaluate"
+  [ "$got" = "0 0" ] || fail "$1: tests of a platform that cannot run here: [$got] run and planned, want [0 0]"
+  echo "ok: $1: what cannot run on the build machine is not tested"
+}
+
+# nixpkgs' overrides for buildRustCrate serve as crateOverrides: what they
+# say of libraries, tools and variables is taken, the rest is not, and the
+# many that name no package of the build go unremarked.
+check_nixpkgs_overrides() {
+  local msg got want
+  msg="$(nix build "${exec_opt[@]}" --no-link "$flake#fixtures.buildscript-nixpkgs" 2>&1)" ||
+    fail "buildscript-nixpkgs: does not build: $msg"
+  case "$msg" in
+    *'no package of this build'*) fail "buildscript-nixpkgs: nixpkgs' overrides are warned about: $msg" ;;
+  esac
+  got="$(nix eval "${exec_opt[@]}" --json "$flake#rustEnv.fromNixpkgsCrateOverrides" --apply '
+    adapt:
+    let
+      entries = adapt {
+        a-sys = attrs: {
+          buildInputs = [ "lib" ];
+          nativeBuildInputs = [ "tool" ];
+          A_SYS_DIR = "/a/${attrs.crateName}";
+          A_SYS_STATIC = true;
+          env.a_sys_builder = 1;
+          postPatch = "rm vendored";
+          extraRustcOpts = [ "-g" ];
+        };
+        plain = { buildInputs = [ "lib" ]; };
+        # One that asks for what is not known before the build is planned
+        # fails when it is used, not before.
+        curious = attrs: { buildInputs = [ attrs.src ]; };
+      };
+    in { inherit (entries) a-sys plain; curious = builtins.attrNames entries.curious; }')" ||
+    fail "fromNixpkgsCrateOverrides does not evaluate"
+  want='{"a-sys":{"buildInputs":["lib"],"env":{"A_SYS_DIR":"/a/a-sys","A_SYS_STATIC":true,"a_sys_builder":1},"nativeBuildInputs":["tool"],"optional":true},"curious":["buildInputs","env","nativeBuildInputs","optional"],"plain":{"buildInputs":["lib"],"env":{},"nativeBuildInputs":[],"optional":true}}'
+  [ "$got" = "$want" ] || fail "fromNixpkgsCrateOverrides gives $got, want $want"
+  # What nixpkgs says libz-sys needs is what its build script runs with.
+  got="$(nix eval "${exec_opt[@]}" --raw "$flake#fixtures.buildscript-nixpkgs.units" --apply '
+    units:
+    let run = builtins.head (builtins.filter (u: u.name == "rustbsrun-libz-sys-1.1.29") (builtins.attrValues units));
+    in toString (map (i: i.pname) (run.buildInputs ++ run.nativeBuildInputs))')" ||
+    fail "buildscript-nixpkgs: the units do not evaluate"
+  [ "$got" = "zlib pkg-config-wrapper" ] ||
+    fail "buildscript-nixpkgs: the build script of libz-sys runs with [$got], want [zlib pkg-config-wrapper]"
+  echo "ok: nixpkgs' crate overrides give libraries, tools and variables, and name no package in vain"
+}
+
+# check_both_sides <fixture> <count>
+# A package that a build script and a library both use is built once where
+# cargo builds the two alike, and once for each where it does not: when
+# they are for different machines, and under a profile such as release,
+# which does not optimise what only build scripts use.
+check_both_sides() {
+  local got
+  got="$(nix eval "${exec_opt[@]}" --raw "$flake#fixtures.$1.units" --apply '
+    units:
+    let
+      ours = builtins.filter (u: u.node.pkg.name == "rostnix-tables") (builtins.attrValues units);
+      count = pred: toString (builtins.length (builtins.filter pred ours));
+    in "${count (u: (u.node.kind or "") == "lib")} ${count (u: u.node ? script)}"')" ||
+    fail "$1: the units do not evaluate"
+  [ "$got" = "$2 $2" ] ||
+    fail "$1: rostnix-tables is built and its build script run [$got] times, want $2 of each"
+  echo "ok: $1: a package used by a build script and by a library is built $2 time(s)"
+}
+
+# A package set can be for another platform than the build machine's and
+# have its triple, as nixpkgs' static one has on macOS. Its units are still
+# told apart: what runs while building is the build machine's, and the
+# rest is linked by the platform's C compiler.
+check_cross_same_triple() {
+  local got want
+  got="$(nix eval --impure --raw "${exec_opt[@]}" --expr "
+    let
+      flake = builtins.getFlake \"$flake\";
+      native = flake.inputs.nixpkgs.legacyPackages.\${builtins.currentSystem};
+      pkgs = native.pkgsStatic;
+      app = (flake.lib.mkRustEnv { inherit pkgs; }).buildRustApplication {
+        pname = \"same-triple\";
+        src = $root/tests/fixtures/hello;
+        doCheck = false;
+      };
+      units = builtins.attrValues app.units;
+      forTarget = builtins.filter (u: u.node.target != null) units;
+      forMachine = builtins.filter (u: u.node.target == null) units;
+      all = pred: list: toString (builtins.all pred list);
+    in \"\${toString (app.graph.target == app.graph.host)} \${toString (builtins.length forTarget)} \${toString (builtins.length forMachine)} \${all (u: u.node.linker == \"\${pkgs.stdenv.cc}/bin/\${pkgs.stdenv.cc.targetPrefix}cc\") forTarget} \${all (u: u.node.linker == null && (!(u ? stdenv) || u.stdenv.cc == native.stdenv.cc)) forMachine}\"
+  ")" || fail "a package set for another platform of the same triple does not evaluate"
+  want="1 14 14 1 1"
+  [ "$got" = "$want" ] || fail "a package set for another platform of the same triple gives [$got], want [$want]"
+  echo "ok: two platforms of one triple are told apart"
 }
 
 # With one executable, nix run finds it through meta.mainProgram.
@@ -635,6 +839,84 @@ check_override_unmatched
 check_override_inputs
 check_override_foreign_extra_src
 check_override_spellings
+
+# The same with nixpkgs' own overrides in place of the one for libz-sys.
+check_nixpkgs_overrides
+check_run buildscript-nixpkgs consumer \
+  "add=5 answer=42 note=from-override generated=from-build-script cfg=yes old=yes msg=shared-message zlib=ok pc=$zlib_version"
+
+# A library for use from outside Rust is installed, as a dynamic and as a
+# static library, beside the program in Rust that uses it. Its build script
+# compiles C.
+case "$(uname)" in
+  Darwin) dynamic_library=librostnix_math.dylib ;;
+  *) dynamic_library=librostnix_math.so ;;
+esac
+native_triple="$(nix eval "${exec_opt[@]}" --raw "$flake#fixtures.libs.graph.host")"
+check_run libs calc "calc: 5 library:$native_triple script:$native_triple linked:$native_triple"
+check_both_sides libs 2
+check_both_sides libs-dev 1
+check_bins libs "calc"
+check_libs libs "librostnix_math.a $dynamic_library"
+check_c_program
+check_conformance libs fixtureShell --profile release
+check_test_conformance libs fixtureShell --profile release
+check_tests_ran libs rostnix_math lib "test result: ok\. 1 passed"
+check_no_intermediate_refs libs
+check_no_intermediate_refs libs-dev
+# With debug information rustc leaves object files beside the library on
+# macOS, which are not installed; the library's debug information is in a
+# bundle beside it.
+if [ "$(uname)" = Darwin ]; then
+  check_libs libs-dev "librostnix_math.a $dynamic_library $dynamic_library.dSYM"
+else
+  check_libs libs-dev "librostnix_math.a $dynamic_library"
+fi
+
+# For another platform, WebAssembly: proc macros and build scripts are
+# built for the machine that builds, and the rest for the platform, the C
+# of a build script included. What comes out runs under wasmtime.
+check_run_wasm hello-wasi hello.wasm '{"greeting":"hello","n":42}'
+check_bins hello-wasi "hello.wasm"
+check_main_program hello-wasi hello.wasm
+check_cross_units hello-wasi "14 of 28 for the target, 0 wrong"
+check_cross_tests_off hello-wasi
+check_conformance hello-wasi fixtureShellWasi --profile release --target wasm32-wasip1
+check_no_intermediate_refs hello-wasi
+# The library is told of the rostnix-tables built for WebAssembly, and its
+# build script links the one built for this machine.
+check_run_wasm libs-wasi calc.wasm \
+  "calc: 5 library:wasm32-wasip1 script:$native_triple linked:wasm32-wasip1"
+check_both_sides libs-wasi 2
+check_bins libs-wasi "calc.wasm"
+check_libs libs-wasi "librostnix_math.a rostnix_math.wasm"
+wasm_sum="$(wasmtime run --invoke rostnix_sum "$(build fixtures.libs-wasi)/lib/rostnix_math.wasm" 1 2 2>/dev/null)"
+[ "$wasm_sum" = 5 ] || fail "libs-wasi: the library's rostnix_sum(1, 2) is '$wasm_sum', want 5"
+echo "ok: libs-wasi: the dynamic library is a module whose function can be called"
+check_conformance libs-wasi fixtureShellWasi --profile release --target wasm32-wasip1
+check_no_intermediate_refs libs-wasi
+check_cross_override_inputs
+check_cross_same_triple
+
+# Planned on this machine and built on another kind, where this machine
+# builds as one: the tests run there too, and the plan is the one cargo
+# makes on that machine when it is told the target.
+elsewhere="$(nix eval --raw "$flake#elsewhere")"
+if [ -n "$elsewhere" ] && nix config show extra-platforms 2>/dev/null | grep -qw "$elsewhere"; then
+  check_run hello-elsewhere hello '{"greeting":"hello","n":42}'
+  elsewhere_system="$(nix eval "${exec_opt[@]}" --raw "$flake#fixtures.hello-elsewhere.system")"
+  [ "$elsewhere_system" = "$elsewhere" ] ||
+    fail "hello-elsewhere: the result is built on $elsewhere_system, want $elsewhere"
+  elsewhere_target="$(nix eval "${exec_opt[@]}" --raw "$flake#fixtures.hello-elsewhere.graph.target")"
+  echo "ok: hello-elsewhere: planned here for $elsewhere_target and built on $elsewhere"
+  check_tests_ran hello-elsewhere cli test "test result: ok\. 6 passed"
+  check_conformance hello-elsewhere "legacyPackages.$elsewhere.fixtureShell" \
+    --profile release --target "$elsewhere_target"
+  check_test_conformance hello-elsewhere "legacyPackages.$elsewhere.fixtureShell" \
+    --profile release --target "$elsewhere_target"
+else
+  echo "skipped: no other kind of machine that this one builds as"
+fi
 
 # One project under four profiles. The release profile aborts on panic;
 # its tests, one of which expects a panic, unwind as cargo has them do.
