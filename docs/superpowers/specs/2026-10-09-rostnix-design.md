@@ -1252,8 +1252,8 @@ Known gaps, none of which the fixtures meet:
   `examples`, cargo builds a library only as a dependency.
 - A dynamic library for Linux is installed under its plain name and has no
   `soname`, as cargo leaves it.
-- The tests have been run on aarch64-darwin and on x86_64-linux. They
-  have not been run on aarch64-linux or on x86_64-darwin.
+- The tests run on aarch64-darwin, x86_64-linux and aarch64-linux. They
+  have not been run on x86_64-darwin.
 
 ## Testing rostnix
 
@@ -1362,6 +1362,17 @@ Anything that needs `builtins.exec` lives under the flake's
 `legacyPackages`, which `nix flake check` and `nix flake show` do not
 evaluate. `packages.rostnix` is the tool built with `buildRustPackage` and
 needs no option.
+
+### Continuous integration
+
+`.github/workflows/tests.yml` runs on GitHub for every pull request and
+every push to `main`: the formatting check, clippy with warnings as
+errors, the unit tests and the tool's own build on Linux, and the
+integration driver on x86_64 Linux, on arm64 Linux and on an Apple Silicon
+Mac. The runners install the newest Nix, so the driver also meets a Nix
+that nobody develops with. What the driver builds for other platforms
+depends on the machine: WebAssembly everywhere, musl and i686 on x86_64
+Linux, x86_64 on the Mac.
 
 ## Repository layout
 

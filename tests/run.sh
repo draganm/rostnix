@@ -165,11 +165,13 @@ check_incremental() {
 }
 
 # Without the option, evaluation must say what to set. The option is
-# turned off explicitly, in case nix.conf turns it on.
+# turned off explicitly, in case nix.conf turns it on, and so is the
+# evaluation cache: a newer Nix remembers what the fixture evaluated to
+# with the option on, and would build it without evaluating anything.
 check_exec_error() {
   local msg
   if msg="$(nix build --option allow-unsafe-native-code-during-evaluation false \
-    --no-link "$flake#fixtures.hello" 2>&1)"; then
+    --option eval-cache false --no-link "$flake#fixtures.hello" 2>&1)"; then
     fail "building without builtins.exec succeeded"
   fi
   case "$msg" in
@@ -465,7 +467,9 @@ check_cross_same_triple() {
       flake = builtins.getFlake \"$flake\";
       native = flake.inputs.nixpkgs.legacyPackages.\${builtins.currentSystem};
       pkgs = if native.stdenv.isDarwin then native.pkgsStatic else native.pkgsLLVM;
-      app = (flake.lib.mkRustEnv { inherit pkgs; }).buildRustApplication {
+      # Planning needs a rustc and any will do. The package set's own
+      # would have to be built first, for a check that builds nothing.
+      app = (flake.lib.mkRustEnv { inherit pkgs; inherit (native) rustc cargo; }).buildRustApplication {
         pname = \"same-triple\";
         src = $root/tests/fixtures/hello;
         doCheck = false;

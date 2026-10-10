@@ -1,0 +1,64 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to a branch makes the run for the older one pointless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: unit tests and lints
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - name: Formatting
+        run: nix develop --command cargo fmt --check
+      - name: Lints
+        run: nix develop --command cargo clippy --all-targets --locked -- -D warnings
+      - name: Unit tests
+        run: nix develop --command cargo test --locked
+      - name: The tool, as the flake builds it
+        run: nix build .#rostnix --print-build-logs
+
+  # Real nix builds of the fixtures, compared with cargo; see tests/run.sh.
+  # They need builtins.exec, which the script turns on for itself, and the
+  # network.
+  integration:
+    name: integration (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64-linux
+            os: ubuntu-latest
+          - name: aarch64-linux
+            os: ubuntu-24.04-arm
+          - name: aarch64-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+      # The compilers for the other platforms the tests build for take
+      # more room than a runner has to spare.
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      # One fixture is planned on this machine and built as an Intel Mac.
+      - name: Rosetta
+        if: runner.os == 'macOS'
+        run: softwareupdate --install-rosetta --agree-to-license
+      - uses: cachix/install-nix-action@v31
+      - name: Integration tests
+        run: tests/run.sh
