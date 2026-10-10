@@ -467,7 +467,9 @@ check_cross_same_triple() {
       flake = builtins.getFlake \"$flake\";
       native = flake.inputs.nixpkgs.legacyPackages.\${builtins.currentSystem};
       pkgs = if native.stdenv.isDarwin then native.pkgsStatic else native.pkgsLLVM;
-      app = (flake.lib.mkRustEnv { inherit pkgs; }).buildRustApplication {
+      # Planning needs a rustc and any will do. The package set's own
+      # would have to be built first, for a check that builds nothing.
+      app = (flake.lib.mkRustEnv { inherit pkgs; inherit (native) rustc cargo; }).buildRustApplication {
         pname = \"same-triple\";
         src = $root/tests/fixtures/hello;
         doCheck = false;
