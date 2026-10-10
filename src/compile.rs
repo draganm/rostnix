@@ -153,6 +153,17 @@ fn push_unique(list: &mut Vec<String>, items: impl IntoIterator<Item = String>) 
     }
 }
 
+/// Appends what one dependency has that the list has not: the same script
+/// is reached through many dependencies and counts once. An item that the
+/// dependency has twice is appended twice. A build script may name one
+/// directory twice, as blake3's does when it compiles two libraries into
+/// it, and cargo then passes the directory twice to whatever links the
+/// package.
+fn push_new(list: &mut Vec<String>, items: &[String]) {
+    let known: std::collections::BTreeSet<String> = list.iter().cloned().collect();
+    list.extend(items.iter().filter(|item| !known.contains(*item)).cloned());
+}
+
 /// Works out the rustc invocation of a unit from its node, the records of
 /// its direct dependencies and what its build script printed.
 pub fn plan(
@@ -234,12 +245,9 @@ pub fn plan_at(
     let mut by_package: Vec<&CompileRecord> = deps.iter().map(|(_, record)| record).collect();
     by_package.sort_by(|a, b| (&a.pkg.name, &a.pkg.version).cmp(&(&b.pkg.name, &b.pkg.version)));
     for record in by_package {
-        push_unique(&mut native, record.native.iter().cloned());
-        push_unique(&mut native_external, record.native_external.iter().cloned());
-        push_unique(
-            &mut cdylib_link_args,
-            record.cdylib_link_args.iter().cloned(),
-        );
+        push_new(&mut native, &record.native);
+        push_new(&mut native_external, &record.native_external);
+        push_new(&mut cdylib_link_args, &record.cdylib_link_args);
     }
 
     let mut argv: Vec<String> = vec![
@@ -759,6 +767,19 @@ mod tests {
                 "native=/z/out"
             ]
         );
+
+        // A directory that one script names twice is passed twice, to the
+        // package itself and to what depends on it, however many of its
+        // dependencies lead to that script.
+        let twice = ["native=/b/out", "native=/b/out"];
+        let through_one = record("lib", "one", &["/nix/store/one/lib"], &twice);
+        let through_two = record("lib", "two", &["/nix/store/two/lib"], &twice);
+        let deps = vec![
+            ("one".to_string(), through_one),
+            ("two".to_string(), through_two),
+        ];
+        let repeated = plan("/rustc", "/cargo", &node("lib", false), "/out", &deps, None);
+        assert_eq!(repeated.native, twice);
         assert_eq!(
             inv.native_external,
             [

@@ -79,7 +79,8 @@ core-rs is the first real project rostnix must build, pinned at commit
 ## Facts verified
 
 Probed on aarch64-darwin with Nix 2.26.1, cargo 1.86.0, and the cargo and
-rustc 1.95.0 of nixpkgs 26.05. The design relies on them. gonixgo's spec
+rustc 1.95.0 of nixpkgs 26.05; what is said of Linux, on x86_64-linux with
+Nix 2.31.5 and the same nixpkgs. The design relies on them. gonixgo's spec
 verified the facts about `builtins.exec` on the same Nix; they are not
 repeated here.
 
@@ -102,6 +103,9 @@ repeated here.
 | A test runs in its package directory, from `target/<profile>/deps/<crate>-<hash>`, with `CARGO`, `CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_PATH`, `CARGO_PKG_*` and the library path variable; an integration test with `CARGO_BIN_EXE_<name>` again; a package with a build script with `OUT_DIR` and what the script set with `rustc-env`. It is not given `CARGO_CRATE_NAME`, `CARGO_PRIMARY_PACKAGE` or `CARGO_TARGET_TMPDIR`. | A test that prints its environment, and the `Running` lines of `cargo test -vv`, which include it. |
 | A file copied out of the store with `fs::copy` cannot be written to: the copy keeps the mode of the original. | core-rs's `golden_packstore` failed with `PermissionDenied` when it was compiled against a store path. |
 | A Nix build cannot create a setuid file. | `chmod 4755` in a bare derivation: `Operation not permitted`, with `sandbox = relaxed` on macOS. |
+| On Linux a Nix build cannot set an extended attribute. | core-rs's `export_extract_roundtrip` in a derivation: `Operation not supported (os error 95)` for `user.roundtrip`. |
+| On Linux, what nixpkgs' linker links is told to look for libraries in the `lib` directory of the derivation that links it, whether or not anything is there. nixpkgs' own builds end by dropping such directories, with `patchelf --shrink-rpath`. | `patchelf --print-rpath` on a unit's executable; a copy of it referred to the unit. |
+| A build script may print one `rustc-link-search` twice, and cargo then passes the directory twice, to the package's own rustc and to every rustc that links the package. | blake3 on x86_64, whose script compiles two libraries into its `OUT_DIR`; `cargo build -vv` of core-rs. |
 | A git package's `source` in `Cargo.lock` and in `cargo metadata` is `git+<url>?<rev\|tag\|branch>=<x>#<full revision>`. Its manifest lies under `<cargo home>/git/checkouts/<repository>-<hash>/<short revision>/`, in a subdirectory when the repository is a workspace, and every package of one repository has the same `source`. Cargo accepts a cargo home whose `git` is a link into another. | A project depending on `serde`, a workspace, by tag and on `itoa` by revision. |
 | Cargo's built-in git cannot authenticate where the git command can. | On a machine that rewrites `https://github.com/` to SSH, the fetch failed with "no authentication methods succeeded" and worked with `CARGO_NET_GIT_FETCH_WITH_CLI=true`. |
 | `builtins.fetchGit { url; rev; submodules = true; shallow = true; }` needs no `ref`, is allowed in pure evaluation, and gives the tree cargo checked out. | `diff -r` of the two for `serde`, the `.git` directory aside. |
@@ -616,7 +620,9 @@ script in the unit's closure, which cargo passes to every dependent rustc.
 They keep cargo's order: the unit's own script, then its dependencies' by
 package, and across all of them the paths inside the `OUT_DIR` of the script
 that printed them before the others, so that a library a script built wins
-over one of the same name found elsewhere. The file also carries the linker
+over one of the same name found elsewhere. A script reached through several
+dependencies counts once, and a directory that one script names twice is
+passed twice, as cargo passes it. The file also carries the linker
 arguments scripts ask of cdylibs, which cargo passes to every cdylib that
 has the script's package in its closure.
 
@@ -660,6 +666,13 @@ closure holds only what the installed files themselves refer to.
 A dynamic library for macOS is told its place in the result with
 `install_name_tool -id`. Until then it names the unit it was linked in, and
 a program linked against the installed file would look for it there.
+
+On Linux, and wherever programs are ELF files, an executable or a dynamic
+library is told by nixpkgs' linker to look for libraries in the `lib`
+directory of its unit, where nothing is. The copy would name the unit and
+so keep every unit alive. The directories that hold nothing the file needs
+are dropped from it with `patchelf --shrink-rpath`, as nixpkgs' own builds
+do in their last phase.
 
 macOS needs one more step when the profile keeps debug information. There
 it stays in the object files, and the executable points at them, which
@@ -1045,11 +1058,14 @@ What follows from this design:
   `doCheck = false` builds without them.
 
 What Nix forbids a build, a test cannot do. In a sandboxed build there is
-no network. No build can create a setuid file, sandboxed or not.
+no network. No build can create a setuid file, sandboxed or not, and on
+Linux none can set an extended attribute.
 
 core-rs needs two settings. `skipTests = [ "amber_bench_smoke" ]`: that
 test runs `cargo build`. `checkFlags = [ "--skip" "golden_tar_extracts" ]`:
-that one extracts a setuid file from an archive and checks its mode.
+that one extracts a setuid file from an archive and checks its mode. On
+Linux `export_extract_roundtrip` is skipped the same way, for the extended
+attribute it sets.
 
 ## Building for another platform
 
@@ -1218,10 +1234,14 @@ Known gaps, none of which the fixtures meet:
   told `PROFILE`.
 - A local path dependency that belongs to another workspace gets this
   workspace's `[workspace.lints]` when it says `lints.workspace = true`.
-- A build for another platform is tested for WebAssembly, where a linker
-  is all the platform needs. With a C compiler as the linker, as for Linux
-  on another processor, nothing here has been built: nixpkgs' cache has no
-  such rustc for the machine the tests run on.
+- A build for another platform is tested for WebAssembly, and from
+  x86_64-linux for Linux with musl, which its C compiler links and whose
+  tests the build machine runs. For another processor, `hello` and `libs`
+  were built once by hand for aarch64 Linux from x86_64 Linux: the files
+  are that processor's and refer to nothing of the build, and they were
+  neither run nor compared with cargo's. A build for macOS from another
+  machine has not been made, and its install step uses tools that could
+  not be tried.
 - When `evalPkgs` is given, the dependencies of build scripts and proc
   macros are planned for the machine that evaluates; see
   [Building for another platform](#building-for-another-platform).
@@ -1232,7 +1252,8 @@ Known gaps, none of which the fixtures meet:
   `examples`, cargo builds a library only as a dependency.
 - A dynamic library for Linux is installed under its plain name and has no
   `soname`, as cargo leaves it.
-- Linux is untested as a whole.
+- The tests have been run on aarch64-darwin and on x86_64-linux. They
+  have not been run on aarch64-linux or on x86_64-darwin.
 
 ## Testing rostnix
 
@@ -1277,7 +1298,7 @@ sandbox because they need `exec` and the network.
 | `config` | A workspace below the source root with cargo configuration at both levels: `rustflags` from the triple's table and from `cfg` tables, one of which matches only because of the triple's flag, all of which take the place of `[build]`'s; and `[env]` variables that are plain, forced, not forced, relative to a data file outside the workspace, and relative to the workspace itself. |
 | `libs` | A workspace with a library of the crate types `cdylib`, `staticlib` and `rlib`, whose build script compiles C, and a binary that uses it. A third package with `links` is used by that build script and by the library, so that it is built for both machines where they differ, and says in the program's output which machine each was for. Built under `release` and under `dev`, natively and for WebAssembly. |
 | `registry` | A crate from a sparse registry that `tests/registry.py` serves on this machine, named in a cargo home made up for the test, which also says how to build and is not listened to in that. |
-| core-rs | Patient zero at its pinned commit, fetched with `builtins.fetchTree`: the `amber-store` example, and its test suite: 21 of 22 test executables, with one test skipped by name. |
+| core-rs | Patient zero at its pinned commit, fetched with `builtins.fetchTree`: the `amber-store` example, and its test suite: 21 of 22 test executables, with one test skipped by name, and on Linux a second. |
 | rostnix | rostnix builds itself with `buildRustApplication` and runs its own unit tests. |
 
 Each fixture asserts:
@@ -1309,10 +1330,19 @@ libraries and tools for a proc macro are the build machine's, that the
 package used on both sides is built for each and its `links` metadata is
 that of the target's, that no test is planned, and that a package set for
 another platform of the build machine's own triple, `pkgsStatic`, is
-planned with a target all the same. Where the machine builds as another kind, as an Apple
-Silicon Mac does as an Intel one, `hello` is planned on the one and built
-on the other with `evalPkgs`: its tests run there, and the invocations
-are those of cargo run on that kind of machine with the target named.
+planned with a target all the same.
+
+On x86_64-linux, where nixpkgs' cache has a rustc for it, the two are also
+built with `pkgsCross.musl64`, a platform that its C compiler links and
+whose programs the build machine runs. There the tests are built for the
+platform and run, the build script's C is compiled by the platform's
+compiler, and builds and tests are compared with cargo's for that target.
+
+Where the machine builds as another kind, as an Apple Silicon Mac does as
+an Intel one and a 64-bit Intel Linux as a 32-bit one, `hello` is planned
+on the one and built on the other with `evalPkgs`: its tests run there,
+and the invocations are those of cargo run on that kind of machine with
+the target named.
 
 For libraries the driver links a C program against the installed dynamic
 library and against the static one, runs both, and checks that the

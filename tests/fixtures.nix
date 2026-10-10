@@ -1,9 +1,14 @@
 # The integration fixtures, built with the rustEnv under test. elsewherePkgs
 # is the package set of another kind of machine that this one can build
-# as, if there is one.
-{ rustEnv, pkgs, mkRustEnv, elsewherePkgs ? null }:
+# as, and crossPkgs one for another platform that a C compiler links for,
+# where there is one.
+{ rustEnv, pkgs, mkRustEnv, elsewherePkgs ? null, crossPkgs ? null }:
 let
   inherit (pkgs) lib;
+  cross =
+    if crossPkgs == null
+    then throw "rostnix: the tests know no platform that ${pkgs.stdenv.buildPlatform.system} builds for with a C compiler as the linker"
+    else mkRustEnv { pkgs = crossPkgs; };
   # For WebAssembly, which the build machine cannot run: nixpkgs has its
   # compiler ready, and a build needs nothing of the platform but a linker.
   wasi = mkRustEnv { pkgs = pkgs.pkgsCross.wasi32; };
@@ -96,6 +101,17 @@ in
     src = ./fixtures/libs;
   };
 
+  # For another platform that its C compiler links, and whose programs the
+  # build machine runs: the tests are built for it and run.
+  hello-cross = cross.buildRustApplication {
+    pname = "hello";
+    src = ./fixtures/hello;
+  };
+  libs-cross = cross.buildRustApplication {
+    pname = "libs";
+    src = ./fixtures/libs;
+  };
+
   # Dependencies from git repositories: a workspace with a proc macro and
   # build scripts, by tag, and a single package by revision.
   gitdeps = rustEnv.buildRustApplication {
@@ -141,9 +157,11 @@ in
     examples = [ "amber-store" ];
     # It runs `cargo build`, which needs the network and a target directory.
     skipTests = [ "amber_bench_smoke" ];
-    # It expects an extracted file to keep its setuid bit, and Nix lets no
-    # build create a setuid file.
-    checkFlags = [ "--skip" "golden_tar_extracts" ];
+    # One test expects an extracted file to keep its setuid bit, and Nix
+    # lets no build create a setuid file. Another sets an extended
+    # attribute, which on Linux Nix lets no build do either.
+    checkFlags = [ "--skip" "golden_tar_extracts" ]
+      ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ "--skip" "export_extract_roundtrip" ];
   };
 
   # rostnix builds itself and runs its own unit tests. The source is

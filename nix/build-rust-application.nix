@@ -4,7 +4,7 @@
 # evalTool, evalCargo and evalRustc run on the machine that evaluates.
 # `target` and `host` are the platform to build for and the machine that
 # builds, as rustc names them, and isCross says whether they are two.
-{ lib, runCommand, runCommandCC, isDarwin, targetPrefix, rustc, cargo, mkBuilders
+{ lib, runCommand, runCommandCC, isDarwin, isElf, patchelf, targetPrefix, rustc, cargo, mkBuilders
 , evalTool, evalCargo, evalRustc, target, host, isCross, canExecute, executableExtension }:
 
 { pname
@@ -159,6 +159,21 @@ let
     }
   '';
 
+  # On Linux and its like, nixpkgs' linker has what it links look for
+  # libraries in the lib directory of the derivation that links it. That is
+  # the unit's, where nothing is, and naming it would keep the unit alive
+  # and through it every other. nixpkgs' own builds end by dropping the
+  # directories that hold nothing the file needs, and so does this. A file
+  # that is linked statically has no such list.
+  dropUnusedRunPaths = lib.optionalString isElf ''
+    dropUnusedRunPaths() {
+      if patchelf --print-rpath "$1" >/dev/null 2>&1; then
+        chmod u+w "$1"
+        patchelf --shrink-rpath "$1"
+      fi
+    }
+  '';
+
   # Copies one executable out of its unit.
   install = name:
     let file = lib.escapeShellArg (name + executableExtension);
@@ -167,6 +182,8 @@ let
       cp ${checked.bins.${name}}/bin/${file} $out/bin/
     '' + lib.optionalString isDarwin ''
       collectDebugInfo $out/bin/${file}
+    '' + lib.optionalString isElf ''
+      dropUnusedRunPaths $out/bin/${file}
     '';
 
   # Copies the libraries of one unit, under the names a linker looks for.
@@ -186,6 +203,8 @@ let
         "$(platformTool install_name_tool)" -id "$library" "$library"
         collectDebugInfo "$library"
       esac
+  '' + lib.optionalString isElf ''
+      dropUnusedRunPaths "$out/lib/''${file##*/}"
   '' + ''
     done
   '';
@@ -194,6 +213,7 @@ in
 {
   # With one executable, `nix run` needs no flags.
   meta = lib.optionalAttrs (lib.length binNames == 1) { mainProgram = lib.head binNames; } // meta;
+  nativeBuildInputs = lib.optional isElf patchelf;
   # The application is built only when its tests pass and what `cargo test`
   # builds beside them, the examples, compiles. Both are inputs and leave
   # nothing in the result, so the result does not refer to them.
@@ -218,6 +238,7 @@ in
 }
   ''
     ${collectDebugInfo}
+    ${dropUnusedRunPaths}
     ${lib.concatMapStrings install (lib.attrNames checked.bins)}
     ${lib.concatMapStrings installLibraries (lib.attrNames checked.libs)}
   ''

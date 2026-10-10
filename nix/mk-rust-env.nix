@@ -62,7 +62,9 @@ let
     # Installing an executable for macOS needs the tools that handle its
     # debug information.
     inherit (pkgs) runCommandCC;
-    inherit (hostPlatform) isDarwin;
+    inherit (hostPlatform) isDarwin isElf;
+    # What rewrites where an ELF file looks for its libraries.
+    inherit (buildPkgs) patchelf;
     # nixpkgs names the tools for another platform with it in front.
     targetPrefix = pkgs.stdenv.cc.targetPrefix;
     mkBuilders = builders;
