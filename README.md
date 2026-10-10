@@ -403,7 +403,7 @@ when they change. Passing a narrowed `src`, for example with
   once by Nix.
 - Import-from-derivation (on by default): the tool, cargo and rustc are
   built or fetched during evaluation the first time.
-- A recent Nix: rostnix is tested with Nix 2.26 and 2.31. Pre-seeding uses
+- A recent Nix: rostnix is tested with Nix 2.26, 2.31 and 2.35. Pre-seeding uses
   `nix store add --mode flat`; with an older `nix` that add fails and crates
   are downloaded at build time instead.
 
@@ -426,9 +426,10 @@ With `evalPkgs`, cargo decides the dependencies of build scripts and proc
 macros for the machine that evaluates. A build dependency that only one of
 the two kinds of machine has is planned wrongly.
 
-The integration tests pass on aarch64-darwin and on x86_64-linux (NixOS).
-Building for another platform has been tested for WebAssembly
-(`pkgsCross.wasi32`) on both, and on x86_64-linux for Linux with musl
+The integration tests pass on aarch64-darwin, x86_64-linux and
+aarch64-linux; x86_64-darwin has not run them. Building for another
+platform has been tested for WebAssembly (`pkgsCross.wasi32`) on all
+three, and on x86_64-linux for Linux with musl
 (`pkgsCross.musl64`), which links with a C compiler and whose tests run on
 the build machine. `evalPkgs` has been tested by building for x86_64-darwin
 from aarch64-darwin and for i686-linux from x86_64-linux. A build for
