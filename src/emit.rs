@@ -73,6 +73,7 @@ pub fn to_nix(graph: &Graph) -> String {
     line("b: rec {".to_string());
     line(format!("  cargoVersion = {};", quote(&graph.cargo_version)));
     line(format!("  host = {};", quote(&graph.host)));
+    line(format!("  target = {};", optional(&graph.target)));
 
     for (key, source) in &graph.sources {
         // A registry other than crates.io is named, for the message of a
@@ -134,6 +135,12 @@ pub fn to_nix(graph: &Graph) -> String {
     if graph.bins.is_empty() {
         line("  bins = { };".to_string());
     }
+    for (name, key) in &graph.libs {
+        line(format!("  libs.{} = {};", quote(name), unit_ref(key)));
+    }
+    if graph.libs.is_empty() {
+        line("  libs = { };".to_string());
+    }
     let roots: Vec<String> = graph.roots.iter().map(|key| unit_ref(key)).collect();
     line(format!("  roots = [ {} ];", roots.join(" ")));
 
@@ -180,6 +187,7 @@ fn compile(line: &mut impl FnMut(String), key: &str, unit: &CompileUnit) {
     line(format!("    name = {};", quote(&unit.name)));
     line(format!("    package = packages.{};", quote(&unit.package)));
     line(format!("    src = {};", src(&unit.src)));
+    line(format!("    target = {};", optional(&unit.target)));
     line(format!("    kind = {};", quote(unit.kind)));
     line(format!("    targetKind = {};", quote(unit.target_kind)));
     line(format!("    crateName = {};", quote(&unit.crate_name)));
@@ -218,6 +226,7 @@ fn run(line: &mut impl FnMut(String), key: &str, unit: &RunUnit) {
     line(format!("    name = {};", quote(&unit.name)));
     line(format!("    package = packages.{};", quote(&unit.package)));
     line(format!("    src = {};", src(&unit.src)));
+    line(format!("    target = {};", optional(&unit.target)));
     line(format!("    script = {};", unit_ref(&unit.script)));
     line(format!("    features = {};", list(&unit.features)));
     line(format!("    debugAssertions = {};", unit.debug_assertions));
@@ -318,6 +327,7 @@ mod tests {
                 name: "rustbs-dep-1.0.0+x".into(),
                 package: "dep-1.0.0+x".into(),
                 src: SrcRef::Registry("dep-1.0.0+x".into()),
+                target: None,
                 kind: "build-script",
                 target_kind: "custom-build",
                 crate_name: "build_script_build".into(),
@@ -350,6 +360,7 @@ mod tests {
                 name: "rustbsrun-dep-1.0.0+x".into(),
                 package: "dep-1.0.0+x".into(),
                 src: SrcRef::Registry("dep-1.0.0+x".into()),
+                target: None,
                 script: "dep-1.0.0+x-build-script-aaaaaaaa".into(),
                 features: vec!["std".into()],
                 debug_assertions: false,
@@ -367,6 +378,7 @@ mod tests {
                     dir: "".into(),
                     exclude: vec!["tests".into()],
                 },
+                target: None,
                 kind: "bin",
                 target_kind: "bin",
                 crate_name: "app".into(),
@@ -398,6 +410,7 @@ mod tests {
         let expected = r#"b: rec {
   cargoVersion = "1.95.0";
   host = "aarch64-apple-darwin";
+  target = null;
   sources."dep-1.0.0+x" = b.fetchCrate { pname = "dep"; version = "1.0.0+x"; sha256 = "abc"; url = "https://static.crates.io/crates/dep/dep-1.0.0+x.crate"; };
   packages."dep-1.0.0+x" = {
     name = "dep";
@@ -413,6 +426,7 @@ mod tests {
     name = "rustbin-app";
     package = packages."dep-1.0.0+x";
     src = b.localSource { name = "rustsrc-app-0.1.0"; dir = "."; exclude = [ "tests" ]; };
+    target = null;
     kind = "bin";
     targetKind = "bin";
     crateName = "app";
@@ -433,6 +447,7 @@ mod tests {
     name = "rustbs-dep-1.0.0+x";
     package = packages."dep-1.0.0+x";
     src = sources."dep-1.0.0+x";
+    target = null;
     kind = "build-script";
     targetKind = "custom-build";
     crateName = "build_script_build";
@@ -453,6 +468,7 @@ mod tests {
     name = "rustbsrun-dep-1.0.0+x";
     package = packages."dep-1.0.0+x";
     src = sources."dep-1.0.0+x";
+    target = null;
     script = units."dep-1.0.0+x-build-script-aaaaaaaa";
     features = [ "std" ];
     debugAssertions = false;
@@ -460,6 +476,7 @@ mod tests {
     linksDeps = [  ];
   };
   bins."app" = units."app-0.1.0-bin-app-cccccccc";
+  libs = { };
   roots = [ units."app-0.1.0-bin-app-cccccccc" ];
   tests = { };
   testBuilds = [  ];
@@ -588,6 +605,33 @@ mod tests {
         assert!(!to_nix(&graph).contains("sources = { };"));
     }
 
+    // A unit says which machine it is for, and a library built for use
+    // from outside Rust is named beside the executables.
+    #[test]
+    fn targets_and_libraries_are_part_of_the_graph() {
+        let mut graph = sample();
+        graph.target = Some("wasm32-wasip1".into());
+        if let Some(UnitNode::Compile(app)) = graph.units.get_mut("app-0.1.0-bin-app-cccccccc") {
+            app.target = Some("wasm32-wasip1".into());
+        }
+        graph
+            .libs
+            .insert("the_lib".into(), "app-0.1.0-bin-app-cccccccc".into());
+        let nix = to_nix(&graph);
+        assert!(nix.contains("\n  target = \"wasm32-wasip1\";\n"), "{nix}");
+        assert!(
+            nix.contains("; };\n    target = \"wasm32-wasip1\";\n    kind = \"bin\";"),
+            "{nix}"
+        );
+        // The build script stays with the machine that builds.
+        assert_eq!(nix.matches("    target = null;").count(), 2);
+        assert!(
+            nix.contains("\n  libs.\"the_lib\" = units.\"app-0.1.0-bin-app-cccccccc\";\n"),
+            "{nix}"
+        );
+        assert!(!nix.contains("libs = { };"), "{nix}");
+    }
+
     // A library-only selection has no executables, and a project without
     // registry dependencies no sources. Both sets must still be there to be
     // asked about.
@@ -599,7 +643,8 @@ mod tests {
         let nix = to_nix(&graph);
         assert!(nix.contains("\n  bins = { };\n"), "{nix}");
         assert!(nix.contains("\n  sources = { };\n"), "{nix}");
-        assert!(!to_nix(&sample()).contains("= { };\n  roots"));
+        assert!(nix.contains("\n  libs = { };\n"), "{nix}");
+        assert!(!to_nix(&sample()).contains("bins = { };"));
 
         if std::process::Command::new("nix-instantiate")
             .arg("--version")
@@ -610,7 +655,7 @@ mod tests {
         }
         let expr = format!(
             "let g = ({nix}) {{ fetchCrate = a: a; localSource = a: a; compile = a: a; runBuildScript = a: a; test = a: a; }}; \
-             in [ (g.bins == {{ }}) (g.sources == {{ }}) (g.tests == {{ }}) ]"
+             in [ (g.bins == {{ }}) (g.sources == {{ }}) (g.tests == {{ }}) (g.libs == {{ }}) ]"
         );
         let output = std::process::Command::new("nix-instantiate")
             .args(["--eval", "--strict", "--json", "--expr", &expr])
@@ -623,7 +668,7 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8_lossy(&output.stdout).trim(),
-            "[true,true,true]"
+            "[true,true,true,true]"
         );
     }
 

@@ -176,6 +176,33 @@ pub fn envify(name: &str) -> String {
         .collect()
 }
 
+/// The arguments with which cargo asks rustc for the cfgs of a platform.
+/// It asks about every kind of crate at once, a proc macro among them, and
+/// a proc macro is never linked statically against the C runtime. So a
+/// platform that links that way by default, as WebAssembly and musl do,
+/// has no `crt-static` among its target features unless a flag turns it on.
+pub fn print_cfg_args(target: Option<&str>, flags: &[String]) -> Vec<String> {
+    let mut args = vec!["--print=cfg".to_string()];
+    for crate_type in ["bin", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"] {
+        args.extend(["--crate-type".to_string(), crate_type.to_string()]);
+    }
+    if let Some(triple) = target {
+        args.extend(["--target".to_string(), triple.to_string()]);
+    }
+    args.extend(flags.iter().cloned());
+    args
+}
+
+/// What rustc answered to that question, as cargo takes it: without
+/// `proc_macro`, which is set only because a proc macro was asked about.
+pub fn cargo_cfgs(printed: &str) -> String {
+    printed
+        .lines()
+        .filter(|line| line.trim() != "proc_macro")
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
 /// The `CARGO_CFG_*` variables: what `rustc --print=cfg` printed, plus the
 /// features and the profile's debug assertions, which rustc cannot know.
 pub fn cfg_env(
@@ -229,8 +256,7 @@ pub fn run() -> Result<()> {
     // Cargo asks with the flags of its configuration, so that what they
     // turn on, a target feature or a `--cfg`, is among the script's cfgs.
     let print_cfg = Command::new(&attrs.rustc)
-        .arg("--print=cfg")
-        .args(&node.rustflags)
+        .args(print_cfg_args(node.target.as_deref(), &node.rustflags))
         .output()
         .map_err(|err| format!("running {} --print=cfg: {err}", attrs.rustc))?;
     if !print_cfg.status.success() {
@@ -247,7 +273,7 @@ pub fn run() -> Result<()> {
 
     let mut env = node.env.clone();
     env.extend(cfg_env(
-        &String::from_utf8_lossy(&print_cfg.stdout),
+        &cargo_cfgs(&String::from_utf8_lossy(&print_cfg.stdout)),
         &node.features,
         node.debug_assertions,
     ));
@@ -286,6 +312,10 @@ pub fn run() -> Result<()> {
         "CARGO_ENCODED_RUSTFLAGS".to_string(),
         node.rustflags.join("\x1f"),
     );
+    // Cargo tells a script the linker it was told of for the platform.
+    if let Some(linker) = &node.linker {
+        env.insert("RUSTC_LINKER".to_string(), linker.clone());
+    }
     let relative_env = config::apply(
         &mut env,
         &node.config_env,
@@ -478,6 +508,22 @@ mod tests {
         ] {
             assert!(parse_output(bad).is_err(), "{bad}");
         }
+    }
+
+    // Cargo's own question, so that the answer is cargo's: with a proc
+    // macro among the crate types, rustc leaves `crt-static` out.
+    #[test]
+    fn cfgs_are_asked_for_as_cargo_asks() {
+        assert_eq!(
+            print_cfg_args(Some("wasm32-wasip1"), &["--cfg".to_string(), "x".to_string()]).join(" "),
+            "--print=cfg --crate-type bin --crate-type rlib --crate-type dylib --crate-type cdylib \
+             --crate-type staticlib --crate-type proc-macro --target wasm32-wasip1 --cfg x"
+        );
+        assert!(!print_cfg_args(None, &[]).contains(&"--target".to_string()));
+        assert_eq!(
+            cargo_cfgs("panic=\"abort\"\nproc_macro\nunix\n"),
+            "panic=\"abort\"\nunix\n"
+        );
     }
 
     #[test]

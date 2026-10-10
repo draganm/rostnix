@@ -1,0 +1,5 @@
+[package]
+name = "rostnix-tables"
+version = "0.1.0"
+edition = "2021"
+links = "rostnixtables"

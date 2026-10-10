@@ -86,6 +86,12 @@ pub struct CompileNode {
     pub pass_l: bool,
     #[serde(default)]
     pub override_env: BTreeMap<String, String>,
+    /// The triple the unit is built for with `--target`, when it is not
+    /// the machine that builds, and the linker rustc is to use for it.
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub linker: Option<String>,
     /// The flags of the project's cargo configuration.
     #[serde(default)]
     pub rustflags: Vec<String>,
@@ -121,6 +127,12 @@ pub struct RunNode {
     pub links_deps: Vec<LinksDep>,
     #[serde(default)]
     pub override_env: BTreeMap<String, String>,
+    /// The triple the script is run for, when it is not the machine that
+    /// builds, and the linker cargo would tell it of.
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub linker: Option<String>,
     #[serde(default)]
     pub rustflags: Vec<String>,
     #[serde(default)]
@@ -180,6 +192,10 @@ pub struct CompileRecord {
     pub pkg: PkgRef,
     #[serde(rename = "crateName")]
     pub crate_name: String,
+    /// The target's own name. An executable's file has it, and after it
+    /// whatever its platform ends an executable's name with.
+    #[serde(rename = "targetName", default)]
+    pub target_name: String,
     /// What dependents name with `--extern`, or the executable.
     pub artifact: String,
     /// The directories dependents pass as `-L dependency=`.

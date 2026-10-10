@@ -39,6 +39,18 @@ pub struct Request {
     /// configuration, when the caller names them.
     #[serde(default)]
     pub rustflags: Option<Vec<String>>,
+    /// The triple of the platform to build for, and that of the machine
+    /// that builds. Both are the triple of the rustc that plans when the
+    /// caller names neither.
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Whether the two are different platforms to the caller. They can be
+    /// and have one triple: nixpkgs' static and LLVM package sets are built
+    /// with other C compilers than the machine's own.
+    #[serde(default)]
+    pub cross: bool,
 }
 
 impl Request {
@@ -60,7 +72,7 @@ impl Request {
     /// What `cargo test` is asked to plan: the tests of the selected
     /// packages. `bins` and `examples` narrow what is installed, not what
     /// is tested.
-    fn test_graph_args(&self) -> Vec<String> {
+    fn test_graph_args(&self, target: Option<&str>) -> Vec<String> {
         let mut args: Vec<String> = [
             "test",
             "--no-run",
@@ -77,10 +89,11 @@ impl Request {
             args.extend(["--package".to_string(), package.clone()]);
         }
         args.extend(self.feature_args());
+        args.extend(target_args(target));
         args
     }
 
-    fn unit_graph_args(&self) -> Vec<String> {
+    fn unit_graph_args(&self, target: Option<&str>) -> Vec<String> {
         let mut args: Vec<String> = [
             "build",
             "--unit-graph",
@@ -102,23 +115,49 @@ impl Request {
             }
         }
         args.extend(self.feature_args());
+        args.extend(target_args(target));
         args
     }
 
-    fn metadata_args(&self, host: &str) -> Vec<String> {
-        let mut args: Vec<String> = [
-            "metadata",
-            "--format-version",
-            "1",
-            "--locked",
-            "--filter-platform",
-            host,
-        ]
-        .map(String::from)
-        .to_vec();
+    /// `platforms` are the triples something is built for: the machine
+    /// cargo runs on, for build scripts and proc macros, and the target
+    /// when that is another.
+    fn metadata_args(&self, platforms: &[&str]) -> Vec<String> {
+        let mut args: Vec<String> = ["metadata", "--format-version", "1", "--locked"]
+            .map(String::from)
+            .to_vec();
+        for platform in platforms {
+            args.extend(["--filter-platform".to_string(), platform.to_string()]);
+        }
         args.extend(self.feature_args());
         args
     }
+}
+
+fn target_args(target: Option<&str>) -> Vec<String> {
+    target
+        .map(|triple| vec!["--target".to_string(), triple.to_string()])
+        .unwrap_or_default()
+}
+
+/// The triple to give cargo as `--target`, if any. Cargo plans for the
+/// machine it runs on unless told otherwise, so it is told whenever the
+/// platform to build for is another: the caller cross-compiles, or
+/// evaluates on a machine of another kind than the one that builds. Told a
+/// target, cargo also says of each unit which side it is for, which the
+/// caller needs whenever its two platforms differ, in triple or not.
+///
+/// The triples are compared as text: the caller's are nixpkgs' names and
+/// the planning machine's is rustc's own. Should the two ever name one
+/// machine differently, cargo is told a target it would not have needed,
+/// and builds the same.
+fn planned_target<'a>(
+    target: &'a str,
+    build_host: &str,
+    planning_host: &str,
+    cross: bool,
+) -> Option<&'a str> {
+    (cross || target != build_host || target != planning_host).then_some(target)
 }
 
 /// What follows an error that the tests alone cause.
@@ -161,7 +200,15 @@ pub fn run(request: &str) -> Result<String> {
     let checksums = Checksums::parse(&lock)?;
 
     let cargo = Cargo::new(&request.cargo, &request.rustc)?;
-    let host = cargo.host()?;
+    // The machine cargo runs on now, the machine that will build, and the
+    // platform the result is for.
+    let planning_host = cargo.host()?;
+    let host = request
+        .host
+        .clone()
+        .unwrap_or_else(|| planning_host.clone());
+    let target_triple = request.target.clone().unwrap_or_else(|| host.clone());
+    let target = planned_target(&target_triple, &host, &planning_host, request.cross);
     let cargo_version = cargo.version(&workspace)?;
 
     let plan = |args: &[String]| -> Result<UnitGraph> {
@@ -176,16 +223,21 @@ pub fn run(request: &str) -> Result<String> {
         }
         Ok(units)
     };
-    let units = plan(&request.unit_graph_args())?;
+    let units = plan(&request.unit_graph_args(target))?;
     let test_units = request
         .do_check
-        .then(|| plan(&request.test_graph_args()))
+        .then(|| plan(&request.test_graph_args(target)))
         .transpose()
         .map_err(|err| format!("{err}\n{TESTS_ONLY}"))?;
+    let mut platforms = vec![planning_host.as_str()];
+    if target_triple != planning_host {
+        platforms.push(&target_triple);
+    }
     let metadata: Metadata =
-        serde_json::from_slice(&cargo.output(&workspace, &request.metadata_args(&host))?).map_err(
-            |err| format!("cargo {cargo_version} printed metadata this version cannot read: {err}"),
-        )?;
+        serde_json::from_slice(&cargo.output(&workspace, &request.metadata_args(&platforms))?)
+            .map_err(|err| {
+                format!("cargo {cargo_version} printed metadata this version cannot read: {err}")
+            })?;
 
     // What the project's cargo configuration says about how to build.
     // Cargo merges its configuration files; only the project's own can say
@@ -201,13 +253,20 @@ pub fn run(request: &str) -> Result<String> {
         serde_json::from_slice(&configured(&["--format", "json"])?).map_err(|err| {
             format!("cargo {cargo_version} printed a configuration this version cannot read: {err}")
         })?;
+    // The flags are those of the platform to build for. With `--target`
+    // cargo gives them to what is built for it and to nothing else.
     let (configured_flags, cfgs) = if config::has_cfg_tables(&cargo_config) {
-        config::settled_rustflags(&cargo_config, &host, &|flags| cargo.print_cfg(flags))?
+        config::settled_rustflags(&cargo_config, &target_triple, &|flags| {
+            cargo.print_cfg(flags, target)
+        })?
     } else {
-        (config::rustflags(&cargo_config, &host, None), Vec::new())
+        (
+            config::rustflags(&cargo_config, &target_triple, None),
+            Vec::new(),
+        )
     };
     let rustflags = request.rustflags.clone().unwrap_or(configured_flags);
-    let unapplied = config::unapplied(&cargo_config, &host, &cfgs);
+    let unapplied = config::unapplied(&cargo_config, &target_triple, &cfgs);
     if !unapplied.is_empty() {
         eprintln!(
             "rostnix: warning: the cargo configuration sets {}, which is not applied: rostnix links with the C compiler of its nixpkgs and runs rustc and tests itself",
@@ -238,6 +297,7 @@ pub fn run(request: &str) -> Result<String> {
             src,
             cargo_root: &cargo_root,
             host: &host,
+            target,
             cargo_version: &cargo_version,
             override_keys: &request.override_keys,
             read_manifest: &|path| {
@@ -305,11 +365,13 @@ mod tests {
     #[test]
     fn default_selection_is_plain_cargo_build() {
         assert_eq!(
-            request("").unit_graph_args().join(" "),
+            request("").unit_graph_args(None).join(" "),
             "build --unit-graph -Z unstable-options --locked --profile release"
         );
         assert_eq!(
-            request("").metadata_args("aarch64-apple-darwin").join(" "),
+            request("")
+                .metadata_args(&["aarch64-apple-darwin"])
+                .join(" "),
             "metadata --format-version 1 --locked --filter-platform aarch64-apple-darwin"
         );
     }
@@ -324,13 +386,13 @@ mod tests {
         req.no_default_features = true;
         req.profile = "thin".into();
         assert_eq!(
-            req.unit_graph_args().join(" "),
+            req.unit_graph_args(None).join(" "),
             "build --unit-graph -Z unstable-options --locked --profile thin --package a --package b \
              --bin tool --example demo --features x,dep/y --no-default-features"
         );
         req.all_features = true;
         assert!(req
-            .metadata_args("h")
+            .metadata_args(&["h"])
             .join(" ")
             .ends_with("--features x,dep/y --all-features --no-default-features"));
     }
@@ -341,7 +403,7 @@ mod tests {
     fn tests_are_planned_for_the_selected_packages() {
         let mut req = request("");
         assert_eq!(
-            req.test_graph_args().join(" "),
+            req.test_graph_args(None).join(" "),
             "test --no-run --unit-graph -Z unstable-options --locked --profile release"
         );
         req.packages = vec!["a".into()];
@@ -350,8 +412,46 @@ mod tests {
         req.features = vec!["x".into()];
         req.profile = "thin".into();
         assert_eq!(
-            req.test_graph_args().join(" "),
+            req.test_graph_args(None).join(" "),
             "test --no-run --unit-graph -Z unstable-options --locked --profile thin --package a --features x"
+        );
+    }
+
+    // Cargo plans for the machine it runs on unless it is told a target.
+    #[test]
+    fn a_target_is_named_when_it_is_not_where_cargo_runs() {
+        let (mac, wasm, intel) = (
+            "aarch64-apple-darwin",
+            "wasm32-wasip1",
+            "x86_64-apple-darwin",
+        );
+        // Building here for here.
+        assert_eq!(planned_target(mac, mac, mac, false), None);
+        // Cross-compiling.
+        assert_eq!(planned_target(wasm, mac, mac, true), Some(wasm));
+        // Evaluating here what another kind of machine builds for itself.
+        assert_eq!(planned_target(intel, intel, mac, false), Some(intel));
+        // Evaluating on the platform that another machine builds for.
+        assert_eq!(planned_target(mac, intel, mac, true), Some(mac));
+        // Two platforms of one triple, as with a static package set: the
+        // units of each side must still be told apart.
+        assert_eq!(planned_target(mac, mac, mac, true), Some(mac));
+
+        let req = request("");
+        assert_eq!(
+            req.unit_graph_args(Some(wasm)).join(" "),
+            "build --unit-graph -Z unstable-options --locked --profile release --target wasm32-wasip1"
+        );
+        assert!(req
+            .test_graph_args(Some(wasm))
+            .join(" ")
+            .ends_with("--profile release --target wasm32-wasip1"));
+        // Packages are needed for both: what runs while building, and
+        // what is built.
+        assert_eq!(
+            req.metadata_args(&[mac, wasm]).join(" "),
+            "metadata --format-version 1 --locked --filter-platform aarch64-apple-darwin \
+             --filter-platform wasm32-wasip1"
         );
     }
 

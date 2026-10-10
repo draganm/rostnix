@@ -108,6 +108,15 @@ repeated here.
 | A sparse registry's cache holds its `config.json`, with the download template, at `<cargo home>/registry/index/<directory>/config.json`. A crate's file is at `registry/cache/<directory>/`, under the same directory name as where it is unpacked. | crates.io, and the registry the tests serve. |
 | `cargo -Z unstable-options config get --format json` prints the merged configuration on stable cargo when `RUSTC_BOOTSTRAP=1`, and `--show-origin` names the file each value comes from. | Run on a project with `[build]`, `[target.*]` and `[env]`. |
 | When the table of the triple or a matching `[target.'cfg(…)']` table has `rustflags`, `build.rustflags` is not used. The triple's flags come first, then those of the matching `cfg` tables in the order of their keys. A string is split at whitespace. Which `cfg` tables match is decided against `rustc --print=cfg` run with the flags found so far: cargo asks once without the `cfg` tables' flags and, if the answer changes the flags, once more with them, and then keeps them, saying "non-trivial mutual dependency" when they still do not hold. The flags are the last arguments cargo itself gives rustc, and they go to every unit, registry crates, build scripts and proc macros included. A build script is told them in `CARGO_ENCODED_RUSTFLAGS`, and its `CARGO_CFG_*` come from `rustc --print=cfg` run with them. | `cargo test -vv`. |
+| With `--target`, cargo's unit graph names the platform of each unit: the triple for what is built for the target, nothing for build scripts, proc macros and what those depend on. A package needed on both sides is two units. A build script is compiled for the machine cargo runs on, and its run is a unit for the target. | `hello` planned with `--target wasm32-wasip1`, recorded in `testdata/hello-wasi/`: 14 units for the target and 14 for the machine. |
+| A unit for the target is given `--target <triple>` and, when cargo knows a linker for the target, `-C linker=<path>`, a library included; a unit for the machine gets neither. With `--target`, the configuration's `rustflags` go to the units for the target and to no other. A build script run for the target is told `TARGET=<triple>`, `HOST=<the machine's triple>`, `RUSTC_LINKER` and the target's `CARGO_CFG_*`. What is for the target lies under `target/<triple>/<profile>/`. | `cargo build -vv --target wasm32-wasip1`. |
+| Cargo asks rustc for a platform's cfgs with every crate type at once, `proc-macro` among them, and drops `proc_macro` from the answer. For a platform that links the C runtime statically by default the answer then lacks `target_feature="crt-static"`, which plain `rustc --print=cfg` has. | `CARGO_CFG_TARGET_FEATURE` of a build script under `cargo build --target wasm32-wasip1`. |
+| For WebAssembly rustc names an executable `<name>.wasm`, a `cdylib` `<name>.wasm` without `lib`, and a `staticlib` `lib<name>.a`. | The same build. |
+| rustc links WebAssembly by driving its linker as an lld. nixpkgs' C compiler for the platform does not take that (`unknown argument: '-flavor'`), nor does its wrapper of `ld`. The unwrapped `wasm-ld` of `stdenv.cc.bintools.bintools` links, and the result runs under wasmtime. | Each tried as `-C linker` with `pkgsCross.wasi32`. |
+| A dynamic library that rustc links for macOS records the path it was written to as its name, and what is linked against it looks for it there. | `otool -D` on a `cdylib`, and `otool -L` on a C program linked against it. |
+| With debug information, rustc leaves object files beside what it links on macOS, named `<crate>-<hash>.<more>.rcgu.o`. C that a build script compiles with debug information names its source directory. | A `dev` build of a `cdylib` whose build script compiles C. |
+| nixpkgs hands the `buildInputs` of a derivation for a platform without dynamic libraries on as `propagatedBuildInputs`. A package of a cross package set has the same package for the build machine as `__spliced.buildBuild`. | The units of a build for `pkgsCross.wasi32`. |
+| `stdenv.hostPlatform.rust.rustcTarget` is the triple rustc knows a package set's platform by, and `buildPlatform.canExecute hostPlatform` says whether the machine that builds runs its programs. | `wasm32-wasip1` and `false` for `pkgsCross.wasi32` on aarch64-darwin. |
 | Every rustc invocation, build-script run and test run is given the `[env]` values, registry crates included. A value with `relative = true` is the path from the directory above the one the file is in, joined as it is, so an empty value ends with a slash and an absolute one stays what it is. A value is not set when the variable is already in cargo's environment, unless it says `force = true`. | Same log: `TERM` forced, `HOME` left alone. |
 
 ## User-facing API
@@ -145,11 +154,17 @@ Non-flake use: `import rostnix { inherit pkgs; }` returns the same set as
 
 | Argument | Default | Meaning |
 |---|---|---|
-| `pkgs` | required | The nixpkgs that builds the tool and performs the build. |
+| `pkgs` | required | The nixpkgs that builds the tool and performs the build. A cross package set builds for its platform; see [Building for another platform](#building-for-another-platform). |
 | `rustc` | `pkgs.buildPackages.rustc` | The compiler inside derivations. Cargo also queries it while planning. |
-| `cargo` | `pkgs.buildPackages.cargo` | The cargo that plans during evaluation. |
+| `cargo` | `pkgs.buildPackages.cargo` | The cargo that plans during evaluation. A test finds it as `CARGO`. |
+| `linker` | `null` | What rustc links with for a platform other than the build machine's. `null` means the one that fits the platform. |
+| `evalPkgs` | `null` | The package set of the machine that evaluates, when it is another kind of machine than the one that builds. |
+| `evalRustc`, `evalCargo` | those of `evalPkgs` | The rustc and cargo that plan when `evalPkgs` is given. With a toolchain that is not nixpkgs' own, the same versions built for that machine. |
 
-Returns `{ buildRustApplication, tool, rustc, cargo, builders }`.
+Returns `{ buildRustApplication, tool, rustc, cargo, builders, linker,
+nixpkgsCrateOverrides, fromNixpkgsCrateOverrides }`. `linker` is what rustc
+is given for the platform, or null when it is the build machine's own. The
+last two are in [crateOverrides](#crateoverrides).
 
 rostnix's flag rules follow cargo 1.95, the cargo of nixpkgs 26.05. Other
 toolchains can be passed but are not tested.
@@ -170,7 +185,7 @@ toolchains can be passed but are not tested.
 | `noDefaultFeatures` | `false` | As `--no-default-features`. |
 | `profile` | `"release"` | As `--profile`. |
 | `crateOverrides` | `{ }` | See [crateOverrides](#crateoverrides). |
-| `doCheck` | `true` | Build and run the tests of the selected packages; see [Tests](#tests). |
+| `doCheck` | whether the build machine runs the platform's programs | Build and run the tests of the selected packages; see [Tests](#tests). |
 | `checkFlags` | `[ ]` | Arguments for every test executable. |
 | `skipTests` | `[ ]` | Names of test targets that are neither built nor run. |
 | `rustflags` | `null` | The flags every rustc gets. `null` means those of the project's cargo configuration; a list takes their place. |
@@ -181,9 +196,12 @@ The selection means what it means to `cargo build`. With neither `bins` nor
 packages. With either, it builds only what they name.
 
 Every binary and example the selection builds lands in `$out/bin` under its
-target name. A selection that builds neither is an error that names `bins`
-and `examples`. `passthru` exposes `graph`, `units`, `bins` and `tests`,
-each unit a derivation, so one unit can be built alone. `tests` holds the
+target name, with the ending the platform gives an executable. Every
+library of the selection that is built for use from outside Rust, with the
+crate type `cdylib` or `staticlib`, lands in `$out/lib` under the name a
+linker looks for. A selection that builds none of these is an error that
+names `bins` and `examples`. `passthru` exposes `graph`, `units`, `bins`,
+`libs` and `tests`, each unit a derivation, so one unit can be built alone. `tests` holds the
 tests that are run. `unitRecords` is a directory of the `unit.json` of
 every unit `cargo build` plans, and `testUnitRecords` the same for
 `cargo test`, with the record of each test's run.
@@ -224,7 +242,10 @@ never written to disk.
 ```nix
 b: rec {
   cargoVersion = "1.95.0";
+  # The machine that builds, and the triple cargo was told with --target,
+  # if it was told one; see "Building for another platform".
   host = "aarch64-apple-darwin";
+  target = null;
 
   sources."zstd-sys-2.0.16+zstd.1.5.7" = b.fetchCrate {
     pname = "zstd-sys";
@@ -293,6 +314,8 @@ b: rec {
   };
 
   bins."amber-store" = units."amber-store-core-0.10.0-example-amber-store-7d21e0b3";
+  # Libraries of the selection for use from outside Rust, by crate name.
+  libs = { };
 
   # What the project's cargo configuration says; see "Cargo configuration".
   rustflags = [ ];
@@ -327,6 +350,9 @@ and builders cannot drift and carries no version number.
        src = "${src}";
        storeDir = builtins.storeDir;
        overrideKeys = builtins.attrNames crateOverrides;
+       # The platform to build for and the machine that builds.
+       target = pkgs.stdenv.hostPlatform.rust.rustcTarget;
+       host = pkgs.stdenv.buildPlatform.rust.rustcTarget;
        inherit cargoRoot packages bins examples features allFeatures
          noDefaultFeatures profile;
      })
@@ -334,13 +360,16 @@ and builders cannot drift and carries no version number.
    ```
 
    Nix builds the tool, cargo and rustc first if they are not in the store.
-3. The tool reads the host triple from `rustc -vV` and runs, in
-   `src/cargoRoot`:
+   With `evalPkgs` the three are that package set's.
+3. The tool reads the triple of the machine it runs on from `rustc -vV`
+   and runs, in `src/cargoRoot`, with `--target` where
+   [another platform](#building-for-another-platform) is built for:
    - `cargo build --unit-graph -Z unstable-options --locked` with the
      selection, for the units;
    - with `doCheck`, `cargo test --no-run --unit-graph -Z unstable-options
      --locked` with the selected packages, for the units of the tests;
    - `cargo metadata --format-version 1 --locked --filter-platform <host>`,
+     and a second `--filter-platform` for the target when it is another,
      for what the unit graph leaves out of each package: its manifest fields,
      declared features, `links` and targets;
    - `cargo config get --format json`, for the `rustflags` and the `[env]`
@@ -563,9 +592,14 @@ once, as it does for `libc` in core-rs.
 
 Runs rustc once. Outputs:
 
-- `$out/lib/`: the rlib of a library, and the dynamic library of a proc
-  macro or `cdylib`;
-- `$out/bin/<name>` for a binary, an example or a build script;
+- `$out/lib/`: the rlib of a library, the dynamic library of a proc macro
+  or `cdylib`, and the archive of a `staticlib`;
+- `$out/install/`: for a library with the crate type `cdylib` or
+  `staticlib`, a link to each of its files in `lib` that is not Rust's own,
+  under the name cargo's target directory has for it, which is the name
+  without the unit's hash;
+- `$out/bin/<name>` for a binary, an example or a build script, with the
+  ending the platform gives an executable;
 - `$out/unit.json`: the artifact, what dependents need (below), and the
   arguments and environment rustc ran with.
 
@@ -592,6 +626,11 @@ builder is the tool; they do not use stdenv. Units that link are built with
 `stdenv.mkDerivation`, which supplies the C compiler, the linker and the
 platform's libraries, and with the `buildInputs` of every overridden package
 in their closure. `resolve` lists those packages in the node's `overrides`.
+The stdenv is that of the platform the unit is for.
+
+What rustc wrote is found by name: `<crate>-<hash>` and one word after a
+dot, or none. Object files that rustc leaves beside it for a debugger have
+more to their names and are neither the executable nor a library.
 
 ### `runBuildScript`
 
@@ -603,20 +642,31 @@ with `stdenv.mkDerivation` and the package's override entry. Outputs:
 - `$out/output`, the script's stdout;
 - `$out/unit.json`, the directives parsed from it.
 
+The C compiler of the run is told `-ffile-prefix-map`, through
+`NIX_CFLAGS_COMPILE`, with the names rustc is given for the package's Rust.
+C that the script compiles would otherwise name its source in the store,
+in debug information and wherever it says `__FILE__`, and what is
+installed would refer to the source tree.
+
 See [Build scripts](#build-scripts).
 
 ### Application
 
-Copies each executable out of its unit into `$out/bin`. A unit's output
-refers to its dependencies through `unit.json`; the copy does not, so the
-application's closure holds only what the executables themselves refer to.
+Copies each executable out of its unit into `$out/bin`, and each file in a
+library unit's `install` into `$out/lib`. A unit's output refers to its
+dependencies through `unit.json`; the copies do not, so the application's
+closure holds only what the installed files themselves refer to.
+
+A dynamic library for macOS is told its place in the result with
+`install_name_tool -id`. Until then it names the unit it was linked in, and
+a program linked against the installed file would look for it there.
 
 macOS needs one more step when the profile keeps debug information. There
 it stays in the object files, and the executable points at them, which
 would keep every unit alive, and through `unit.json` the sources and the
 toolchain. Such an executable gets a `.dSYM` bundle beside it, made with
 `dsymutil`, and has the pointers stripped. ripgrep, whose release profile
-sets `debug = 1`, showed the need.
+sets `debug = 1`, showed the need. A dynamic library gets the same.
 
 ## rustc flags
 
@@ -747,7 +797,9 @@ follows the source root in its value, and those withheld from it.
 `RUSTC`, `RUSTDOC`, `CARGO`, `CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_LINKS`,
 `CARGO_PKG_*`, `CARGO_ENCODED_RUSTFLAGS`, one `CARGO_FEATURE_<NAME>` per
 enabled feature, and `CARGO_CFG_*` from `rustc --print=cfg`, queried in the
-derivation as cargo queries it.
+derivation as cargo queries it: for the target the run is for, with every
+crate type named at once, and without `proc_macro` in the answer. For the
+target the run is also told `RUSTC_LINKER`, when rustc is given a linker.
 
 It reads `cargo::` and `cargo:` lines from the script's stdout, ignoring
 whitespace around a line as cargo does:
@@ -789,6 +841,7 @@ A key is a package name.
 | `nativeBuildInputs` | `[ ]` | Tools the package's build script and rustc invocations run, such as `pkg-config`. |
 | `env` | `{ }` | Environment of the package's build script and of its rustc invocations. |
 | `extraSrc` | `[ ]` | Local packages only: files and directories, relative to `src`, added to the view of every unit of the package. |
+| `optional` | `false` | The entry is one of a collection: no warning when it names no package of the build. |
 
 A package with an entry builds all its units with stdenv. `env` values
 become strings as `toString` makes them, and an `extraSrc` path may be
@@ -800,6 +853,32 @@ the same key may match on another platform or with other features.
 
 core-rs needs no entry: its native libraries are compiled from the sources
 their crates bundle.
+
+### nixpkgs' overrides
+
+nixpkgs keeps such knowledge for its own `buildRustCrate`, in
+`defaultCrateOverrides`: for each crate a function from the crate's
+attributes to attributes of its build. `fromNixpkgsCrateOverrides` turns a
+set of that shape into `crateOverrides` entries, and
+`nixpkgsCrateOverrides` is `defaultCrateOverrides` of `pkgs` turned so:
+
+```nix
+crateOverrides = rustEnv.nixpkgsCrateOverrides // {
+  my-crate.extraSrc = [ "proto" ];
+};
+```
+
+Of what an entry returns, three things mean here what they mean there:
+`buildInputs`, `nativeBuildInputs`, and environment variables, which
+`buildRustCrate` takes as attributes written in capitals or in an `env`
+set. The rest,
+patches, hooks and flags of a build this is not, is left out. Every entry
+is `optional`.
+
+A nixpkgs entry is called with what is known of a crate before the build
+is planned: `crateName` and `pname`, a `version` of `0.0.0` and no
+`features`. It is called when a package of the build takes it, so one that
+asks for more fails then, and only then.
 
 ## Conformance with cargo
 
@@ -972,17 +1051,104 @@ core-rs needs two settings. `skipTests = [ "amber_bench_smoke" ]`: that
 test runs `cargo build`. `checkFlags = [ "--skip" "golden_tar_extracts" ]`:
 that one extracts a setuid file from an archive and checks its mode.
 
-## Later stages
+## Building for another platform
 
-**Stage 4, cross-compilation and the rest.**
+`mkRustEnv` builds for the platform its `pkgs` is for. A cross package
+set, `pkgsCross.<name>` or nixpkgs imported with a `crossSystem`, has two
+platforms: the machine that builds, `stdenv.buildPlatform`, and the one the
+program runs on, `stdenv.hostPlatform`. rustc knows each by a triple, which
+nixpkgs has as `rust.rustcTarget`.
 
-- Cargo plans with `--target`; units for the target get `--target` and the
-  cross linker of `pkgs.stdenv.cc`, units for the build machine do not.
-  `evalPkgs` names the package set of the evaluating machine when it differs
-  from the build platform.
-- `cdylib` and `staticlib` targets can be installed.
-- An adapter reads `buildInputs` and `nativeBuildInputs` from nixpkgs'
-  `defaultCrateOverrides`.
+```nix
+rustEnv = rostnix.lib.mkRustEnv { pkgs = pkgs.pkgsCross.wasi32; };
+```
+
+**Planning.** `resolve` is told both triples: `target`, the platform to
+build for, and `host`, the machine that builds; and `cross`, whether
+nixpkgs holds them to be two platforms. It gives cargo `--target <target>`
+when they are, or when the target is not the machine cargo runs on while
+it plans. Two platforms can have one triple: nixpkgs' static package set
+on macOS is one, with a C compiler of its own. Cargo is told the target
+then too, because only then does its plan say which side a unit is for.
+Otherwise cargo is told no target, and the graph is what it was before
+there were targets. `cargo
+metadata` is filtered for the machine cargo runs on and for the target,
+and the configuration's `rustflags` and the `cfg` tables that match are
+those of the target.
+
+With `--target`, each unit of cargo's plan says which machine it is for.
+The graph has the build's `target`, and each node its own: the triple, or
+null for the machine that builds. Build scripts, proc macros and what they
+depend on are for the machine that builds, and a package needed on both
+sides is two units. A unit for a triple the build is not for is an error,
+since one target is built at a time; a package that names its own target
+gives one.
+
+**Units.**
+
+| | For the target | For the machine that builds |
+|---|---|---|
+| rustc | `--target <triple>`, and `-C linker=<linker>` when the platforms differ | neither |
+| `rustflags` of the configuration or the argument | given | not given, as cargo has it with `--target` |
+| stdenv, when the unit has one | `pkgs.stdenv` | `pkgs.buildPackages.stdenv` |
+| an override's `buildInputs` and `nativeBuildInputs` | as written | the same packages for the build machine, `__spliced.buildBuild` |
+
+In a graph without a target there is one platform, and every unit is for
+it.
+
+An override's `env` is given as it is written to the units of both
+machines: a value is a string, and a string that names a library of the
+target names it for a build script's dependency on the build machine too.
+The same holds for an input that a cross package set has no build-machine
+counterpart of, such as one made with `.override`.
+
+**The linker.** rustc links by calling `cc`, which in a derivation for
+another platform is not that platform's. So it is given the C compiler of
+`pkgs.stdenv`, `<prefix>cc`, as nixpkgs' own Rust support gives it. For
+WebAssembly it is given the `wasm-ld` of `pkgs.stdenv.cc.bintools`,
+unwrapped, because rustc drives that linker itself. `linker` of `mkRustEnv`
+names another. No linker is named when the build machine builds for
+itself.
+
+nixpkgs' wrapper of a linker is what adds the library directories of
+`buildInputs`. The unwrapped `wasm-ld` is given none, so for WebAssembly a
+library from an override is found only when a build script names its
+directory, as one that asks `pkg-config` does.
+
+**Build scripts.** A script is compiled for the machine that builds and
+runs on it. Its run is for the target when its package is: it is told
+`TARGET`, `HOST` and `RUSTC_LINKER`, and the `CARGO_CFG_*` of the target,
+which rustc is asked for as cargo asks. It runs in `pkgs.stdenv`, where
+`CC` is the target's C compiler, so a script that compiles C compiles it
+for the target. The build machine's own is in `HOST_CC` and `HOST_CXX`,
+where the `cc` crate looks, and `PKG_CONFIG_ALLOW_CROSS` is set, without
+which the `pkg-config` crate refuses to answer for another platform.
+
+**Tests.** `doCheck` is on by default when
+`buildPlatform.canExecute hostPlatform`. What the build machine cannot run
+is not tested unless `doCheck = true` says so, and then a test fails when
+it is run. Cargo's `runner` is not applied. A test of the target finds the
+standard library of the target, and its package's binaries under
+`CARGO_BIN_EXE_<target name>`, whatever the file's name ends with.
+
+**What is installed.** An executable has the ending rustc gives it:
+`.wasm` for WebAssembly, `.exe` for Windows, none elsewhere.
+`meta.mainProgram` has it too.
+
+**Evaluating on another kind of machine.** Evaluation runs the tool, cargo
+and rustc where Nix evaluates. When that is another kind of machine than
+the one that builds, as when a Mac evaluates what a Linux builder builds,
+`evalPkgs` is its package set: the three that plan come from it, and
+everything else from `pkgs`. Cargo is then told the target even if it is
+the build machine's own, because it is not the machine cargo runs on.
+
+Cargo plans build scripts and proc macros for the machine it runs on, and
+here they are built on another. Their rustc is the build machine's and is
+told no target, so they are compiled for the right machine. Which of their
+dependencies are planned is decided for the wrong one: a build dependency
+that only one of the two machines has, under
+`[target.'cfg(…)'.build-dependencies]`, is planned for the machine that
+evaluates.
 
 ## Error handling
 
@@ -1006,8 +1172,9 @@ non-zero. Nix then reports that the program failed.
 | An example that is not an executable | Names the example and its crate type. |
 | A target whose root file is outside its package directory, a `path` with `..` in it included | Names the target and the file. |
 | Two selected executables with one name | Names both units and says to select one. |
-| A unit planned for another target, before stage 4 | Names the target and says cross-compilation is not supported yet. |
-| The selection builds no binary or example | `buildRustApplication` throws, naming `bins` and `examples`. |
+| A unit planned for another target than the build's | Names the unit and both targets, and says that one target is built at a time. |
+| Two selected libraries for use from outside Rust with one name | Names both units. |
+| The selection builds no binary, no example, and no `cdylib` or `staticlib` | `buildRustApplication` throws, naming `bins` and `examples`. |
 | Unknown `crateOverrides` attribute | `buildRustApplication` throws, naming it and the attributes an entry takes. |
 | `extraSrc` on a package that is not local | `buildRustApplication` throws, naming the entry. |
 | A build script fails or prints `cargo::error` | The run derivation fails with the script's output in its log. |
@@ -1051,9 +1218,21 @@ Known gaps, none of which the fixtures meet:
   told `PROFILE`.
 - A local path dependency that belongs to another workspace gets this
   workspace's `[workspace.lints]` when it says `lints.workspace = true`.
-- On Linux, C objects a build script compiles with debug information may
-  name their sources in the store, which the executable then refers to.
-  Linux is untested as a whole.
+- A build for another platform is tested for WebAssembly, where a linker
+  is all the platform needs. With a C compiler as the linker, as for Linux
+  on another processor, nothing here has been built: nixpkgs' cache has no
+  such rustc for the machine the tests run on.
+- When `evalPkgs` is given, the dependencies of build scripts and proc
+  macros are planned for the machine that evaluates; see
+  [Building for another platform](#building-for-another-platform).
+- A package that names its own target, with `forced-target` or
+  `per-package-target`, is refused, as is a second `--target`.
+- A `cdylib` or `staticlib` is installed when cargo builds it as a root of
+  the selection. Nothing selects a library alone: with `bins` or
+  `examples`, cargo builds a library only as a dependency.
+- A dynamic library for Linux is installed under its plain name and has no
+  `soname`, as cargo leaves it.
+- Linux is untested as a whole.
 
 ## Testing rostnix
 
@@ -1096,6 +1275,7 @@ sandbox because they need `exec` and the network.
 | `profiles` | One project built under four profiles: fat LTO with `panic = "abort"`, `opt-level = "s"`, `codegen-units` and a per-package override; thin LTO; no LTO; and `dev`. Tests: one that expects a panic, which cargo has unwind under every profile. |
 | `gitdeps` | Dependencies from git repositories: `serde` by tag, a workspace with a proc macro, build scripts and packages that depend on each other by path, and `itoa` by revision. |
 | `config` | A workspace below the source root with cargo configuration at both levels: `rustflags` from the triple's table and from `cfg` tables, one of which matches only because of the triple's flag, all of which take the place of `[build]`'s; and `[env]` variables that are plain, forced, not forced, relative to a data file outside the workspace, and relative to the workspace itself. |
+| `libs` | A workspace with a library of the crate types `cdylib`, `staticlib` and `rlib`, whose build script compiles C, and a binary that uses it. A third package with `links` is used by that build script and by the library, so that it is built for both machines where they differ, and says in the program's output which machine each was for. Built under `release` and under `dev`, natively and for WebAssembly. |
 | `registry` | A crate from a sparse registry that `tests/registry.py` serves on this machine, named in a cargo home made up for the test, which also says how to build and is not listened to in that. |
 | core-rs | Patient zero at its pinned commit, fetched with `builtins.fetchTree`: the `amber-store` example, and its test suite: 21 of 22 test executables, with one test skipped by name. |
 | rostnix | rostnix builds itself with `buildRustApplication` and runs its own unit tests. |
@@ -1118,6 +1298,30 @@ registry crate; that the `rustflags` argument takes the place of the
 configuration's flags, and that a `linker` in the configuration is warned
 about; that the registry's own download address reproduces the pre-seeded
 file; and that a crate with no usable address explains itself.
+
+For building for another platform, `hello` and `libs` are built with
+`pkgsCross.wasi32`, whose rustc is in nixpkgs' cache. The driver runs what
+comes out under wasmtime, calls the function of the library's module,
+compares every invocation with `cargo build --target wasm32-wasip1` in a
+shell that has cargo told the same linker, and checks that each unit is
+built with the stdenv and the linker of its machine, that an override's
+libraries and tools for a proc macro are the build machine's, that the
+package used on both sides is built for each and its `links` metadata is
+that of the target's, that no test is planned, and that a package set for
+another platform of the build machine's own triple, `pkgsStatic`, is
+planned with a target all the same. Where the machine builds as another kind, as an Apple
+Silicon Mac does as an Intel one, `hello` is planned on the one and built
+on the other with `evalPkgs`: its tests run there, and the invocations
+are those of cargo run on that kind of machine with the target named.
+
+For libraries the driver links a C program against the installed dynamic
+library and against the static one, runs both, and checks that the
+dynamic library is looked for where it was installed; that a `dev` build
+installs no object file, has its debug information in a `.dSYM` bundle
+and refers to no source tree; and that `buildscript` builds the same with
+`nixpkgsCrateOverrides` in place of its own entry for `libz-sys`, whose
+build script runs with what nixpkgs names, without a warning for the
+entries no package takes.
 
 The driver also checks that a failing test fails the build and is named,
 that `skipTests` leaves a test out and warns about an entry that matches
@@ -1156,7 +1360,8 @@ src/node.rs          reading a derivation's node from its attributes
 src/compile.rs       the compile subcommand
 src/buildscript.rs   the run-build-script subcommand, directive parsing
 src/testrun.rs       the test subcommand: a test compiled and run in a copy of its source
-nix/                 mk-rust-env.nix, tool.nix, builders.nix, build-rust-application.nix
+nix/                 mk-rust-env.nix, tool.nix, builders.nix, build-rust-application.nix,
+                     nixpkgs-overrides.nix
 examples/conformance.rs   comparing units and test runs with a cargo -vv log
 testdata/            recorded cargo output for the unit tests
 tests/fixtures/      integration fixtures
@@ -1182,6 +1387,6 @@ tests/run.sh         integration driver
 4. **Cross-compilation and the rest.** `--target`, `evalPkgs`, `cdylib` and
    `staticlib` outputs, the nixpkgs overrides adapter.
 
-Each stage ends with its fixtures passing, and each gets its own
-implementation plan, written when the previous stage is done. The first plan
-covers stage 1 only.
+Each stage ends with its fixtures passing, and each got its own
+implementation plan, written when the previous stage was done. All four
+are built.

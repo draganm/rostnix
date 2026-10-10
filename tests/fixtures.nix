@@ -1,7 +1,12 @@
-# The integration fixtures, built with the rustEnv under test.
-{ rustEnv, pkgs }:
+# The integration fixtures, built with the rustEnv under test. elsewherePkgs
+# is the package set of another kind of machine that this one can build
+# as, if there is one.
+{ rustEnv, pkgs, mkRustEnv, elsewherePkgs ? null }:
 let
   inherit (pkgs) lib;
+  # For WebAssembly, which the build machine cannot run: nixpkgs has its
+  # compiler ready, and a build needs nothing of the platform but a linker.
+  wasi = mkRustEnv { pkgs = pkgs.pkgsCross.wasi32; };
   profiles = profile: rustEnv.buildRustApplication {
     pname = "profiles-${profile}";
     src = ./fixtures/profiles;
@@ -49,6 +54,46 @@ in
         buildInputs = [ pkgs.zlib ];
       };
     };
+  };
+
+  # The same with nixpkgs' own overrides, which know what libz-sys needs.
+  buildscript-nixpkgs = rustEnv.buildRustApplication {
+    pname = "buildscript";
+    src = ./fixtures/buildscript;
+    crateOverrides = rustEnv.nixpkgsCrateOverrides // {
+      bs-native.env.ROSTNIX_FIXTURE_NOTE = "from-override";
+      consumer = {
+        nativeBuildInputs = [ pkgs.pkg-config ];
+        buildInputs = [ pkgs.zlib ];
+        extraSrc = [ "shared" ];
+      };
+    };
+  };
+
+  # A library for use from C, dynamic and static, whose build script
+  # compiles C, and a program in Rust that uses it.
+  libs = rustEnv.buildRustApplication {
+    pname = "libs";
+    src = ./fixtures/libs;
+  };
+
+  # With debug information, which on macOS a dynamic library points at as
+  # an executable does.
+  libs-dev = rustEnv.buildRustApplication {
+    pname = "libs-dev";
+    src = ./fixtures/libs;
+    profile = "dev";
+  };
+
+  # For another platform: proc macros and build scripts are built for the
+  # machine that builds and the rest for WebAssembly, C included.
+  hello-wasi = wasi.buildRustApplication {
+    pname = "hello";
+    src = ./fixtures/hello;
+  };
+  libs-wasi = wasi.buildRustApplication {
+    pname = "libs";
+    src = ./fixtures/libs;
   };
 
   # Dependencies from git repositories: a workspace with a proc macro and
@@ -111,4 +156,15 @@ in
       fileset = lib.fileset.unions [ ../Cargo.toml ../Cargo.lock ../src ../examples ../testdata ];
     };
   };
+
+  # Planned on this machine and built on another kind: the plan must be
+  # one for that machine, down to the tests, which run there.
+  hello-elsewhere =
+    if elsewherePkgs == null
+    then throw "rostnix: the tests know no other kind of machine that ${pkgs.stdenv.buildPlatform.system} builds as"
+    else
+      (mkRustEnv { pkgs = elsewherePkgs; evalPkgs = pkgs; }).buildRustApplication {
+        pname = "hello";
+        src = ./fixtures/hello;
+      };
 }

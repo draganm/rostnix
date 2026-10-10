@@ -1,0 +1,17 @@
+[package]
+name = "rostnix-math"
+version = "0.1.0"
+edition = "2021"
+
+# For C as a dynamic and as a static library, and for Rust.
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+# The library uses rostnix-tables on the platform it is for, and the build
+# script on the machine that builds.
+[dependencies]
+rostnix-tables = { path = "../tables" }
+
+[build-dependencies]
+cc = "1"
+rostnix-tables = { path = "../tables" }

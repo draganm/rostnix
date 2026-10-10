@@ -44,6 +44,8 @@ pub struct Layout {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Placed {
+    /// The target's name, which the file's name may have an ending after.
+    pub name: String,
     pub from: String,
     pub to: PathBuf,
     pub is_example: bool,
@@ -104,6 +106,7 @@ pub fn layout(node: &TestNode, source: &Path, executables: &[CompileRecord]) -> 
                 profile_dir.clone()
             };
             Placed {
+                name: record.target_name.clone(),
                 from: record.artifact.clone(),
                 to: dir.join(name),
                 is_example,
@@ -130,10 +133,9 @@ fn binaries(node: &TestNode, layout: &Layout) -> Vec<(String, String)> {
         .executables
         .iter()
         .filter(|placed| !placed.is_example)
-        .map(|placed| {
-            let name = placed.to.file_name().unwrap_or_default().to_string_lossy();
-            (format!("CARGO_BIN_EXE_{name}"), text(&placed.to))
-        })
+        // The variable is named after the target; the file it names has
+        // the platform's ending.
+        .map(|placed| (format!("CARGO_BIN_EXE_{}", placed.name), text(&placed.to)))
         .collect()
 }
 
@@ -327,8 +329,11 @@ pub fn run() -> Result<()> {
         .map(node::read_record::<RunRecord>)
         .transpose()?;
 
+    // The directory of the standard library of the platform the test is
+    // for, where a test that links it dynamically finds it.
     let target_libdir = Command::new(&attrs.rustc)
         .arg("--print=target-libdir")
+        .args(unit.target.iter().flat_map(|triple| ["--target", triple]))
         .output()
         .map_err(|err| format!("running {} --print=target-libdir: {err}", attrs.rustc))?;
     if !target_libdir.status.success() {
@@ -382,9 +387,11 @@ pub fn run() -> Result<()> {
     if !status.success() {
         return Err(format!("rustc failed for {what}").into());
     }
-    if !layout.exe.is_file() {
-        return Err(format!("rustc did not write {}", layout.exe.display()).into());
-    }
+    // The executable has the name the layout says, and on some platforms
+    // an ending after it.
+    let stem = format!("{}-{}", unit.crate_name, unit.metadata);
+    let exe = compile::executable_in(&layout.deps_dir, &stem)
+        .ok_or_else(|| format!("rustc did not write {}", layout.exe.display()))?;
 
     // Run.
     let mut env = run_env(
@@ -407,7 +414,7 @@ pub fn run() -> Result<()> {
     let mut log = fs::File::create(Path::new(out).join("log"))?;
     let (reader, writer) = std::io::pipe()?;
     let mut child = {
-        let mut command = Command::new(&layout.exe);
+        let mut command = Command::new(&exe);
         command
             .args(&node.args)
             .current_dir(&layout.cwd)
@@ -427,7 +434,7 @@ pub fn run() -> Result<()> {
         }
         command
             .spawn()
-            .map_err(|err| format!("running {what} ({}): {err}", layout.exe.display()))?
+            .map_err(|err| format!("running {what} ({}): {err}", exe.display()))?
         // The command, and with it this process's ends of the pipe, is
         // dropped here, so that reading ends when the test does.
     };
@@ -439,7 +446,7 @@ pub fn run() -> Result<()> {
         return Err(format!("{what} failed: {status}").into());
     }
 
-    let mut argv = vec![text(&layout.exe)];
+    let mut argv = vec![text(&exe)];
     argv.extend(node.args.iter().cloned());
     node::write_record_as(
         out,
@@ -462,7 +469,8 @@ pub fn run() -> Result<()> {
             kind: unit.kind.clone(),
             pkg: unit.pkg.clone(),
             crate_name: unit.crate_name.clone(),
-            artifact: text(&layout.exe),
+            target_name: unit.target_name.clone(),
+            artifact: text(&exe),
             transitive: inv.transitive,
             native: inv.native,
             native_external: inv.native_external,
@@ -518,6 +526,13 @@ mod tests {
                 version: "1.0.0".to_string(),
             },
             crate_name: "cli".to_string(),
+            // Its file's name without what follows a dot.
+            target_name: artifact
+                .rsplit('/')
+                .next()
+                .and_then(|file| file.split('.').next())
+                .unwrap_or_default()
+                .to_string(),
             artifact: artifact.to_string(),
             transitive: vec![],
             native: vec![],
@@ -562,16 +577,38 @@ mod tests {
             layout.executables,
             [
                 Placed {
+                    name: "my-tool".to_string(),
                     from: "/nix/store/tool/bin/my-tool".to_string(),
                     to: PathBuf::from("/build/source/ws/target/release/my-tool"),
                     is_example: false,
                 },
                 Placed {
+                    name: "demo".to_string(),
                     from: "/nix/store/demo/bin/demo".to_string(),
                     to: PathBuf::from("/build/source/ws/target/release/examples/demo"),
                     is_example: true,
                 },
             ]
+        );
+    }
+
+    // Where an executable's name has an ending, the file keeps it and the
+    // variable that names the file does not: it is the target's name that
+    // a test writes in `env!("CARGO_BIN_EXE_…")`.
+    #[test]
+    fn a_binary_with_an_ending_is_named_by_its_target() {
+        let n = node("test");
+        let layout = layout(
+            &n,
+            Path::new("/build/source"),
+            &[record("bin", "/nix/store/tool/bin/my-tool.wasm")],
+        );
+        assert_eq!(
+            binaries(&n, &layout),
+            [(
+                "CARGO_BIN_EXE_my-tool".to_string(),
+                "/build/source/ws/target/release/my-tool.wasm".to_string()
+            )]
         );
     }
 

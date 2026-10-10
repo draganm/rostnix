@@ -22,7 +22,12 @@ pub const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-ind
 #[derive(Debug, Default)]
 pub struct Graph {
     pub cargo_version: String,
+    /// The triple of the machine that builds.
     pub host: String,
+    /// The triple cargo planned for with `--target`, when it was given
+    /// one: units for it say so, and the others are for the machine that
+    /// builds.
+    pub target: Option<String>,
     pub sources: BTreeMap<String, Source>,
     /// The git repositories packages come from, each at one revision.
     pub git_sources: BTreeMap<String, GitSource>,
@@ -31,6 +36,9 @@ pub struct Graph {
     /// Target name of each binary and example the selection builds, and its
     /// unit.
     pub bins: BTreeMap<String, String>,
+    /// Target name of each library the selection builds as a `cdylib` or a
+    /// `staticlib`, and its unit.
+    pub libs: BTreeMap<String, String>,
     pub roots: Vec<String>,
     /// The units that are tests: each compiles a test executable and runs
     /// it.
@@ -278,6 +286,9 @@ pub struct CompileUnit {
     pub name: String,
     pub package: String,
     pub src: SrcRef,
+    /// The triple the unit is built for with `--target`. `None` is the
+    /// machine that builds.
+    pub target: Option<String>,
     /// What is built: `lib`, `proc-macro`, `bin`, `example`, `build-script`,
     /// or `test` for any target built as a test.
     pub kind: &'static str,
@@ -321,6 +332,8 @@ pub struct RunUnit {
     pub name: String,
     pub package: String,
     pub src: SrcRef,
+    /// The triple the script is run for; `None` is the machine that builds.
+    pub target: Option<String>,
     /// The unit that compiles the script.
     pub script: String,
     pub features: Vec<String>,
@@ -341,7 +354,10 @@ pub struct Inputs<'a> {
     pub src: &'a str,
     /// The workspace directory relative to it; `""` is the root.
     pub cargo_root: &'a str,
+    /// The triple of the machine that builds, and the one cargo was given
+    /// with `--target`, if it was given one.
     pub host: &'a str,
+    pub target: Option<&'a str>,
     pub cargo_version: &'a str,
     pub override_keys: &'a [String],
     /// Reads the manifest at a path.
@@ -504,6 +520,7 @@ fn profile_dir(profile: &str) -> String {
 fn classify(
     graph: &UnitGraph,
     by_id: &HashMap<&str, &Package>,
+    target: Option<&str>,
     test_plan: bool,
 ) -> Result<Vec<Kind>> {
     let mut kinds = Vec::with_capacity(graph.units.len());
@@ -515,8 +532,19 @@ fn classify(
             )
         })?;
         let what = format!("{} of {} {}", unit.target.name, pkg.name, pkg.version);
-        if let Some(platform) = &unit.platform {
-            return Err(format!("{what} is planned for the target {platform}; cross-compilation is not supported yet").into());
+        // Cargo plans for the one target it was given, and for the machine
+        // it runs on.
+        if unit
+            .platform
+            .as_deref()
+            .is_some_and(|platform| Some(platform) != target)
+        {
+            return Err(format!(
+                "{what} is planned for the target {}, and this build is for {}; one target is built at a time",
+                unit.platform.as_deref().unwrap_or_default(),
+                target.unwrap_or("the machine that builds")
+            )
+            .into());
         }
         let built = matches!(unit.mode.as_str(), "build" | "run-custom-build")
             || (test_plan && matches!(unit.mode.as_str(), "test" | "doctest"));
@@ -563,9 +591,9 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
         .collect();
 
     // The build plan, and the test plan when tests are wanted.
-    let build_kinds = classify(inp.units, &by_id, false)?;
+    let build_kinds = classify(inp.units, &by_id, inp.target, false)?;
     let test_plan = match inp.test_units {
-        Some(tests) => Some((tests, classify(tests, &by_id, true)?)),
+        Some(tests) => Some((tests, classify(tests, &by_id, inp.target, true)?)),
         None => None,
     };
 
@@ -607,6 +635,7 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
     let mut out = Graph {
         cargo_version: inp.cargo_version.to_string(),
         host: inp.host.to_string(),
+        target: inp.target.map(String::from),
         rustflags: inp.rustflags.to_vec(),
         config_env: inp
             .config_env
@@ -777,12 +806,32 @@ pub fn build(inp: &Inputs) -> Result<Graph> {
     out.build_units = built(&keys, &build_kinds);
     for &root in &graph.roots {
         out.roots.push(keys[root].clone());
+        let unit = &graph.units[root];
+        let name = &unit.target.name;
         if matches!(build_kinds[root], Kind::Bin | Kind::Example) {
-            let name = &graph.units[root].target.name;
             match out.bins.insert(name.clone(), keys[root].clone()) {
                 Some(other) if other != keys[root] => {
                     return Err(format!(
                         "the selection builds two executables named {name} ({other} and {}), which would be installed under one name; select one of them with `packages`, `bins` or `examples`",
+                        keys[root]
+                    )
+                    .into());
+                }
+                _ => {}
+            }
+        }
+        // A library that is built to be used from outside Rust is
+        // something to install too.
+        let for_others = unit
+            .target
+            .crate_types
+            .iter()
+            .any(|ct| matches!(ct.as_str(), "cdylib" | "staticlib"));
+        if build_kinds[root] == Kind::Lib && for_others {
+            match out.libs.insert(name.clone(), keys[root].clone()) {
+                Some(other) if other != keys[root] => {
+                    return Err(format!(
+                        "the selection builds two libraries named {name} ({other} and {}), which would be installed under one name; select one of them with `packages`",
                         keys[root]
                     )
                     .into());
@@ -924,7 +973,12 @@ fn add_plan(ctx: &Ctx, graph: &UnitGraph, kinds: &[Kind], out: &mut Graph) -> Re
                     "PROFILE".to_string(),
                     profile_root(&unit.profile.name, ctx.workspace_manifest).to_string(),
                 ),
-                ("TARGET".to_string(), inp.host.to_string()),
+                (
+                    "TARGET".to_string(),
+                    unit.platform
+                        .clone()
+                        .unwrap_or_else(|| inp.host.to_string()),
+                ),
                 ("HOST".to_string(), inp.host.to_string()),
             ]);
             if let Some(links) = &pkg.links {
@@ -936,6 +990,7 @@ fn add_plan(ctx: &Ctx, graph: &UnitGraph, kinds: &[Kind], out: &mut Graph) -> Re
                     name,
                     package: pkg_info.key.clone(),
                     src,
+                    target: unit.platform.clone(),
                     script: keys[script.index].clone(),
                     features: unit.features.clone(),
                     debug_assertions: unit.profile.debug_assertions,
@@ -1003,7 +1058,12 @@ fn add_plan(ctx: &Ctx, graph: &UnitGraph, kinds: &[Kind], out: &mut Graph) -> Re
                 executables.dedup();
             }
             TestInfo {
-                profile_dir: profile_dir(&unit.profile.name),
+                // With `--target`, cargo keeps what is for the target in a
+                // directory of the triple's name.
+                profile_dir: match &unit.platform {
+                    Some(triple) => format!("{triple}/{}", profile_dir(&unit.profile.name)),
+                    None => profile_dir(&unit.profile.name),
+                },
                 executables,
             }
         });
@@ -1032,6 +1092,7 @@ fn add_plan(ctx: &Ctx, graph: &UnitGraph, kinds: &[Kind], out: &mut Graph) -> Re
                 name,
                 package: pkg_info.key.clone(),
                 src,
+                target: unit.platform.clone(),
                 kind: kind.word(),
                 target_kind,
                 crate_name: unit.target.crate_name(),
@@ -1116,7 +1177,7 @@ fn unit_hash(
     };
     let profile = &unit.profile;
     let mut parts = vec![
-        "rostnix-unit-2".to_string(),
+        "rostnix-unit-3".to_string(),
         info.pkg.name.clone(),
         info.pkg.version.clone(),
         source,
@@ -1124,6 +1185,7 @@ fn unit_hash(
         unit.target.name.clone(),
         unit.target.crate_types.join(","),
         unit.mode.clone(),
+        unit.platform.clone().unwrap_or_default(),
         unit.features.join(","),
         format!(
             "{}|{}|{}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}",
@@ -1341,6 +1403,7 @@ mod tests {
             src: "/src",
             cargo_root: "",
             host: "aarch64-apple-darwin",
+            target: None,
             cargo_version: "1.95.0",
             override_keys,
             read_manifest: &|_| Ok(Table::new()),
@@ -1389,6 +1452,7 @@ mod tests {
             src: "/src",
             cargo_root: "",
             host: "aarch64-apple-darwin",
+            target: None,
             cargo_version: "1.95.0",
             override_keys: &[],
             read_manifest: &|_| Ok(Table::new()),
@@ -1677,14 +1741,148 @@ mod tests {
     }
 
     #[test]
-    fn a_unit_for_another_target_is_refused() {
+    fn a_unit_for_a_target_the_build_is_not_for_is_refused() {
         let err = rejection(|units, _, _| {
             units.units[0].platform = Some("x86_64-unknown-linux-gnu".to_string())
         });
         assert!(
-            err.contains("x86_64-unknown-linux-gnu") && err.contains("cross-compilation"),
+            err.contains("x86_64-unknown-linux-gnu") && err.contains("one target"),
             "{err}"
         );
+    }
+
+    /// The graph of the hello fixture as cargo 1.95 planned it for
+    /// WebAssembly on a Mac, after `change` has had its way with the plan.
+    fn hello_wasi(change: impl FnOnce(&mut UnitGraph)) -> Graph {
+        let mut units: UnitGraph =
+            serde_json::from_str(include_str!("../testdata/hello-wasi/build-graph.json")).unwrap();
+        let tests: UnitGraph =
+            serde_json::from_str(include_str!("../testdata/hello-wasi/test-graph.json")).unwrap();
+        let metadata: Metadata =
+            serde_json::from_str(include_str!("../testdata/hello-wasi/metadata.json")).unwrap();
+        let mut lock = String::new();
+        for pkg in metadata.packages.iter().filter(|p| p.source.is_some()) {
+            lock.push_str(&format!(
+                "[[package]]\nname = \"{}\"\nversion = \"{}\"\nsource = \"{CRATES_IO}\"\nchecksum = \"sum\"\n\n",
+                pkg.name, pkg.version
+            ));
+        }
+        change(&mut units);
+        let checksums = Checksums::parse(&lock).unwrap();
+        build(&Inputs {
+            units: &units,
+            test_units: Some(&tests),
+            metadata: &metadata,
+            checksums: &checksums,
+            src: "/src",
+            cargo_root: "",
+            host: "aarch64-apple-darwin",
+            target: Some("wasm32-wasip1"),
+            cargo_version: "1.95.0",
+            override_keys: &[],
+            read_manifest: &|_| Ok(Table::new()),
+            read_source: &|_| None,
+            rustflags: &[],
+            config_env: &[],
+        })
+        .unwrap()
+    }
+
+    // What runs while building is for the machine that builds: build
+    // scripts, proc macros and what they are made of. The rest is for the
+    // target, the run of a build script included.
+    #[test]
+    fn a_cross_plan_says_which_machine_each_unit_is_for() {
+        let graph = hello_wasi(|_| {});
+        assert_eq!(graph.host, "aarch64-apple-darwin");
+        assert_eq!(graph.target.as_deref(), Some("wasm32-wasip1"));
+        let wasm = Some("wasm32-wasip1".to_string());
+
+        let of = |prefix: &str| compile(&graph, prefix)[0].target.clone();
+        assert_eq!(of("hello-0.1.0-lib-"), wasm);
+        assert_eq!(of("hello-0.1.0-bin-hello-"), wasm);
+        assert_eq!(of("serde_core-1.0.229-lib-"), wasm);
+        assert_eq!(of("serde_derive-1.0.229-proc-macro-"), None);
+        assert_eq!(of("syn-3.0.6-lib-"), None);
+        assert_eq!(of("serde_core-1.0.229-build-script-"), None);
+
+        let run = |prefix: &str| {
+            let (_, unit) = graph
+                .units
+                .iter()
+                .find(|(key, _)| key.starts_with(prefix))
+                .unwrap();
+            let UnitNode::Run(run) = unit else { panic!() };
+            run.clone()
+        };
+        // A script of a package of the program runs for the target.
+        let for_target = run("serde_core-1.0.229-run-build-script-");
+        assert_eq!(for_target.target, wasm);
+        assert_eq!(for_target.env["TARGET"], "wasm32-wasip1");
+        assert_eq!(for_target.env["HOST"], "aarch64-apple-darwin");
+        // One of a package that only a proc macro uses runs for the
+        // machine.
+        let for_host = run("proc-macro2-1.0.107-run-build-script-");
+        assert_eq!(for_host.target, None);
+        assert_eq!(for_host.env["TARGET"], "aarch64-apple-darwin");
+        assert_eq!(for_host.env["HOST"], "aarch64-apple-darwin");
+
+        // Cargo keeps what is for the target in a directory of its name.
+        let test = compile(&graph, "hello-0.1.0-test-cli-")[0];
+        assert_eq!(test.target, wasm);
+        assert_eq!(
+            test.test.as_ref().unwrap().profile_dir,
+            "wasm32-wasip1/release"
+        );
+    }
+
+    // A package the program uses and a build script uses too is built
+    // once for each machine: two units of one name, told apart by what
+    // they are for.
+    #[test]
+    fn a_package_built_for_both_machines_is_two_units() {
+        let graph = hello_wasi(|units| {
+            let itoa = units
+                .units
+                .iter()
+                .find(|unit| unit.pkg_id.contains("itoa@"))
+                .unwrap();
+            let mut for_host = itoa.clone();
+            for_host.platform = None;
+            units.units.push(for_host);
+        });
+        let itoa = compile(&graph, "itoa-1.0.18-lib-");
+        assert_eq!(itoa.len(), 2);
+        assert_eq!(itoa[0].name, itoa[1].name);
+        assert_ne!(itoa[0].metadata, itoa[1].metadata);
+        let mut targets: Vec<Option<&str>> =
+            itoa.iter().map(|unit| unit.target.as_deref()).collect();
+        targets.sort();
+        assert_eq!(targets, [None, Some("wasm32-wasip1")]);
+    }
+
+    // A library built as a cdylib or a staticlib is something to install.
+    #[test]
+    fn libraries_for_use_from_outside_rust_are_named() {
+        let graph = hello_wasi(|units| {
+            let lib = units
+                .units
+                .iter_mut()
+                .find(|unit| unit.pkg_id.contains("hello@") && unit.target.kind == ["lib"])
+                .unwrap();
+            lib.target.crate_types = vec!["cdylib".to_string(), "rlib".to_string()];
+            let index = units
+                .units
+                .iter()
+                .position(|unit| unit.pkg_id.contains("hello@") && unit.target.kind == ["lib"])
+                .unwrap();
+            units.roots.push(index);
+        });
+        assert_eq!(graph.libs.keys().collect::<Vec<_>>(), ["hello"]);
+        assert!(graph.libs["hello"].starts_with("hello-0.1.0-lib-"));
+        // An ordinary library is not.
+        assert!(hello_wasi(|_| {}).libs.is_empty());
+        assert!(hello(false).libs.is_empty());
     }
 
     #[test]
@@ -2024,6 +2222,7 @@ mod tests {
             src: "/src",
             cargo_root: "",
             host: "aarch64-apple-darwin",
+            target: None,
             cargo_version: "1.95.0",
             override_keys: &[],
             read_manifest: &|_| Ok(Table::new()),

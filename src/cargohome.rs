@@ -296,19 +296,20 @@ impl Cargo {
         Ok(output.stdout)
     }
 
-    /// The cfgs of the machine rustc runs on when it is given `flags`, as
-    /// `rustc --print=cfg` prints them.
-    pub fn print_cfg(&self, flags: &[String]) -> Result<String> {
+    /// The cfgs of `target`, or of the machine rustc runs on, when rustc is
+    /// given `flags`, as `rustc --print=cfg` prints them.
+    pub fn print_cfg(&self, flags: &[String], target: Option<&str>) -> Result<String> {
         let output = Command::new(&self.rustc)
-            .arg("--print=cfg")
-            .args(flags)
+            .args(crate::buildscript::print_cfg_args(target, flags))
             .env_remove("RUSTFLAGS")
             .output()
             .map_err(|err| format!("running {}: {err}", self.rustc.display()))?;
         if !output.status.success() {
             return Err(format!("{} --print=cfg failed", self.rustc.display()).into());
         }
-        Ok(String::from_utf8(output.stdout)?)
+        Ok(crate::buildscript::cargo_cfgs(&String::from_utf8(
+            output.stdout,
+        )?))
     }
 
     /// `cargo --version`'s number.
