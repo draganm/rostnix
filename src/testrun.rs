@@ -20,6 +20,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
 use crate::compile::{self, Invocation};
+use crate::config;
 use crate::node::{self, Attrs, CompileRecord, RunRecord, TestNode, TestRecord, RUN_RECORD_FILE};
 use crate::Result;
 
@@ -353,13 +354,23 @@ pub fn run() -> Result<()> {
     }
 
     // Compile.
-    let inv = compile_plan(
+    let mut inv = compile_plan(
         &attrs.rustc,
         &attrs.cargo,
         node,
         &layout,
         &deps,
         script.as_ref(),
+    );
+    // A relative variable of the cargo configuration names a path in the
+    // copy, where the test is compiled and runs.
+    let copy = text(&layout.source);
+    let relative_env = config::apply(
+        &mut inv.env,
+        &unit.config_env,
+        unit.local,
+        &copy,
+        &config::in_environment,
     );
     let status = Command::new(&inv.argv[0])
         .args(&inv.argv[1..])
@@ -376,7 +387,7 @@ pub fn run() -> Result<()> {
     }
 
     // Run.
-    let env = run_env(
+    let mut env = run_env(
         &attrs.cargo,
         node,
         &layout,
@@ -384,6 +395,13 @@ pub fn run() -> Result<()> {
         script.as_ref(),
         String::from_utf8_lossy(&target_libdir.stdout).trim(),
         &std::env::var(dylib_var()).unwrap_or_default(),
+    );
+    config::apply(
+        &mut env,
+        &unit.config_env,
+        unit.local,
+        &copy,
+        &config::in_environment,
     );
     fs::create_dir_all(out)?;
     let mut log = fs::File::create(Path::new(out).join("log"))?;
@@ -434,6 +452,8 @@ pub fn run() -> Result<()> {
             env,
             override_env: unit.override_env.clone(),
             cwd: text(&layout.cwd),
+            relative_env: relative_env.clone(),
+            withheld_env: unit.withheld_env.clone(),
         },
     )?;
     node::write_record(
@@ -451,6 +471,8 @@ pub fn run() -> Result<()> {
             env: inv.env,
             override_env: unit.override_env.clone(),
             cwd: inv.cwd,
+            relative_env,
+            withheld_env: unit.withheld_env.clone(),
         },
     )
 }
@@ -505,6 +527,8 @@ mod tests {
             env: BTreeMap::new(),
             override_env: BTreeMap::new(),
             cwd: String::new(),
+            relative_env: BTreeMap::new(),
+            withheld_env: vec![],
         }
     }
 

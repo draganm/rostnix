@@ -3,8 +3,9 @@
 # graph `rostnix resolve` prints.
 { lib, fetchurl, runCommand, stdenv, tool, rustc, cargo, system }:
 
-# Per-application settings.
-{ srcStr, crateOverrides ? { }, checkFlags ? [ ] }:
+# Per-application settings, and what the project's cargo configuration
+# says: the flags every rustc gets and the variables of its [env] table.
+{ srcStr, crateOverrides ? { }, checkFlags ? [ ], rustflags ? [ ], configEnv ? [ ] }:
 let
   builder = "${tool}/bin/rostnix";
   rustcBin = "${rustc}/bin/rustc";
@@ -48,12 +49,35 @@ let
           || (type == "directory" && keepDir ? ${rel});
     };
 
+  # A relative variable of the cargo configuration names a path of the
+  # source. One that holds a local package names the source itself; the
+  # others name data: a configuration file, a directory of assets.
+  relativeEnv = lib.filter (variable: variable.relative != null) configEnv;
+  dataEnv = lib.filter (variable: !variable.holdsSource) relativeEnv;
+
   # The source tree of a unit: a fetched crate, or a view of the local
-  # source that the package's override may widen.
+  # source. The package's override may widen the view, and the data a
+  # relative variable names is part of every view.
   sourceOf = src: override:
     if src ? localSource
-    then mkLocalSource (src.localSource // { extra = map cleanPath (override.extraSrc or [ ]); })
+    then
+      mkLocalSource (src.localSource // {
+        extra = map cleanPath (override.extraSrc or [ ]) ++ map (variable: variable.relative) dataEnv;
+      })
     else src;
+
+  # The [env] variables as a unit of a package gets them. A plain value
+  # goes to every unit. A relative one names a path of the source, and goes
+  # to the units of local packages, each of which finds the path in its own
+  # tree. A crate from elsewhere is not handed paths into this source: it
+  # would be rebuilt whenever what lies there changes. One that needs such
+  # a variable gets it from crateOverrides.
+  configEnvOf = package:
+    lib.filter (variable: variable.relative == null || package.local)
+      (map (variable: { inherit (variable) name value force relative slash; }) configEnv);
+  withheldEnvOf = package:
+    lib.optionals (!package.local) (map (variable: variable.name) relativeEnv);
+
   # What the tool is told about a unit that rustc compiles.
   compileNode = node: override:
     let inherit (node) package;
@@ -67,6 +91,9 @@ let
       deps = map (dep: { inherit (dep) name; path = "${dep.unit}"; }) node.deps;
       buildScript = if node.buildScript == null then null else "${node.buildScript}";
       overrideEnv = envOf override;
+      inherit rustflags;
+      configEnv = configEnvOf package;
+      withheldEnv = withheldEnvOf package;
     };
 
   # The libraries of every overridden package a unit links.
@@ -77,12 +104,42 @@ in
   # A registry crate: its .crate file, then the tree unpacked from it.
   # resolve adds the file to the store under the path its Cargo.lock
   # checksum dictates, so the download runs only where that did not happen.
-  fetchCrate = { pname, version, sha256, url }:
-    let crate = fetchurl { name = "${pname}-${version}.crate"; inherit url sha256; };
+  #
+  # A registry other than crates.io may give no address that works without
+  # the caller's token. Then there is nothing to download with, and the
+  # derivation that stands for the file can only say so.
+  fetchCrate = { pname, version, sha256, url, registry ? null }:
+    let
+      name = "${pname}-${version}.crate";
+      crate =
+        if url != null then fetchurl { inherit name url sha256; }
+        else
+          runCommand name
+            {
+              outputHashMode = "flat";
+              outputHashAlgo = "sha256";
+              outputHash = sha256;
+              inherit registry;
+            } ''
+            echo "rostnix: ${pname} ${version} comes from the registry $registry, which names no address to download it from without credentials." >&2
+            echo "The file is put into the Nix store where the project is evaluated. Build on that machine, or get this path from a substituter." >&2
+            exit 1
+          '';
     in runCommand "rustsrc-${pname}-${version}" { passthru = { inherit crate; }; } ''
       mkdir $out
       tar -xzf ${crate} -C $out --strip-components=1
     '';
+
+  # A git repository at the revision Cargo.lock names, fetched during
+  # evaluation by the git of whoever evaluates, with their credentials.
+  # Cargo checks submodules out, so they are fetched too.
+  #
+  # The revision is what is fetched. The ref, the branch or tag the
+  # dependency asks for, is for a Nix that cannot fetch a revision by its
+  # name and looks for it there.
+  fetchGit = { name, url, rev, ref ? null }:
+    builtins.fetchGit ({ inherit name url rev; submodules = true; shallow = true; }
+      // lib.optionalAttrs (ref != null) { inherit ref; });
 
   # A view of the local source. It becomes a store path once the unit that
   # uses it knows what its package's override adds.
@@ -178,6 +235,9 @@ in
         env = package.env // node.env;
         linksDeps = map (dep: { inherit (dep) links; path = "${dep.unit}"; }) node.linksDeps;
         overrideEnv = envOf override;
+        inherit rustflags;
+        configEnv = configEnvOf package;
+        withheldEnv = withheldEnvOf package;
       };
       nativeBuildInputs = override.nativeBuildInputs or [ ];
       buildInputs = libraries;

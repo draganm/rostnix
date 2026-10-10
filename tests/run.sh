@@ -11,7 +11,9 @@ exec_opt=(--option allow-unsafe-native-code-during-evaluation true)
 # Everything the tests write: reference builds, copies of fixtures, and the
 # build of the conformance example. Nothing is built inside the repository.
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+# The registry one check serves, stopped whatever happens.
+registry_pid=
+trap '[ -z "$registry_pid" ] || kill "$registry_pid" 2>/dev/null; rm -rf "$work"' EXIT
 
 fail() {
   echo "FAIL: $*" >&2
@@ -44,9 +46,11 @@ check_bins() {
 
 # compare_with_cargo <fixture> <shell> <records attribute> <conformance flag or ""> <cargo arguments...>
 # Runs cargo on a copy of the fixture's source, in the named flake shell and
-# with a cargo home that shares only the download cache, as resolve's does.
+# with a cargo home that shares only the download caches, as resolve's does.
 # What cargo ran must be what the fixture's records say rostnix ran, apart
-# from what the spec lists. The flags are split into words.
+# from what the spec lists. The flags are split into words. CARGO_ROOT names
+# the workspace's directory in the source, when it is not the root. Cargo
+# fetches git repositories with the git command, as rostnix has it do.
 compare_with_cargo() {
   local fixture="$1" shell="$2" attr="$3" flag="$4" src dir records
   shift 4
@@ -54,16 +58,18 @@ compare_with_cargo() {
   dir="$work/conformance-$fixture-$attr"
   mkdir -p "$dir/home" "$dir/src"
   ln -s "${CARGO_HOME:-$HOME/.cargo}/registry" "$dir/home/registry"
+  ln -s "${CARGO_HOME:-$HOME/.cargo}/git" "$dir/home/git"
   cp -R "$src/." "$dir/src/"
   chmod -R u+w "$dir/src"
-  (cd "$dir/src" &&
+  (cd "$dir/src/${CARGO_ROOT:-.}" &&
     env -u RUSTFLAGS -u CARGO_BUILD_TARGET -u RUSTC_WRAPPER \
-      CARGO_HOME="$dir/home" CARGO_TARGET_DIR="$dir/target" \
+      CARGO_HOME="$dir/home" CARGO_TARGET_DIR="$dir/target" CARGO_NET_GIT_FETCH_WITH_CLI=true \
       nix develop "$flake#$shell" --command cargo "$@" >"$dir/cargo.out" 2>"$dir/cargo.log") ||
     fail "$fixture: the reference cargo $1 failed; see $(tail -n 5 "$dir/cargo.log")"
   records="$(build "fixtures.$fixture.$attr")"
   CARGO_TARGET_DIR="$work/target" nix develop "$flake" --command \
-    cargo run --quiet --manifest-path "$root/Cargo.toml" --example conformance -- $flag "$dir/cargo.log" "$records" ||
+    cargo run --quiet --manifest-path "$root/Cargo.toml" --example conformance -- \
+    $flag --root "$(cd "$dir/src" && pwd -P)" "$dir/cargo.log" "$records" ||
     fail "$fixture: rostnix does not run what cargo $1 runs (differences above)"
   rm -rf "$dir"
 }
@@ -445,6 +451,108 @@ check_tests_only_refusal() {
   echo "ok: what only the tests need and cannot be planned is explained; doCheck = false builds without it"
 }
 
+# A crate from a registry other than crates.io. The registry is served
+# from this machine, and named in the cargo home of whoever builds: a home
+# made up for this check, which also says how to build, to show that this
+# part of it is not listened to.
+check_registry() {
+  local served="$work/registry" home="$work/registry-home" port=18473
+  local python out got crate="graph.sources.\"rostnix-fixture-dep-0.1.0\".crate"
+  mkdir -p "$served" "$home"
+  python="$(nix develop "$flake#fixtureShell" --command sh -c 'command -v python3')"
+  "$python" "$root/tests/registry.py" make "$served" "$port" >/dev/null
+  "$python" "$root/tests/registry.py" serve "$served" "$port" &
+  registry_pid=$!
+  for _ in {1..50}; do
+    curl -sf "http://127.0.0.1:$port/index/config.json" >/dev/null && break
+    sleep 0.2
+  done
+  # What answers must be the server just started, not one left over from
+  # an earlier run, which would serve a directory that is gone.
+  kill -0 "$registry_pid" 2>/dev/null && curl -sf "http://127.0.0.1:$port/index/config.json" >/dev/null ||
+    fail "registry: the registry does not run on port $port; is another program using it?"
+  printf '[registries.fixture]\nindex = "sparse+http://127.0.0.1:%s/index/"\n\n[build]\nrustflags = ["--cfg", "from_the_callers_home"]\n\n[env]\nFROM_THE_CALLERS_HOME = "1"\n' \
+    "$port" >"$home/config.toml"
+
+  out="$(CARGO_HOME="$home" build fixtures.registry)" || fail "registry: the fixture does not build"
+  got="$("$out/bin/from-registry")"
+  [ "$got" = "registry ok: 42" ] || fail "registry: from-registry printed '$got', want 'registry ok: 42'"
+  echo "ok: registry: a crate from another registry is built, and its test passes"
+
+  got="$(CARGO_HOME="$home" nix eval "${exec_opt[@]}" --json "$flake#fixtures.registry.graph" \
+    --apply 'graph: { inherit (graph) rustflags configEnv; }')"
+  [ "$got" = '{"configEnv":[],"rustflags":[]}' ] ||
+    fail "registry: the caller's cargo home says how to build, and was listened to: $got"
+  echo "ok: registry: the caller's cargo home says where crates come from and not how to build"
+
+  # The registry's own config.json says where its crates are downloaded.
+  got="$(CARGO_HOME="$home" nix eval "${exec_opt[@]}" --raw "$flake#fixtures.registry.$crate.url")"
+  [ "$got" = "http://127.0.0.1:$port/crates/rostnix-fixture-dep/rostnix-fixture-dep-0.1.0.crate" ] ||
+    fail "registry: the crate would be downloaded from '$got'"
+  CARGO_HOME="$home" nix build "${exec_opt[@]}" --rebuild --no-link "$flake#fixtures.registry.$crate" ||
+    fail "registry: downloading the crate does not reproduce the pre-seeded file"
+  echo "ok: registry: downloading the crate from the registry reproduces the pre-seeded file"
+
+  kill "$registry_pid" 2>/dev/null || true
+  wait "$registry_pid" 2>/dev/null || true
+  registry_pid=
+}
+
+# A registry that names no address to download from without a token: the
+# derivation that stands for the crate file cannot fetch it, and says what
+# to do instead.
+check_registry_without_address() {
+  local msg
+  if msg="$(nix build --impure "${exec_opt[@]}" --no-link -L --expr "
+      let rustEnv = (builtins.getFlake \"$flake\").legacyPackages.\${builtins.currentSystem}.rustEnv;
+      in ((rustEnv.builders { srcStr = \"/nowhere\"; }).fetchCrate {
+        pname = \"private-dep\";
+        version = \"1.0.0\";
+        sha256 = \"7b1f0c1b0f9d5c7a3d1e6a4c8e2b9f0d6a5c4b3e2f1a0d9c8b7a6f5e4d3c2b1a\";
+        url = null;
+        registry = \"sparse+https://crates.example.com/index/\";
+      }).crate" 2>&1)"; then
+    fail "a crate with no address to download from was built"
+  fi
+  case "$msg" in
+    *'private-dep 1.0.0 comes from the registry sparse+https://crates.example.com/index/'*'substituter'*)
+      echo "ok: a crate of a registry that needs a token says how to get it" ;;
+    *) fail "unhelpful error for a crate with no address to download from: $msg" ;;
+  esac
+}
+
+# The flags of the cargo configuration can be replaced: a project that
+# links with mold on its developers' machines must still build here.
+check_rustflags_argument() {
+  local got
+  got="$(fixture_with config '{ cargoRoot = "ws"; rustflags = [ "--cfg" "from_argument" ]; }' \
+    'builtins.toJSON app.graph.rustflags')" || fail "the rustflags argument does not evaluate"
+  [ "$got" = '["--cfg","from_argument"]' ] ||
+    fail "rustflags = [ --cfg from_argument ] gives the flags $got"
+  echo "ok: config: the rustflags argument takes the place of the configuration's flags"
+}
+
+# A linker the cargo configuration names is not used: rostnix links with
+# the C compiler of its nixpkgs. Evaluation says so, by the key that sets
+# it.
+check_unapplied_config() {
+  local dir="$work/linker" msg
+  mkdir -p "$dir/.cargo"
+  cp -R "$root/tests/fixtures/hello/." "$dir/"
+  printf '[target."cfg(all())"]\nlinker = "clang"\n' >"$dir/.cargo/config.toml"
+  msg="$(nix eval --impure --raw "${exec_opt[@]}" --expr "
+      ((builtins.getFlake \"$flake\").legacyPackages.\${builtins.currentSystem}.rustEnv.buildRustApplication {
+        pname = \"linker\";
+        src = $dir;
+      }).drvPath" 2>&1)" || fail "a cargo configuration that names a linker stops the evaluation: $msg"
+  case "$msg" in
+    *"the cargo configuration sets target.'cfg(all())'.linker, which is not applied"*)
+      echo "ok: a setting of the cargo configuration that is not applied is named" ;;
+    *) fail "no warning for a linker in the cargo configuration: $msg" ;;
+  esac
+  rm -rf "$dir"
+}
+
 check_run hello hello '{"greeting":"hello","n":42}'
 check_conformance hello default --profile release
 check_test_conformance hello default --profile release
@@ -479,6 +587,38 @@ check_conformance workspace-shout default --profile release --package ws-app --b
 # Tests are those of the selected package; naming a binary does not narrow
 # them.
 check_test_conformance workspace-shout default --profile release --package ws-app --features shout
+
+# Dependencies from git repositories: serde, a workspace with a proc macro
+# and build scripts, by tag, and itoa by revision. Each is the tree of the
+# revision Cargo.lock names.
+check_run gitdeps gitdeps "gitdeps ok: sum 7"
+check_conformance gitdeps default --profile release
+check_test_conformance gitdeps default --profile release
+check_tests_ran gitdeps gitdeps bin "test result: ok\. 1 passed"
+check_no_intermediate_refs gitdeps
+git_revs="$(nix eval "${exec_opt[@]}" --raw "$flake#fixtures.gitdeps.graph.sources" --apply '
+  sources: toString (map (key: "${key}=${sources.${key}.rev}")
+    (builtins.filter (key: sources.${key} ? rev) (builtins.attrNames sources)))')"
+[ "$git_revs" = "git-itoa-af77385d0daf=af77385d0daf4d0e949e81f2588be2e44f69f086 git-serde-a866b336f14a=a866b336f14aa57a07f0d0be9f8762746e64ecb4" ] ||
+  fail "gitdeps: the git sources are [$git_revs]"
+echo "ok: gitdeps: each repository is fetched at the revision Cargo.lock names"
+
+# The cargo configuration: flags from target tables, which take the place
+# of [build]'s, and variables that are plain, forced, and relative to the
+# directory of the file that sets them. The workspace lies below the source
+# root, with a configuration file at each level.
+check_run config configured \
+  "config ok: plain=plain message=hello-from-data unix=true expression=true triple=true flag=true build=false script=flags n=7"
+CARGO_ROOT=ws check_conformance config default --profile release
+CARGO_ROOT=ws check_test_conformance config default --profile release
+check_tests_ran config configured bin "test result: ok\. 2 passed"
+check_no_intermediate_refs config
+check_rustflags_argument
+check_unapplied_config
+
+# A crate from a registry other than crates.io.
+check_registry
+check_registry_without_address
 
 # Build scripts. The note comes from an override's env, the message from a
 # file an override's extraSrc adds, and pc from the pkg-config and zlib that
@@ -595,6 +735,16 @@ check_incremental "$workspace" '{ }' app/src/bin/ws-tool.rs "rustbin-ws-tool rus
 buildscript="$root/tests/fixtures/buildscript"
 check_incremental "$buildscript" '{ crateOverrides.consumer.extraSrc = [ "shared" ]; }' shared/message.txt \
   "rustbin-consumer rustbs-consumer-0.1.0 rustbsrun-consumer-0.1.0 rusttest-consumer"
+
+# A file that a relative variable of the cargo configuration names is seen
+# by every unit of a local package, although it lies outside the package.
+# The crate from the registry is given no path into this source, and is
+# rebuilt neither when that file changes nor when the source does.
+config="$root/tests/fixtures/config"
+check_incremental "$config" '{ cargoRoot = "ws"; }' data/message.txt \
+  "rustbin-configured rustbs-configured-0.1.0 rustbsrun-configured-0.1.0 rusttest-configured"
+check_incremental "$config" '{ cargoRoot = "ws"; }' ws/app/src/main.rs \
+  "rustbin-configured rustbsrun-configured-0.1.0 rusttest-configured"
 
 core_rs_src="$(nix eval --raw "${exec_opt[@]}" "$flake#fixtures.core-rs.src")"
 check_incremental "$core_rs_src" '{ examples = [ "amber-store" ]; doCheck = false; }' src/lib.rs \

@@ -6,6 +6,7 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use crate::config;
 use crate::localsrc::join;
 use crate::node::{self, Attrs, CompileRecord, LinkArg, RunNode, RunRecord};
 use crate::Result;
@@ -225,8 +226,11 @@ pub fn run() -> Result<()> {
     fs::create_dir_all(&out_dir)?;
     let pkg_root = join(&node.src, &node.manifest_dir);
 
+    // Cargo asks with the flags of its configuration, so that what they
+    // turn on, a target feature or a `--cfg`, is among the script's cfgs.
     let print_cfg = Command::new(&attrs.rustc)
         .arg("--print=cfg")
+        .args(&node.rustflags)
         .output()
         .map_err(|err| format!("running {} --print=cfg: {err}", attrs.rustc))?;
     if !print_cfg.status.success() {
@@ -278,7 +282,17 @@ pub fn run() -> Result<()> {
             .into_owned(),
     );
     env.insert("CARGO".to_string(), attrs.cargo.clone());
-    env.insert("CARGO_ENCODED_RUSTFLAGS".to_string(), String::new());
+    env.insert(
+        "CARGO_ENCODED_RUSTFLAGS".to_string(),
+        node.rustflags.join("\x1f"),
+    );
+    let relative_env = config::apply(
+        &mut env,
+        &node.config_env,
+        node.local,
+        &node.src,
+        &config::in_environment,
+    );
 
     let output = Command::new(&script.artifact)
         .current_dir(&pkg_root)
@@ -330,6 +344,8 @@ pub fn run() -> Result<()> {
             env_recorded: env,
             override_env: node.override_env.clone(),
             cwd: pkg_root,
+            relative_env,
+            withheld_env: node.withheld_env.clone(),
         },
     )
 }

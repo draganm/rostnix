@@ -7,6 +7,7 @@
 pub mod buildscript;
 pub mod cargohome;
 pub mod compile;
+pub mod config;
 pub mod emit;
 pub mod flags;
 pub mod graph;

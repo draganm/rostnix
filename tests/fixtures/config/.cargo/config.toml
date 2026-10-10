@@ -1,0 +1,11 @@
+# Cargo reads this file because the workspace lies below its directory.
+
+[env]
+FIXTURE_PLAIN = "plain"
+# A file outside the workspace. The path is relative to the directory this
+# file's .cargo is in.
+FIXTURE_DATA = { value = "data/message.txt", relative = true }
+# Every environment has TERM and HOME. Cargo sets the one that is forced
+# and leaves the other alone.
+TERM = { value = "dumb", force = true }
+HOME = "/not-applied"

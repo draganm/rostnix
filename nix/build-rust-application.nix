@@ -20,6 +20,9 @@
 , checkFlags ? [ ]
   # Names of test targets that are not run.
 , skipTests ? [ ]
+  # The flags every rustc gets. null means those of the project's cargo
+  # configuration; a list takes their place.
+, rustflags ? null
 , meta ? { }
 }:
 let
@@ -44,12 +47,17 @@ let
       rustc = "${rustc}/bin/rustc";
       src = srcStr;
       inherit (builtins) storeDir;
-      inherit cargoRoot packages bins examples features allFeatures noDefaultFeatures profile doCheck;
+      inherit cargoRoot packages bins examples features allFeatures noDefaultFeatures profile doCheck rustflags;
       overrideKeys = lib.attrNames crateOverrides;
     })
   ];
 
-  graph = graphFn (mkBuilders { inherit srcStr crateOverrides checkFlags; });
+  # The builders are told what the graph says of the cargo configuration.
+  # That part of the graph does not depend on them, so this is no circle.
+  graph = graphFn (mkBuilders {
+    inherit srcStr crateOverrides checkFlags;
+    inherit (graph) rustflags configEnv;
+  });
 
   # A misspelt attribute would otherwise be ignored, and the build would
   # fail later for want of what it was meant to supply.

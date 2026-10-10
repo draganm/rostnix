@@ -6,6 +6,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use crate::config;
 use crate::localsrc::{is_under, join};
 use crate::node::{self, Attrs, CompileNode, CompileRecord, RunRecord};
 use crate::Result;
@@ -45,13 +46,20 @@ pub fn run() -> Result<()> {
         .as_deref()
         .map(node::read_record::<RunRecord>)
         .transpose()?;
-    let inv = plan(
+    let mut inv = plan(
         &attrs.rustc,
         &attrs.cargo,
         node,
         out,
         &deps,
         script.as_ref(),
+    );
+    let relative_env = config::apply(
+        &mut inv.env,
+        &node.config_env,
+        node.local,
+        &node.src,
+        &config::in_environment,
     );
 
     fs::create_dir_all(&inv.out_dir)?;
@@ -86,6 +94,8 @@ pub fn run() -> Result<()> {
             env: inv.env,
             override_env: node.override_env.clone(),
             cwd: inv.cwd,
+            relative_env,
+            withheld_env: node.withheld_env.clone(),
         },
     )
 }
@@ -253,6 +263,8 @@ pub fn plan_at(
         ]);
     }
     argv.extend(node.tail_args.iter().cloned());
+    // The flags of the cargo configuration are the last cargo itself gives.
+    argv.extend(node.rustflags.iter().cloned());
 
     for path in native.iter().chain(&native_external) {
         argv.extend(["-L".to_string(), path.clone()]);
@@ -422,6 +434,8 @@ mod tests {
             env: BTreeMap::new(),
             override_env: BTreeMap::new(),
             cwd: String::new(),
+            relative_env: BTreeMap::new(),
+            withheld_env: vec![],
         }
     }
 
@@ -774,6 +788,27 @@ mod tests {
         );
         assert_eq!(inv.native, ["native=/nix/store/run/out"]);
         assert!(inv.cdylib_link_args.is_empty());
+    }
+
+    // The configuration's flags follow everything cargo itself decides,
+    // `--cap-lints` included, and come before what a build script printed.
+    #[test]
+    fn rustflags_of_the_configuration_follow_cargos_own() {
+        let mut n = node("lib", false);
+        n.rustflags = vec![
+            "--cfg".into(),
+            "from_config".into(),
+            "-A".into(),
+            "dead_code".into(),
+        ];
+        let inv = plan("/rustc", "/cargo", &n, "/out", &[], Some(&script()));
+        let args = inv.argv.join(" ");
+        assert!(
+            args.contains(
+                "--cap-lints allow --cfg from_config -A dead_code -L native=/nix/store/run/out"
+            ),
+            "{args}"
+        );
     }
 
     // The planned environment is cargo's. An override is laid over it when

@@ -18,8 +18,9 @@ does for Go. Cargo plans and rustc builds:
   when they pass. An edit runs again the tests that could tell the
   difference.
 - **No lockfile for Nix.** Crate hashes are the checksums already in
-  `Cargo.lock`. A Rust project commits no Nix code or hash that depends on
-  `Cargo.toml` or `Cargo.lock`.
+  `Cargo.lock`, and git dependencies are fetched at the revisions it names.
+  A Rust project commits no Nix code or hash that depends on `Cargo.toml`
+  or `Cargo.lock`.
 
 [crate2nix](https://github.com/nix-community/crate2nix) can also generate
 its build during evaluation. rostnix differs in that cargo resolves the
@@ -92,6 +93,7 @@ toolchains can be passed but are not tested.
 | `doCheck` | `true` | Build and run the tests of the selected packages; see [Tests](#tests). |
 | `checkFlags` | `[ ]` | Arguments for every test executable, such as `[ "--skip" "needs_network" ]`. |
 | `skipTests` | `[ ]` | Names of test targets that are neither built nor run. |
+| `rustflags` | `null` | The flags every rustc gets. `null` means those of the project's [cargo configuration](#cargo-configuration); a list takes their place. |
 
 The selection means what it means to `cargo build`. With neither `bins` nor
 `examples`, cargo builds the library and every binary of the selected
@@ -189,9 +191,78 @@ Limits worth knowing:
   selected package. Every test executable gets the same `checkFlags`.
 - A test is an input of the application: editing one gives the application
   a new store path although its binaries are unchanged.
-- If something only the tests need cannot be planned, a git
-  dev-dependency for instance, the error says so and `doCheck = false`
-  builds without tests.
+- If something only the tests need cannot be planned, the error says so
+  and `doCheck = false` builds without tests.
+
+### Git dependencies and other registries
+
+Neither needs anything in Nix. A dependency from a git repository is
+fetched during evaluation, by Nix's `builtins.fetchGit`, at the revision
+`Cargo.lock` names and with your own git credentials; private repositories
+work if `git` can reach them. Cargo fetches the repository as well, to
+plan, and is told to use the `git` command for it unless a cargo
+configuration or `CARGO_NET_GIT_FETCH_WITH_CLI` says otherwise, so that
+both read the same git and ssh settings.
+
+A crate from another registry is found the way cargo finds it: through the
+registry settings and tokens of your cargo home, or the project's own
+`.cargo/config.toml`. Its file is added to the Nix store during
+evaluation, like a crates.io crate's. A machine that did not evaluate the
+project downloads it from the address the registry publishes. A registry
+that wants a token for downloads has no such address, so its crates build
+on the machine that evaluated, or come from a substituter.
+
+From your cargo home rostnix takes only what says where crates come from
+and how to reach them: the tables `[registries]`, `[registry]`, `[source]`,
+`[net]`, `[http]` and `[credential-alias]` of its `config.toml`, and your
+credentials. Anything there about how to build is ignored.
+
+### Cargo configuration
+
+The project's own `.cargo/config.toml` files, those of the workspace and
+of the directories above it inside `src`, say how to build, and two of
+their settings are applied:
+
+- **`rustflags`**, from `[build]` and from `[target.<triple>]` and
+  `[target.'cfg(…)']` tables, by cargo's rule: when a target table that
+  matches has flags, `[build]`'s are not used. Every rustc invocation gets
+  them, and build scripts are told them.
+- **`[env]`**, for every rustc invocation, build script and test, with
+  `force` meaning what it means to cargo.
+
+An `[env]` value with `relative = true` names a path of the source, as in
+the usual
+
+```toml
+[env]
+CARGO_WORKSPACE_DIR = { value = "", relative = true }
+```
+
+Your own packages find the path in their own source, and their tests in
+their writable copy. Crates from a registry or from git are not given such
+a variable, where cargo gives it to everything: a path of your source
+would become an input of every crate, and all of them would be rebuilt
+whenever something under it changes. A crate that does need one, a `-sys`
+crate whose build script is pointed at a configuration file of yours, can
+be given it:
+
+```nix
+crateOverrides.some-sys.env.SOME_CONFIG = "${./config/some.toml}";
+```
+
+Other settings that act at build time are not applied, and evaluation
+warns about them: `linker` and `runner` of a `[target]` table and
+`build.rustc-wrapper`. rostnix links with the C compiler of the nixpkgs you
+give it. If your configuration's flags only make sense with such a linker,
+`-C link-arg=-fuse-ld=mold` say, name the flags you do want:
+
+```nix
+rustEnv.buildRustApplication {
+  pname = "app";
+  src = ./.;
+  rustflags = [ "--cfg" "tokio_unstable" ];
+}
+```
 
 ### crateOverrides
 
@@ -234,10 +305,14 @@ directory, narrowed by three rules:
   an example, test or bench. Everything built as a test, unit tests
   included, keeps all three: a test may read whatever lies in its package.
 - The root files of the package's other binaries, examples, tests and
-  benches are left out, except one the step's own root file names as a
-  module: `tests/common.rs` stays for a test that says `mod common;`. A
-  build script's run still sees them all, since build scripts read source
-  files on their own.
+  benches are left out. A build script's run still sees them all, since
+  build scripts read source files on their own.
+
+A file that the step's own root file names stays in any case: by
+`mod common;`, by `#[path = "…"]`, or by `include_str!("…")` and its like
+with a literal path. So `tests/common.rs` stays for the tests that use it
+as a module, and an example stays for a library that includes it in its
+documentation.
 
 Editing `src/main.rs` therefore rebuilds the binary and not the library,
 and editing `tests/e2e.rs` builds and runs that test again and nothing
@@ -255,9 +330,13 @@ when they change. Passing a narrowed `src`, for example with
   `NIX_CONFIG` or `nix.conf`. A flake's `nixConfig` cannot set it.
 - A committed `Cargo.lock` that matches `Cargo.toml`.
 - The project's crates: cargo runs during evaluation and downloads what its
-  cache lacks. It uses your cargo home's download cache and nothing else of
-  your configuration: `~/.cargo/config.toml`, `RUSTFLAGS` and the like do
-  not change the build.
+  cache lacks. It uses your cargo home's download caches, registry settings
+  and credentials, and nothing of what your configuration says about
+  building: `[build]` and `[env]` in `~/.cargo/config.toml`, `RUSTFLAGS`
+  and the like do not change the build.
+- For git dependencies: `git` on your `PATH`, and access to the
+  repositories. Each is fetched twice the first time, once by cargo and
+  once by Nix.
 - Import-from-derivation (on by default): the tool, cargo and rustc are
   built or fetched during evaluation the first time.
 - A recent Nix: rostnix is developed against Nix 2.26. Pre-seeding uses
@@ -271,12 +350,11 @@ it.
 
 ## Not yet supported
 
-Dependencies from git repositories and from registries other than
-crates.io, path dependencies outside `src`, `rustflags` and `[env]` from
-`.cargo/config.toml`, cross-compilation, installing `cdylib` and `staticlib`
-targets, dependencies built as Rust `dylib`s, doc tests and benches. Git
-and registry dependencies, path dependencies outside `src` and builds for
-another target are rejected during evaluation with a message naming them.
+Path dependencies outside `src`, cross-compilation, installing `cdylib` and
+`staticlib` targets, dependencies built as Rust `dylib`s, doc tests and
+benches, vendored sources, and Git LFS. Path dependencies outside `src` and
+builds for another target are rejected during evaluation with a message
+naming them.
 
 Build scripts run with their package directory read-only: one that writes
 outside `OUT_DIR` fails.
@@ -296,7 +374,8 @@ The integration tests build small fixtures, rostnix itself, and
 commit, and run the test suite of each. For each they compare every rustc
 invocation, build-script run and test run with what `cargo build -vv` and
 `cargo test -vv` do for the same source, and check that an edit rebuilds
-only the steps it should.
+only the steps it should. They fetch two repositories from GitHub and
+serve a small registry on port 18473 of this machine.
 
 The design is in `docs/superpowers/specs/2026-10-09-rostnix-design.md`.
 

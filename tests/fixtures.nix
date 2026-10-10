@@ -51,6 +51,30 @@ in
     };
   };
 
+  # Dependencies from git repositories: a workspace with a proc macro and
+  # build scripts, by tag, and a single package by revision.
+  gitdeps = rustEnv.buildRustApplication {
+    pname = "gitdeps";
+    src = ./fixtures/gitdeps;
+  };
+
+  # A workspace below the source root, with cargo configuration at both
+  # levels: rustflags from target tables, and [env] variables that are
+  # plain, forced, and relative to a data file and to the workspace.
+  config = rustEnv.buildRustApplication {
+    pname = "config";
+    src = ./fixtures/config;
+    cargoRoot = "ws";
+  };
+
+  # A dependency from a registry other than crates.io: the one that
+  # tests/registry.py serves. This evaluates only while that runs and the
+  # cargo home of whoever evaluates names it; tests/run.sh sees to both.
+  registry = rustEnv.buildRustApplication {
+    pname = "registry";
+    src = ./fixtures/registry;
+  };
+
   # One project under four profiles: fat LTO with panic=abort, thin LTO,
   # no LTO, and dev with debug information.
   profiles-release = profiles "release";

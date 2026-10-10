@@ -55,7 +55,7 @@ fn unit_ref(key: &str) -> String {
 
 fn src(src: &SrcRef) -> String {
     match src {
-        SrcRef::Registry(key) => format!("sources.{}", quote(key)),
+        SrcRef::Registry(key) | SrcRef::Git(key) => format!("sources.{}", quote(key)),
         SrcRef::Local { name, dir, exclude } => format!(
             "b.localSource {{ name = {}; dir = {}; exclude = {}; }}",
             quote(name),
@@ -75,17 +75,34 @@ pub fn to_nix(graph: &Graph) -> String {
     line(format!("  host = {};", quote(&graph.host)));
 
     for (key, source) in &graph.sources {
+        // A registry other than crates.io is named, for the message of a
+        // download that cannot be made.
+        let registry = source
+            .registry
+            .as_ref()
+            .map(|registry| format!(" registry = {};", quote(registry)))
+            .unwrap_or_default();
         line(format!(
-            "  sources.{} = b.fetchCrate {{ pname = {}; version = {}; sha256 = {}; url = {}; }};",
+            "  sources.{} = b.fetchCrate {{ pname = {}; version = {}; sha256 = {}; url = {};{registry} }};",
             quote(key),
             quote(&source.pname),
             quote(&source.version),
             quote(&source.sha256),
-            quote(&source.url)
+            optional(&source.url),
         ));
     }
-    // A project with no registry dependency still has the set.
-    if graph.sources.is_empty() {
+    for (key, source) in &graph.git_sources {
+        line(format!(
+            "  sources.{} = b.fetchGit {{ name = {}; url = {}; rev = {}; ref = {}; }};",
+            quote(key),
+            quote(&source.name),
+            quote(&source.url),
+            quote(&source.rev),
+            optional(&source.git_ref)
+        ));
+    }
+    // A project with no dependency to fetch still has the set.
+    if graph.sources.is_empty() && graph.git_sources.is_empty() {
         line("  sources = { };".to_string());
     }
 
@@ -130,6 +147,23 @@ pub fn to_nix(graph: &Graph) -> String {
     let builds: Vec<String> = graph.test_builds.iter().map(|key| unit_ref(key)).collect();
     line(format!("  testBuilds = [ {} ];", builds.join(" ")));
     line(format!("  buildUnits = {};", list(&graph.build_units)));
+    line(format!("  rustflags = {};", list(&graph.rustflags)));
+    let variables: Vec<String> = graph
+        .config_env
+        .iter()
+        .map(|env| {
+            format!(
+                "{{ name = {}; value = {}; force = {}; relative = {}; slash = {}; holdsSource = {}; }}",
+                quote(&env.entry.name),
+                quote(&env.entry.value),
+                env.entry.force,
+                optional(&env.entry.relative),
+                env.entry.slash,
+                env.holds_source
+            )
+        })
+        .collect();
+    line(format!("  configEnv = [ {} ];", variables.join(" ")));
     line(format!("  testUnits = {};", list(&graph.test_units)));
     line("}".to_string());
     out
@@ -257,7 +291,8 @@ mod tests {
                 pname: "dep".into(),
                 version: "1.0.0+x".into(),
                 sha256: "abc".into(),
-                url: "https://static.crates.io/crates/dep/dep-1.0.0+x.crate".into(),
+                url: Some("https://static.crates.io/crates/dep/dep-1.0.0+x.crate".into()),
+                registry: None,
                 cargo_src_dir: "/cargo-home/registry/src/index/dep-1.0.0+x".into(),
             },
         );
@@ -429,10 +464,54 @@ mod tests {
   tests = { };
   testBuilds = [  ];
   buildUnits = [ "app-0.1.0-bin-app-cccccccc" "dep-1.0.0+x-build-script-aaaaaaaa" "dep-1.0.0+x-run-build-script-bbbbbbbb" ];
+  rustflags = [ ];
+  configEnv = [  ];
   testUnits = [ ];
 }
 "#;
         assert_eq!(to_nix(&sample()), expected);
+    }
+
+    #[test]
+    fn the_cargo_configuration_is_part_of_the_graph() {
+        use crate::config::EnvEntry;
+        use crate::graph::ConfigEnv;
+        let mut graph = sample();
+        graph.rustflags = vec!["--cfg".into(), "feature=\"x\"".into()];
+        graph.config_env = vec![
+            ConfigEnv {
+                entry: EnvEntry {
+                    name: "PLAIN".into(),
+                    value: "costs $5".into(),
+                    force: true,
+                    relative: None,
+                    slash: false,
+                },
+                holds_source: false,
+            },
+            ConfigEnv {
+                entry: EnvEntry {
+                    name: "ROOT".into(),
+                    value: String::new(),
+                    force: false,
+                    relative: Some(String::new()),
+                    slash: true,
+                },
+                holds_source: true,
+            },
+        ];
+        let nix = to_nix(&graph);
+        assert!(
+            nix.contains("\n  rustflags = [ \"--cfg\" \"feature=\\\"x\\\"\" ];\n"),
+            "{nix}"
+        );
+        assert!(
+            nix.contains(
+                "\n  configEnv = [ { name = \"PLAIN\"; value = \"costs \\$5\"; force = true; relative = null; slash = false; holdsSource = false; } \
+                 { name = \"ROOT\"; value = \"\"; force = false; relative = \"\"; slash = true; holdsSource = true; } ];\n"
+            ),
+            "{nix}"
+        );
     }
 
     // A test is a unit like any other, built by another builder, which is
@@ -471,6 +550,42 @@ mod tests {
         assert!(!nix.contains("tests = { };"), "{nix}");
         // What is not a test is told nothing of the kind.
         assert_eq!(nix.matches("profileDir").count(), 1);
+    }
+
+    #[test]
+    fn git_repositories_and_other_registries_are_sources_too() {
+        use crate::graph::GitSource;
+        let mut graph = sample();
+        graph.git_sources.insert(
+            "git-serde-a866b336f14a".into(),
+            GitSource {
+                name: "rustsrc-serde-a866b33".into(),
+                url: "https://github.com/serde-rs/serde".into(),
+                rev: "a866b336f14aa57a07f0d0be9f8762746e64ecb4".into(),
+                git_ref: Some("refs/tags/v1.0.228".into()),
+            },
+        );
+        let private = graph.sources.get_mut("dep-1.0.0+x").unwrap();
+        private.url = None;
+        private.registry = Some("sparse+https://crates.example.com/index/".into());
+        let nix = to_nix(&graph);
+        assert!(
+            nix.contains(
+                "  sources.\"git-serde-a866b336f14a\" = b.fetchGit { name = \"rustsrc-serde-a866b33\"; \
+                 url = \"https://github.com/serde-rs/serde\"; \
+                 rev = \"a866b336f14aa57a07f0d0be9f8762746e64ecb4\"; ref = \"refs/tags/v1.0.228\"; };\n"
+            ),
+            "{nix}"
+        );
+        assert!(
+            nix.contains(
+                "sha256 = \"abc\"; url = null; registry = \"sparse+https://crates.example.com/index/\"; };\n"
+            ),
+            "{nix}"
+        );
+        // A project with git dependencies only has no empty set beside them.
+        graph.sources.clear();
+        assert!(!to_nix(&graph).contains("sources = { };"));
     }
 
     // A library-only selection has no executables, and a project without

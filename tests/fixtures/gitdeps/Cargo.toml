@@ -1,0 +1,11 @@
+[package]
+name = "gitdeps"
+version = "0.1.0"
+edition = "2021"
+
+# Both dependencies come from git repositories. serde's is a workspace:
+# its packages lie in subdirectories, depend on each other by path, and
+# one of them is a proc macro. itoa's holds a single package.
+[dependencies]
+serde = { git = "https://github.com/serde-rs/serde", tag = "v1.0.228", features = ["derive"] }
+itoa = { git = "https://github.com/dtolnay/itoa", rev = "af77385d0d" }
