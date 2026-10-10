@@ -1,5 +1,7 @@
 # rostnix
 
+[![tests](https://github.com/draganm/rostnix/actions/workflows/tests.yml/badge.svg)](https://github.com/draganm/rostnix/actions/workflows/tests.yml)
+
 Build Rust programs with Nix one compile step per derivation, with nothing
 to check in when `Cargo.toml` or `Cargo.lock` changes.
 
@@ -451,6 +453,10 @@ run under wasmtime, and on x86_64 Linux for musl, with their tests. On an
 Apple Silicon Mac with Rosetta one fixture is planned there and built as
 x86_64, and on x86_64 Linux as i686. They fetch two repositories from
 GitHub and serve a small registry on port 18473 of this machine.
+
+Both run for every pull request and every push to `main`, the integration
+tests on x86_64 Linux, on arm64 Linux and on an Apple Silicon Mac; see
+`.github/workflows/tests.yml`.
 
 The design is in `docs/superpowers/specs/2026-10-09-rostnix-design.md`.
 
