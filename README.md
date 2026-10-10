@@ -184,7 +184,8 @@ that does not compile fails the build as it fails `cargo test`.
 Limits worth knowing:
 
 - What a Nix build forbids, a test cannot do: reach the network (in a
-  sandboxed build), or create a setuid file.
+  sandboxed build), create a setuid file, or on Linux set an extended
+  attribute.
 - Tests are built with `profile`, which is `release` unless you say
   otherwise, so `debug_assert!` and overflow checks are off as under
   `cargo test --release`.
@@ -400,7 +401,7 @@ when they change. Passing a narrowed `src`, for example with
   once by Nix.
 - Import-from-derivation (on by default): the tool, cargo and rustc are
   built or fetched during evaluation the first time.
-- A recent Nix: rostnix is developed against Nix 2.26. Pre-seeding uses
+- A recent Nix: rostnix is tested with Nix 2.26 and 2.31. Pre-seeding uses
   `nix store add --mode flat`; with an older `nix` that add fails and crates
   are downloaded at build time instead.
 
@@ -423,11 +424,15 @@ With `evalPkgs`, cargo decides the dependencies of build scripts and proc
 macros for the machine that evaluates. A build dependency that only one of
 the two kinds of machine has is planned wrongly.
 
-The integration tests have been run on aarch64-darwin only; Linux is
-untested. Building for another platform has been tested for WebAssembly
-(`pkgsCross.wasi32`), and `evalPkgs` by building for x86_64-darwin from
-aarch64-darwin. A cross build that links with a C compiler, such as Linux
-for another processor, has not been run.
+The integration tests pass on aarch64-darwin and on x86_64-linux (NixOS).
+Building for another platform has been tested for WebAssembly
+(`pkgsCross.wasi32`) on both, and on x86_64-linux for Linux with musl
+(`pkgsCross.musl64`), which links with a C compiler and whose tests run on
+the build machine. `evalPkgs` has been tested by building for x86_64-darwin
+from aarch64-darwin and for i686-linux from x86_64-linux. A build for
+another processor was made once by hand, for aarch64 Linux from x86_64
+Linux, and its results were not run. A build for macOS from another
+machine has not been made.
 
 ## Development
 
@@ -442,9 +447,10 @@ commit, and run the test suite of each. For each they compare every rustc
 invocation, build-script run and test run with what `cargo build -vv` and
 `cargo test -vv` do for the same source, and check that an edit rebuilds
 only the steps it should. Two fixtures are also built for WebAssembly and
-run under wasmtime, and on an Apple Silicon Mac with Rosetta one is planned
-there and built as x86_64. They fetch two repositories from GitHub and
-serve a small registry on port 18473 of this machine.
+run under wasmtime, and on x86_64 Linux for musl, with their tests. On an
+Apple Silicon Mac with Rosetta one fixture is planned there and built as
+x86_64, and on x86_64 Linux as i686. They fetch two repositories from
+GitHub and serve a small registry on port 18473 of this machine.
 
 The design is in `docs/superpowers/specs/2026-10-09-rostnix-design.md`.
 

@@ -329,27 +329,28 @@ check_c_program() {
   echo "ok: libs: a C program links against the dynamic and the static library and runs"
 }
 
+# check_cross_units <fixture> <linker pattern> <expected>
 # In a build for another platform, what runs while building is built for
 # the machine that builds: with its C compiler, and with no word to rustc
 # about a target or a linker. The rest gets the platform's of each.
 check_cross_units() {
   local got
-  got="$(nix eval "${exec_opt[@]}" --raw "$flake#fixtures.$1.units" --apply '
-    units:
+  got="$(nix eval "${exec_opt[@]}" --raw "$flake#fixtures.$1" --apply "
+    app:
     let
-      all = builtins.attrValues units;
+      inherit (app.graph) host target;
+      all = builtins.attrValues app.units;
       count = pred: toString (builtins.length (builtins.filter pred all));
       forTarget = u: u.node.target != null;
-      wasm = u: !(u ? stdenv) || u.stdenv.hostPlatform.isWasm;
-      here = u: !(u ? stdenv) || !u.stdenv.hostPlatform.isWasm;
+      builtFor = triple: u: !(u ? stdenv) || u.stdenv.hostPlatform.rust.rustcTarget == triple;
       wrong = u:
         if forTarget u
-        then !(wasm u) || u.node.target != "wasm32-wasip1" || builtins.match ".*-wasm-ld" u.node.linker == null
-        else !(here u) || u.node.linker != null;
-    in "${count forTarget} of ${count (u: true)} for the target, ${count wrong} wrong"
-  ')" || fail "$1: units do not evaluate"
-  [ "$got" = "$2" ] || fail "$1: the units are [$got], want [$2]"
-  echo "ok: $1: each unit is built for its machine ($2)"
+        then !(builtFor target u) || u.node.target != target || builtins.match \"$2\" u.node.linker == null
+        else !(builtFor host u) || u.node.linker != null;
+    in \"\${count forTarget} of \${count (u: true)} for the target, \${count wrong} wrong\"
+  ")" || fail "$1: units do not evaluate"
+  [ "$got" = "$3" ] || fail "$1: the units are [$got], want [$3]"
+  echo "ok: $1: each unit is built for its machine ($3)"
 }
 
 # A library or a tool that an override names is for the platform the
@@ -454,16 +455,16 @@ check_both_sides() {
 }
 
 # A package set can be for another platform than the build machine's and
-# have its triple, as nixpkgs' static one has on macOS. Its units are still
-# told apart: what runs while building is the build machine's, and the
-# rest is linked by the platform's C compiler.
+# have its triple, as nixpkgs' static one has on macOS and its LLVM one on
+# Linux. Its units are still told apart: what runs while building is the
+# build machine's, and the rest is linked by the platform's C compiler.
 check_cross_same_triple() {
   local got want
   got="$(nix eval --impure --raw "${exec_opt[@]}" --expr "
     let
       flake = builtins.getFlake \"$flake\";
       native = flake.inputs.nixpkgs.legacyPackages.\${builtins.currentSystem};
-      pkgs = native.pkgsStatic;
+      pkgs = if native.stdenv.isDarwin then native.pkgsStatic else native.pkgsLLVM;
       app = (flake.lib.mkRustEnv { inherit pkgs; }).buildRustApplication {
         pname = \"same-triple\";
         src = $root/tests/fixtures/hello;
@@ -879,7 +880,7 @@ fi
 check_run_wasm hello-wasi hello.wasm '{"greeting":"hello","n":42}'
 check_bins hello-wasi "hello.wasm"
 check_main_program hello-wasi hello.wasm
-check_cross_units hello-wasi "14 of 28 for the target, 0 wrong"
+check_cross_units hello-wasi '.*-wasm-ld' "14 of 28 for the target, 0 wrong"
 check_cross_tests_off hello-wasi
 check_conformance hello-wasi fixtureShellWasi --profile release --target wasm32-wasip1
 check_no_intermediate_refs hello-wasi
@@ -898,6 +899,29 @@ check_no_intermediate_refs libs-wasi
 check_cross_override_inputs
 check_cross_same_triple
 
+# For another platform that its C compiler links and this machine runs,
+# where nixpkgs has a rustc for it ready: the linker is that compiler, a
+# build script compiles C with it, and the tests are built for the platform
+# and run. Everything is what cargo does when told the target.
+cross_target="$(nix eval --raw "$flake#crossTarget")"
+if [ -n "$cross_target" ]; then
+  check_run hello-cross hello '{"greeting":"hello","n":42}'
+  # The tests are units for the platform too.
+  check_cross_units hello-cross '.*-cc' "19 of 33 for the target, 0 wrong"
+  check_conformance hello-cross fixtureShellCross --profile release --target "$cross_target"
+  check_test_conformance hello-cross fixtureShellCross --profile release --target "$cross_target"
+  check_tests_ran hello-cross cli test "test result: ok\. 6 passed"
+  check_no_intermediate_refs hello-cross
+  check_run libs-cross calc "calc: 5 library:$cross_target script:$native_triple linked:$cross_target"
+  check_both_sides libs-cross 2
+  check_conformance libs-cross fixtureShellCross --profile release --target "$cross_target"
+  check_test_conformance libs-cross fixtureShellCross --profile release --target "$cross_target"
+  check_tests_ran libs-cross rostnix_math lib "test result: ok\. 1 passed"
+  check_no_intermediate_refs libs-cross
+else
+  echo "skipped: no platform that a C compiler links for and this machine has a rustc for"
+fi
+
 # Planned on this machine and built on another kind, where this machine
 # builds as one: the tests run there too, and the plan is the one cargo
 # makes on that machine when it is told the target.
@@ -910,9 +934,9 @@ if [ -n "$elsewhere" ] && nix config show extra-platforms 2>/dev/null | grep -qw
   elsewhere_target="$(nix eval "${exec_opt[@]}" --raw "$flake#fixtures.hello-elsewhere.graph.target")"
   echo "ok: hello-elsewhere: planned here for $elsewhere_target and built on $elsewhere"
   check_tests_ran hello-elsewhere cli test "test result: ok\. 6 passed"
-  check_conformance hello-elsewhere "legacyPackages.$elsewhere.fixtureShell" \
+  check_conformance hello-elsewhere fixtureShellElsewhere \
     --profile release --target "$elsewhere_target"
-  check_test_conformance hello-elsewhere "legacyPackages.$elsewhere.fixtureShell" \
+  check_test_conformance hello-elsewhere fixtureShellElsewhere \
     --profile release --target "$elsewhere_target"
 else
   echo "skipped: no other kind of machine that this one builds as"
@@ -958,8 +982,13 @@ echo "ok: core-rs: 21 of its 22 test executables ran"
 check_tests_ran core-rs cli_e2e test "test result: ok\. [1-9][0-9]* passed"
 check_tests_ran core-rs golden_packstore test "test result: ok\. 4 passed"
 check_tests_ran core-rs amber_store_core lib "test result: ok\. [1-9][0-9]* passed"
-# The one test Nix itself rules out: it creates a setuid file.
-check_tests_ran core-rs tar_extract test "test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out"
+# The tests Nix itself rules out: one creates a setuid file, and on Linux
+# the other sets an extended attribute.
+if [ "$(uname)" = Linux ]; then
+  check_tests_ran core-rs tar_extract test "test result: ok\. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out"
+else
+  check_tests_ran core-rs tar_extract test "test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out"
+fi
 check_test_compile_conformance core-rs default amber_bench_smoke --profile release
 
 # rostnix builds itself, and its own unit tests pass in a derivation.
